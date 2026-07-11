@@ -23,40 +23,91 @@ def _to_uint16(arr: np.ndarray) -> np.ndarray:
     return arr.astype(np.uint16)
 
 
+def _write_temp_tiff(data: np.ndarray, target_path: str, *, photometric: str) -> str:
+    """Write `data` to a temp TIFF next to `target_path`. Returns the temp path.
+
+    Caller commits it (os.replace to the real path) and is responsible for
+    cleaning up the temp file if anything downstream fails. On failure here,
+    the temp file is cleaned up before re-raising and `target_path` itself is
+    never touched.
+    """
+    fd, tmp_path = tempfile.mkstemp(suffix=".tif", dir=os.path.dirname(target_path) or ".")
+    os.close(fd)
+    try:
+        tifffile.imwrite(tmp_path, data, photometric=photometric, compression="lzw")
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+    return tmp_path
+
+
 def write_tiff_16bit(result: ScanResult, path: str) -> str:
     """Write ScanResult to 16-bit TIFF. IR written as sidecar `<basename>_IR.tif`.
 
-    Uses atomic write (write to .tmp then rename) to avoid partial files.
+    Transactional as a unit: RGB and (if present) IR are both written to temp
+    files first, and the real `path` / `ir_path` are only touched (via
+    os.replace) once every payload is fully on disk. If either temp write
+    fails, neither final path is touched. If the IR temp write succeeds but
+    its commit (os.replace) fails after the RGB commit already landed, the
+    RGB commit is rolled back too — this never leaves an orphan RGB file with
+    no IR when IR was requested. When this write has no IR, a stale
+    `<basename>_IR.tif` sidecar left over from a previous IR-enabled write of
+    the same target is removed so it can't be silently misattributed to the
+    new IR-less RGB frame (TiffLoader auto-discovers `_IR.tif` by filename
+    alone, with no cross-check against the RGB it's paired with).
+
     Returns final RGB path.
     """
     if not path.lower().endswith((".tif", ".tiff")):
         path = path + ".tif"
 
     rgb = _to_uint16(result.rgb)
+    base = os.path.splitext(path)[0]
+    ir_path = f"{base}_IR.tif"
+    has_ir = result.ir is not None
 
-    fd, tmp_path = tempfile.mkstemp(suffix=".tif", dir=os.path.dirname(path) or ".")
-    os.close(fd)
+    # Phase 1: write both payloads to temp files. Nothing under `path` or
+    # `ir_path` is touched here, so a failure at this stage (bad array,
+    # codec error, disk full) leaves the filesystem exactly as it was.
+    tmp_rgb = _write_temp_tiff(rgb, path, photometric="rgb")
+    tmp_ir = None
+    if has_ir:
+        try:
+            ir_data = _to_uint16(result.ir)
+            tmp_ir = _write_temp_tiff(ir_data, ir_path, photometric="minisblack")
+        except Exception:
+            os.unlink(tmp_rgb)
+            raise
+
+    # Phase 2: commit. Both temp files are known-good at this point; only a
+    # filesystem-level rename can fail from here.
     try:
-        tifffile.imwrite(tmp_path, rgb, photometric="rgb", compression="zlib", predictor=True)
-        os.replace(tmp_path, path)
+        os.replace(tmp_rgb, path)
     except Exception:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        if os.path.exists(tmp_rgb):
+            os.unlink(tmp_rgb)
+        if tmp_ir and os.path.exists(tmp_ir):
+            os.unlink(tmp_ir)
         raise
 
-    if result.ir is not None:
-        base = os.path.splitext(path)[0]
-        ir_path = f"{base}_IR.tif"
-        ir_data = _to_uint16(result.ir)
-        fd_ir, tmp_ir = tempfile.mkstemp(suffix=".tif", dir=os.path.dirname(ir_path) or ".")
-        os.close(fd_ir)
+    if tmp_ir is not None:
         try:
-            tifffile.imwrite(tmp_ir, ir_data, photometric="minisblack", compression="zlib", predictor=True)
+            
             os.replace(tmp_ir, ir_path)
         except Exception:
+            # RGB already committed but its IR pair didn't make it — undo
+            # the RGB commit rather than leave an orphan (IR was requested).
+            if os.path.exists(path):
+                os.unlink(path)
             if os.path.exists(tmp_ir):
                 os.unlink(tmp_ir)
             raise
+    elif os.path.exists(ir_path):
+        # No IR this write; drop a stale sidecar from a previous IR-enabled
+        # write of this same target so it isn't silently misattributed to
+        # the new IR-less RGB frame.
+        os.unlink(ir_path)
 
     # Mask marking which IR pixels the scanner actually sampled. The loader
     # fails closed on a malformed one, so write {0,255} the reader accepts.

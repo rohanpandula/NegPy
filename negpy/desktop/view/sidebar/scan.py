@@ -138,6 +138,12 @@ class ScanSidebar(QWidget):
         self.ae_check.setToolTip("Meter exposure in hardware before the scan")
         self.form.addRow(self.ae_check)
 
+        self.samples_combo = QComboBox()
+        self.samples_combo.setToolTip("Hardware multi-sampling passes per line (higher = less noise, slower)")
+        for n in (1, 2, 4, 8, 16):
+            self.samples_combo.addItem(f"{n}x", n)
+        self.form.addRow("Samples/pass", self.samples_combo)
+
         # Frame range (roll/strip feeders only — shown when a live capacity is known).
         self.frame_range_widget = QWidget()
         frame_row = QHBoxLayout(self.frame_range_widget)
@@ -245,6 +251,7 @@ class ScanSidebar(QWidget):
         self.frame_to_spin.valueChanged.connect(self._on_frame_to_changed)
         self.scan_window_btn.clicked.connect(self._on_set_scan_window)
         self.scan_window_clear_btn.clicked.connect(self._on_clear_scan_window)
+        self.samples_combo.currentTextChanged.connect(lambda: self._update_settings_from_ui())
 
         # Controller signals
         self.controller.scan_devices_ready.connect(self._on_devices_ready)
@@ -346,6 +353,7 @@ class ScanSidebar(QWidget):
             self.eject_btn.setVisible(False)
             self.frame_range_label.setVisible(False)
             self.frame_range_widget.setVisible(False)
+            self.samples_combo.setEnabled(False)
             return
 
         caps = device.capabilities
@@ -354,6 +362,7 @@ class ScanSidebar(QWidget):
         self.ir_check.setEnabled(True)
         self.eject_btn.setVisible(caps.can_eject)
         self.eject_btn.setEnabled(caps.can_eject and not self._scanning)
+        self.samples_combo.setEnabled(True)
         self.frame_label.setText(f"Frame: {caps.max_area_mm[0]:.0f} × {caps.max_area_mm[1]:.0f} mm")
 
         # If no film sources, show banner
@@ -373,6 +382,7 @@ class ScanSidebar(QWidget):
         self.ae_check.blockSignals(True)
         self.frame_from_spin.blockSignals(True)
         self.frame_to_spin.blockSignals(True)
+        self.samples_combo.blockSignals(True)
 
         # DPI
         self.dpi_combo.clear()
@@ -441,12 +451,23 @@ class ScanSidebar(QWidget):
             self.scan_window_btn.setToolTip("Preview each frame, set a window per frame, and pick which frames to scan")
             self._update_scan_window_status()
 
+        # Samples/pass (hardware multi-sampling)
+        self.samples_combo.setEnabled(caps.multi_sample)
+        if caps.multi_sample:
+            idx = self.samples_combo.findData(self._settings.samples_per_scan)
+            self.samples_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.samples_combo.setToolTip("Hardware multi-sampling passes per line (higher = less noise, slower)")
+        else:
+            self.samples_combo.setCurrentIndex(0)
+            self.samples_combo.setToolTip("Multi-sampling not supported by this device")
+
         self.dpi_combo.blockSignals(False)
         self.depth_combo.blockSignals(False)
         self.ir_check.blockSignals(False)
         self.ae_check.blockSignals(False)
         self.frame_from_spin.blockSignals(False)
         self.frame_to_spin.blockSignals(False)
+        self.samples_combo.blockSignals(False)
 
     def _on_frame_from_changed(self, _value: int) -> None:
         if self.frame_to_spin.value() < self.frame_from_spin.value():
@@ -514,7 +535,6 @@ class ScanSidebar(QWidget):
         else:
             tl_x, tl_y, br_x, br_y = area
             self.scan_window_status.setText(f"{br_x - tl_x:.1f} × {br_y - tl_y:.1f} mm{offset_txt}")
-
     def _on_browse(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if folder:
@@ -562,6 +582,8 @@ class ScanSidebar(QWidget):
             auto_exposure=auto_exposure,
             window=base_window,
             frame_offset_mm=self._settings.frame_offset_mm,
+            area=None,
+            samples_per_scan=int(self.samples_combo.currentData() or 1),
         )
 
         self._update_settings_from_ui()
@@ -687,6 +709,7 @@ class ScanSidebar(QWidget):
             auto_exposure=self.ae_check.isChecked() and self.ae_check.isEnabled(),
             frame_from=self.frame_from_spin.value(),
             frame_to=self.frame_to_spin.value(),
+            samples_per_scan=int(self.samples_combo.currentData() or 1),
             output_folder=self.folder_edit.text().strip(),
             output_format=self.fmt_combo.currentText(),
             filename_pattern=self.pattern_edit.text().strip() or '{{ date }}_{{ "%03d" % seq }}',

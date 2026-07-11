@@ -33,6 +33,10 @@ class ScannerCapabilities:
     adapter_frame_control: bool = False
     can_eject: bool = False
     frame_pitch_mm: float = 0.0  # feed-axis distance between frame positions; 0.0 = unknown
+    # Device exposes a samples-per-scan option (hardware multi-sampling, e.g.
+    # Nikon Coolscan). UI-gating only — SaneBackend.scan() fails loud on its
+    # own if samples_per_scan > 1 is requested against a device without it.
+    multi_sample: bool = False
 
 
 @dataclass(frozen=True)

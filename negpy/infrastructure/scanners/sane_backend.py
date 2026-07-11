@@ -460,6 +460,13 @@ def _require_writable_option(opt, option_name: str, absent_message: str) -> None
             raise RuntimeError(f"Requested SANE option {option_name!r} is not settable")
 
 
+def _detect_multi_sample(opt) -> bool:
+    """True if the device exposes a samples-per-scan option (hardware
+    multi-sampling, e.g. Nikon Coolscan). UI-gating only — the actual
+    fail-loud enforcement lives in SaneBackend.scan()."""
+    return "samples_per_scan" in opt
+
+
 def _caps_from_options(opt, device_id: str = "") -> ScannerCapabilities:
     """Build ScannerCapabilities from a SANE option map. Pure — no `sane` import."""
     sources = _detect_explicit_sources(opt)
@@ -478,6 +485,7 @@ def _caps_from_options(opt, device_id: str = "") -> ScannerCapabilities:
         adapter_frame_control=_detect_adapter_frame_control(opt),
         can_eject=_detect_eject(opt),
         frame_pitch_mm=_feed_pitch_mm(opt),
+        multi_sample=_detect_multi_sample(opt),
     )
 
 
