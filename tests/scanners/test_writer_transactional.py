@@ -120,3 +120,20 @@ class TestStaleIrSidecar:
             readback = tifffile.imread(ir_path)
             assert readback.shape == result.ir.shape
             assert np.array_equal(readback, result.ir)
+
+
+def test_dpi_metadata_written(tmp_path):
+    import numpy as np
+    import tifffile
+
+    from negpy.infrastructure.scanners.result import ScanResult
+    from negpy.services.scanning.writer import write_tiff_16bit
+
+    rgb = np.zeros((8, 6, 3), dtype=np.uint16)
+    ir = np.zeros((8, 6), dtype=np.uint16)
+    out = write_tiff_16bit(ScanResult(rgb=rgb, ir=ir, dpi=4000, device_model="t"), str(tmp_path / "f.tif"))
+    for f in (out, str(tmp_path / "f_IR.tif")):
+        with tifffile.TiffFile(f) as t:
+            xres = t.pages[0].tags["XResolution"].value
+            assert xres[0] / xres[1] == 4000, f"{f}: XResolution {xres}"
+            assert t.pages[0].tags["ResolutionUnit"].value == 2  # INCH

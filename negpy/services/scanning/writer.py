@@ -23,7 +23,9 @@ def _to_uint16(arr: np.ndarray) -> np.ndarray:
     return arr.astype(np.uint16)
 
 
-def _write_temp_tiff(data: np.ndarray, target_path: str, *, photometric: str) -> str:
+def _write_temp_tiff(
+    data: np.ndarray, target_path: str, *, photometric: str, dpi: int | None = None
+) -> str:
     """Write `data` to a temp TIFF next to `target_path`. Returns the temp path.
 
     Caller commits it (os.replace to the real path) and is responsible for
@@ -33,8 +35,13 @@ def _write_temp_tiff(data: np.ndarray, target_path: str, *, photometric: str) ->
     """
     fd, tmp_path = tempfile.mkstemp(suffix=".tif", dir=os.path.dirname(target_path) or ".")
     os.close(fd)
+    kwargs: dict = {}
+    if dpi and dpi > 0:
+        # archival provenance: without this, tifffile stamps XResolution=1
+        kwargs["resolution"] = (dpi, dpi)
+        kwargs["resolutionunit"] = "INCH"
     try:
-        tifffile.imwrite(tmp_path, data, photometric=photometric, compression="lzw")
+        tifffile.imwrite(tmp_path, data, photometric=photometric, compression="lzw", **kwargs)
     except Exception:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -70,12 +77,12 @@ def write_tiff_16bit(result: ScanResult, path: str) -> str:
     # Phase 1: write both payloads to temp files. Nothing under `path` or
     # `ir_path` is touched here, so a failure at this stage (bad array,
     # codec error, disk full) leaves the filesystem exactly as it was.
-    tmp_rgb = _write_temp_tiff(rgb, path, photometric="rgb")
+    tmp_rgb = _write_temp_tiff(rgb, path, photometric="rgb", dpi=result.dpi)
     tmp_ir = None
     if has_ir:
         try:
             ir_data = _to_uint16(result.ir)
-            tmp_ir = _write_temp_tiff(ir_data, ir_path, photometric="minisblack")
+            tmp_ir = _write_temp_tiff(ir_data, ir_path, photometric="minisblack", dpi=result.dpi)
         except Exception:
             os.unlink(tmp_rgb)
             raise
