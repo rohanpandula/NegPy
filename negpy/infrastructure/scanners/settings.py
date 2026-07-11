@@ -16,6 +16,7 @@ class ScannerSettings:
     auto_exposure: bool = False
     frame_from: int = 1
     frame_to: int = 1
+    samples_per_scan: int = 1
     output_folder: str = ""
     output_format: str = "TIFF"
     filename_pattern: str = '{{ date }}_{{ "%03d" % seq }}'

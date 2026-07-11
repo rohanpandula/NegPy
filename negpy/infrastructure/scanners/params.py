@@ -15,6 +15,8 @@ class ScanParams:
     capture_ir: bool
     # Normalized (x1,y1,x2,y2) window 0..1; backend maps to device units (coolscan3 int px).
     window: tuple[float, float, float, float] | None = None
+    # Normalized (x1,y1,x2,y2) area 0..1; legacy name kept for roll scanning.
+    area: tuple[float, float, float, float] | None = None
     # coolscan3 `subframe` (mm), applied to every frame. 0 = scanner default.
     frame_offset_mm: float = 0.0
     autofocus: bool = True
@@ -25,6 +27,10 @@ class ScanParams:
     # Hardware auto-exposure (SANE `ae`), distinct from NegPy's rendering
     # auto-exposure. An explicit request fails if the option is unavailable.
     auto_exposure: bool = False
+    # Hardware multi-sampling passes per line (1 = off). Archival intent:
+    # if a value > 1 cannot be honored, the scan fails rather than silently
+    # degrading to a single pass.
+    samples_per_scan: int = 1
 
 
 MIN_FRAME_EXTENT_MM = 1.0  # below this a capped scan is a useless sliver
