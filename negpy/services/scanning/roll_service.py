@@ -15,7 +15,7 @@ import threading
 from hashlib import sha256
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
-from math import isfinite
+from math import ceil, isfinite
 from pathlib import Path, PureWindowsPath
 from typing import Callable, Mapping, Protocol, Sequence, cast
 
@@ -23,12 +23,21 @@ import numpy as np
 import tifffile
 
 from negpy.infrastructure.scanners.params import RegisteredScanGeometry, ScanParams
+from negpy.infrastructure.scanners.result import SplitIrAlignment
 from negpy.services.scanning.service import ScannerService
+from negpy.services.scanning.quality import (
+    assess_stopped_transport_smear,
+    inspect_tiff_payload,
+    measure_focus_detail,
+    measure_scan_clipping,
+    split_alignment_metrics_confident,
+)
 from negpy.services.scanning.writer import write_tiff_16bit
 
 
 PLAN_FILENAME = "roll-scan.json"
 PLAN_VERSION = 2
+FINE_QC_VERSION = 1
 
 
 class RollStage(StrEnum):
@@ -277,12 +286,7 @@ def _optional_path(value: object, field: str) -> str | None:
     path = _strict_string(value, field, nonempty=True)
     candidate = Path(path)
     windows_candidate = PureWindowsPath(path)
-    if (
-        candidate.is_absolute()
-        or windows_candidate.is_absolute()
-        or ".." in candidate.parts
-        or ".." in windows_candidate.parts
-    ):
+    if candidate.is_absolute() or windows_candidate.is_absolute() or ".." in candidate.parts or ".." in windows_candidate.parts:
         raise ValueError(f"{field} must be a safe relative path")
     return path
 
@@ -534,11 +538,7 @@ def _read_plan(path: Path) -> RollScanPlan:
             fine_ir_shape = _optional_shape(item["fine_ir_shape"], f"frames[{index}].fine_ir_shape", channels=None)
             fine_dtype = _optional_dtype(item["fine_dtype"], f"frames[{index}].fine_dtype")
             fine_ir_dtype = _optional_dtype(item["fine_ir_dtype"], f"frames[{index}].fine_ir_dtype")
-            fine_dpi = (
-                None
-                if item["fine_dpi"] is None
-                else _strict_int(item["fine_dpi"], f"frames[{index}].fine_dpi", minimum=1)
-            )
+            fine_dpi = None if item["fine_dpi"] is None else _strict_int(item["fine_dpi"], f"frames[{index}].fine_dpi", minimum=1)
             fine_recipe = _optional_recipe(item["fine_recipe"], f"frames[{index}].fine_recipe", FineScanRecipe)
 
             _coherent_artifact(wide_path, wide_rgb_shape, wide_dtype, f"frames[{index}].wide")
@@ -585,8 +585,7 @@ def _read_plan(path: Path) -> RollScanPlan:
         if type(raw_overrides) is not list:
             raise ValueError("visual_override_frames must be an array")
         visual_override_frames = tuple(
-            _strict_int(value, f"visual_override_frames[{index}]", minimum=1)
-            for index, value in enumerate(raw_overrides)
+            _strict_int(value, f"visual_override_frames[{index}]", minimum=1) for index, value in enumerate(raw_overrides)
         )
         if tuple(sorted(set(visual_override_frames))) != visual_override_frames:
             raise ValueError("visual_override_frames must be unique and increasing")
@@ -600,11 +599,7 @@ def _read_plan(path: Path) -> RollScanPlan:
         if not approved and visual_override_frames:
             raise ValueError("an unapproved plan cannot retain visual overrides")
         if approved:
-            unverified = {
-                record.frame
-                for record in records
-                if record.verification is None or not record.verification.passed
-            }
+            unverified = {record.frame for record in records if record.verification is None or not record.verification.passed}
             if not unverified.issubset(visual_override_frames):
                 raise ValueError("approved plan has unverified frames without visual overrides")
         if stage in {RollStage.ALIGNED_PREVIEW, RollStage.REVIEW_REQUIRED, *approved_stages} and any(
@@ -685,6 +680,7 @@ def _fine_record_valid(
     root: Path,
     record: RollFrameRecord,
     recipe: FineScanRecipe | None,
+    device_id: str,
 ) -> bool:
     if recipe is None or record.fine_recipe != recipe or record.fine_path is None or record.fine_dpi != recipe.dpi:
         return False
@@ -695,14 +691,15 @@ def _fine_record_valid(
         dtype=record.fine_dtype,
     ):
         return False
-    if not recipe.capture_ir:
-        return True
-    ir_sidecar = output.with_name(f"{output.stem}_IR.tif")
-    return _tiff_payload_matches(
-        ir_sidecar,
-        shape=record.fine_ir_shape,
-        dtype=record.fine_ir_dtype,
-    )
+    if recipe.capture_ir:
+        ir_sidecar = output.with_name(f"{output.stem}_IR.tif")
+        if not _tiff_payload_matches(
+            ir_sidecar,
+            shape=record.fine_ir_shape,
+            dtype=record.fine_ir_dtype,
+        ):
+            return False
+    return _fine_qc_valid(output, record, recipe, device_id)
 
 
 def _complete_plan_valid(root: Path, plan: RollScanPlan) -> bool:
@@ -712,7 +709,7 @@ def _complete_plan_valid(root: Path, plan: RollScanPlan) -> bool:
     recipe = next(iter(recipes))
     if recipe is None:
         return False
-    return all(_fine_record_valid(root, record, recipe) for record in plan.frames)
+    return all(_fine_record_valid(root, record, recipe, plan.device_id) for record in plan.frames)
 
 
 def _fine_artifact_name(
@@ -735,6 +732,331 @@ def _fine_artifact_name(
     return f"frame{frame:03d}-{sha256(payload).hexdigest()[:16]}.tif"
 
 
+def _fine_qc_path(output: Path) -> Path:
+    return Path(f"{output}.qc.json")
+
+
+def _read_fine_qc(path: Path) -> dict[str, object] | None:
+    try:
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_json_object_without_duplicates,
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return payload if type(payload) is dict else None
+
+
+def _finite_json_number(value: object) -> bool:
+    return type(value) in (int, float) and isfinite(value)
+
+
+def _fine_qc_telemetry_valid(
+    payload: Mapping[str, object],
+    *,
+    allow_indeterminate: bool,
+    expected_dpi: int,
+    image_height: int,
+) -> bool:
+    smear = payload.get("stopped_transport_smear")
+    if type(smear) is not dict or set(smear) != {
+        "verdict",
+        "start_row",
+        "suffix_rows",
+        "minimum_matches",
+        "tail_median_rms",
+        "tail_min_corr",
+        "pre_tail_median_rms",
+        "texture_span",
+        "reason",
+    }:
+        return False
+    verdict = smear.get("verdict")
+    if verdict != "clean" and not (verdict == "indeterminate" and allow_indeterminate):
+        return False
+    suffix_rows = smear.get("suffix_rows")
+    minimum_matches = smear.get("minimum_matches")
+    if (
+        type(suffix_rows) is not int
+        or suffix_rows < 0
+        or suffix_rows >= image_height
+        or type(minimum_matches) is not int
+        or minimum_matches != ceil(expected_dpi * 0.016)
+    ):
+        return False
+    if type(smear.get("reason")) is not str or not smear.get("reason").strip():
+        return False
+    start_row = smear.get("start_row")
+    if start_row is not None and (type(start_row) is not int or start_row < 0):
+        return False
+    for field in ("tail_median_rms", "pre_tail_median_rms", "texture_span"):
+        value = smear.get(field)
+        if value is not None and (not _finite_json_number(value) or value < 0):
+            return False
+    tail_min_corr = smear.get("tail_min_corr")
+    if tail_min_corr is not None and (not _finite_json_number(tail_min_corr) or not -1.0 <= tail_min_corr <= 1.0):
+        return False
+    tail_fields = ("tail_median_rms", "tail_min_corr", "pre_tail_median_rms")
+    if verdict == "clean":
+        if start_row is not None or suffix_rows != 0 or any(smear.get(field) is not None for field in tail_fields):
+            return False
+        if smear.get("texture_span") is None:
+            return False
+    elif suffix_rows == 0:
+        if start_row is not None or any(smear.get(field) is not None for field in tail_fields):
+            return False
+    elif (
+        start_row != image_height - suffix_rows
+        or smear.get("tail_median_rms") is None
+        or tail_min_corr is None
+        or smear.get("texture_span") is None
+    ):
+        return False
+
+    clipping = payload.get("clipping")
+    if type(clipping) is not dict or set(clipping) != {
+        "fractions",
+        "clip_level",
+        "warning_fraction",
+        "warning",
+    }:
+        return False
+    fractions = clipping.get("fractions")
+    if (
+        type(fractions) is not list
+        or len(fractions) != 3
+        or not all(_finite_json_number(value) and 0.0 <= value <= 1.0 for value in fractions)
+    ):
+        return False
+    clip_level = clipping.get("clip_level")
+    warning_fraction = clipping.get("warning_fraction")
+    if (
+        not _finite_json_number(clip_level)
+        or not 0.0 < clip_level <= 1.0
+        or not _finite_json_number(warning_fraction)
+        or not 0.0 <= warning_fraction <= 1.0
+    ):
+        return False
+    warning = clipping.get("warning")
+    if type(warning) is not bool or warning is not (max(fractions) > warning_fraction):
+        return False
+
+    focus = payload.get("focus_detail")
+    if type(focus) is not dict or set(focus) != {"method", "verdict", "score", "texture_span"}:
+        return False
+    if focus.get("method") != "normalized-gradient-v1":
+        return False
+    focus_verdict = focus.get("verdict")
+    if focus_verdict not in ("measured", "indeterminate"):
+        return False
+    score = focus.get("score")
+    if score is not None and (not _finite_json_number(score) or score < 0):
+        return False
+    focus_texture_span = focus.get("texture_span")
+    if not _finite_json_number(focus_texture_span) or focus_texture_span < 0:
+        return False
+    if focus_verdict == "measured":
+        return score is not None and focus_texture_span > 0
+    return score is None
+
+
+def _fine_qc_valid(
+    output: Path,
+    record: RollFrameRecord,
+    recipe: FineScanRecipe,
+    device_id: str,
+) -> bool:
+    payload = _read_fine_qc(_fine_qc_path(output))
+    expected_keys = {
+        "version",
+        "accepted",
+        "frame",
+        "device_id",
+        "fine_recipe",
+        "registered_geometry",
+        "artifacts",
+        "split_alignment",
+        "stopped_transport_smear",
+        "clipping",
+        "focus_detail",
+        "human_overrides",
+        "device_health",
+    }
+    if (
+        payload is None
+        or set(payload) != expected_keys
+        or type(payload.get("version")) is not int
+        or payload.get("version") != FINE_QC_VERSION
+        or payload.get("accepted") is not True
+    ):
+        return False
+    if record.registration is None:
+        return False
+    if (
+        payload.get("frame") != record.frame
+        or payload.get("device_id") != device_id
+        or payload.get("fine_recipe") != asdict(recipe)
+        or payload.get("registered_geometry") != asdict(record.registration.geometry)
+    ):
+        return False
+    artifacts = payload.get("artifacts")
+    if type(artifacts) is not dict:
+        return False
+    rgb = artifacts.get("rgb")
+    if type(rgb) is not dict:
+        return False
+    try:
+        root = output.parents[1]
+        live_rgb = _fine_artifact_evidence(output, root=root)
+        _require_fine_artifact(
+            live_rgb,
+            frame=record.frame,
+            expected_shape=cast(tuple[int, ...], record.fine_rgb_shape),
+            expected_dpi=recipe.dpi,
+            label="RGB",
+        )
+        if rgb != live_rgb:
+            return False
+        if recipe.capture_ir:
+            ir = artifacts.get("ir")
+            if type(ir) is not dict:
+                return False
+            ir_output = output.with_name(f"{output.stem}_IR.tif")
+            live_ir = _fine_artifact_evidence(ir_output, root=root)
+            _require_fine_artifact(
+                live_ir,
+                frame=record.frame,
+                expected_shape=cast(tuple[int, ...], record.fine_ir_shape),
+                expected_dpi=recipe.dpi,
+                label="IR",
+            )
+            if ir != live_ir:
+                return False
+            rgb_shape = cast(list[int], live_rgb["shape"])
+            ir_shape = cast(list[int], live_ir["shape"])
+            if rgb_shape[:2] != ir_shape:
+                return False
+        elif artifacts.get("ir") is not None:
+            return False
+
+        overrides = payload.get("human_overrides")
+        if type(overrides) is not dict or set(overrides) != {"allow_indeterminate_stopped_transport_smear"}:
+            return False
+        allow_indeterminate = overrides.get("allow_indeterminate_stopped_transport_smear")
+        if type(allow_indeterminate) is not bool:
+            return False
+        if not _fine_qc_telemetry_valid(
+            payload,
+            allow_indeterminate=allow_indeterminate,
+            expected_dpi=recipe.dpi,
+            image_height=int(cast(list[int], live_rgb["shape"])[0]),
+        ):
+            return False
+
+        alignment_payload = payload.get("split_alignment")
+        alignment = None
+        if alignment_payload is not None:
+            if type(alignment_payload) is not dict or set(alignment_payload) != {
+                "mode",
+                "dx_px",
+                "dy_px",
+                "phase_responses",
+                "channel_spread_px",
+                "ecc_coefficient",
+            }:
+                return False
+            phase_responses = alignment_payload.get("phase_responses")
+            if type(phase_responses) is not list:
+                return False
+            alignment = SplitIrAlignment(
+                mode=cast(str, alignment_payload.get("mode")),
+                dx_px=float(cast(float, alignment_payload.get("dx_px"))),
+                dy_px=float(cast(float, alignment_payload.get("dy_px"))),
+                phase_responses=tuple(float(value) for value in phase_responses),
+                channel_spread_px=(
+                    None
+                    if alignment_payload.get("channel_spread_px") is None
+                    else float(cast(float, alignment_payload.get("channel_spread_px")))
+                ),
+                ecc_coefficient=(
+                    None
+                    if alignment_payload.get("ecc_coefficient") is None
+                    else float(cast(float, alignment_payload.get("ecc_coefficient")))
+                ),
+            )
+        split_capture = recipe.capture_ir and recipe.samples_per_scan > 1 and "coolscan" in device_id.lower()
+        if split_capture and not split_alignment_metrics_confident(
+            alignment,
+            image_width=int(cast(list[int], live_rgb["shape"])[1]),
+        ):
+            return False
+
+        health = payload.get("device_health")
+        if (
+            type(health) is not dict
+            or set(health) != {"fresh_probe", "id", "vendor", "model"}
+            or health.get("fresh_probe") is not True
+            or health.get("id") != device_id
+            or type(health.get("vendor")) is not str
+            or not health.get("vendor")
+            or type(health.get("model")) is not str
+            or not health.get("model")
+        ):
+            return False
+    except (OSError, OverflowError, RuntimeError, TypeError, ValueError, tifffile.TiffFileError):
+        return False
+    return True
+
+
+def _resolution_matches_dpi(resolution: tuple[int, int] | None, expected_dpi: int) -> bool:
+    if resolution is None or expected_dpi <= 0:
+        return False
+    numerator, denominator = resolution
+    return numerator > 0 and denominator > 0 and numerator == expected_dpi * denominator
+
+
+def _fine_artifact_evidence(path: Path, *, root: Path) -> dict[str, object]:
+    inspection = inspect_tiff_payload(path)
+    return {
+        "path": str(path.relative_to(root)),
+        "sha256": inspection.sha256,
+        "bytes": inspection.byte_length,
+        "shape": list(inspection.shape),
+        "dtype": inspection.dtype,
+        "page_count": inspection.page_count,
+        "payload_within_file": inspection.payload_within_file,
+        "x_resolution": list(inspection.x_resolution) if inspection.x_resolution is not None else None,
+        "y_resolution": list(inspection.y_resolution) if inspection.y_resolution is not None else None,
+        "resolution_unit": inspection.resolution_unit,
+    }
+
+
+def _require_fine_artifact(
+    evidence: Mapping[str, object],
+    *,
+    frame: int,
+    expected_shape: tuple[int, ...],
+    expected_dpi: int,
+    label: str,
+) -> None:
+    x_resolution = evidence["x_resolution"]
+    y_resolution = evidence["y_resolution"]
+    x_pair = tuple(x_resolution) if isinstance(x_resolution, list) else None
+    y_pair = tuple(y_resolution) if isinstance(y_resolution, list) else None
+    valid = (
+        evidence["shape"] == list(expected_shape)
+        and evidence["dtype"] == "uint16"
+        and evidence["page_count"] == 1
+        and evidence["payload_within_file"] is True
+        and evidence["resolution_unit"] == "INCH"
+        and _resolution_matches_dpi(cast(tuple[int, int] | None, x_pair), expected_dpi)
+        and _resolution_matches_dpi(cast(tuple[int, int] | None, y_pair), expected_dpi)
+    )
+    if not valid:
+        raise RuntimeError(f"frame {frame}: fine {label} artifact failed committed TIFF metadata QC")
+
+
 def _aligned_record_valid(root: Path, record: RollFrameRecord) -> bool:
     if record.aligned_path is None or record.verification is None:
         return False
@@ -749,10 +1071,7 @@ def _aligned_record_valid(root: Path, record: RollFrameRecord) -> bool:
         preview = tifffile.imread(path)
     except (OSError, ValueError, tifffile.TiffFileError):
         return False
-    return (
-        tuple(int(value) for value in preview.shape) == record.aligned_rgb_shape
-        and np.dtype(preview.dtype).name == record.aligned_dtype
-    )
+    return tuple(int(value) for value in preview.shape) == record.aligned_rgb_shape and np.dtype(preview.dtype).name == record.aligned_dtype
 
 
 class RollScanService:
@@ -803,6 +1122,100 @@ class RollScanService:
         write_tiff_16bit(result, str(path))
         return str(path.relative_to(path.parents[1]))
 
+    def _write_fine_qc(
+        self,
+        *,
+        root: Path,
+        output: Path,
+        frame: int,
+        device_id: str,
+        recipe: FineScanRecipe,
+        geometry: RegisteredScanGeometry,
+        result,
+        allow_indeterminate_smear: bool,
+    ) -> None:
+        rgb_evidence = _fine_artifact_evidence(output, root=root)
+        _require_fine_artifact(
+            rgb_evidence,
+            frame=frame,
+            expected_shape=tuple(int(value) for value in result.rgb.shape),
+            expected_dpi=recipe.dpi,
+            label="RGB",
+        )
+
+        ir_evidence = None
+        if recipe.capture_ir:
+            if result.ir is None:
+                raise RuntimeError(f"frame {frame}: fine QC requires the requested IR artifact")
+            ir_output = output.with_name(f"{output.stem}_IR.tif")
+            ir_evidence = _fine_artifact_evidence(ir_output, root=root)
+            _require_fine_artifact(
+                ir_evidence,
+                frame=frame,
+                expected_shape=tuple(int(value) for value in result.ir.shape),
+                expected_dpi=recipe.dpi,
+                label="IR",
+            )
+            if tuple(result.rgb.shape[:2]) != tuple(result.ir.shape):
+                raise RuntimeError(f"frame {frame}: committed RGB and IR shapes do not match")
+
+        split_capture = (
+            recipe.capture_ir
+            and recipe.samples_per_scan > 1
+            and ("coolscan" in device_id.lower() or "coolscan" in result.device_model.lower())
+        )
+        if split_capture and not split_alignment_metrics_confident(
+            result.ir_alignment,
+            image_width=int(result.rgb.shape[1]),
+        ):
+            raise RuntimeError(f"frame {frame}: Coolscan split-capture alignment failed QC")
+
+        committed_rgb = tifffile.imread(output)
+        smear = assess_stopped_transport_smear(committed_rgb, dpi=recipe.dpi)
+        if smear.verdict == "smear":
+            raise RuntimeError(f"frame {frame}: fine QC detected stopped-transport smear")
+        if smear.verdict == "indeterminate" and not allow_indeterminate_smear:
+            raise RuntimeError(
+                f"frame {frame}: stopped-transport smear QC is {smear.verdict!r}; "
+                "an indeterminate result requires an explicit human override"
+            )
+        clipping = measure_scan_clipping(committed_rgb)
+        focus_detail = measure_focus_detail(committed_rgb)
+
+        try:
+            device = self._scanner.probe_device(device_id)
+        except Exception as exc:
+            raise RuntimeError(f"frame {frame}: fresh scanner health probe failed: {exc}") from exc
+        if device.id != device_id:
+            raise RuntimeError(f"frame {frame}: fresh scanner probe returned {device.id!r}, expected {device_id!r}")
+
+        sidecar = {
+            "version": FINE_QC_VERSION,
+            "accepted": True,
+            "frame": frame,
+            "device_id": device_id,
+            "fine_recipe": asdict(recipe),
+            "registered_geometry": asdict(geometry),
+            "artifacts": {
+                "rgb": rgb_evidence,
+                "ir": ir_evidence,
+            },
+            "split_alignment": asdict(result.ir_alignment) if result.ir_alignment is not None else None,
+            "stopped_transport_smear": asdict(smear),
+            "clipping": asdict(clipping),
+            "focus_detail": asdict(focus_detail),
+            "human_overrides": {
+                "allow_indeterminate_stopped_transport_smear": allow_indeterminate_smear,
+            },
+            "device_health": {
+                "fresh_probe": True,
+                "id": device.id,
+                "vendor": device.vendor,
+                "model": device.model,
+            },
+        }
+        _atomic_write_json(_fine_qc_path(output), sidecar)
+
     def prepare_roll(
         self,
         *,
@@ -824,9 +1237,7 @@ class RollScanService:
         if type(minimum_preview_count) is not int or minimum_preview_count < 1:
             raise ValueError("registration minimum_preview_count must be a positive integer")
         if len(selected) < minimum_preview_count:
-            raise ValueError(
-                f"registration requires at least {minimum_preview_count} preview frames; got {len(selected)}"
-            )
+            raise ValueError(f"registration requires at least {minimum_preview_count} preview frames; got {len(selected)}")
         if preview_params.area is not None:
             raise ValueError("roll registration requires area=None")
         if preview_params.dpi != self._registration.preview_dpi:
@@ -1084,6 +1495,7 @@ class RollScanService:
         stop: threading.Event,
         frames: Sequence[int] | None = None,
         progress: ProgressCallback | None = None,
+        allow_indeterminate_smear_frames: Sequence[int] = (),
     ) -> RollScanPlan:
         """Scan approved frames at fine resolution using saved geometry."""
 
@@ -1100,8 +1512,7 @@ class RollScanService:
         if invalid_previews:
             joined = ", ".join(str(frame) for frame in invalid_previews)
             raise RuntimeError(
-                "fine scan refused: aligned preview is missing or invalid for frame(s) "
-                f"{joined}; run preview preparation and review again"
+                f"fine scan refused: aligned preview is missing or invalid for frame(s) {joined}; run preview preparation and review again"
             )
         if fine_params.area is not None:
             raise ValueError("registered fine scans require area=None")
@@ -1112,15 +1523,19 @@ class RollScanService:
         unknown = sorted(set(selected) - set(available))
         if unknown:
             raise ValueError("fine-scan frames are absent from the approved plan: " + ", ".join(str(frame) for frame in unknown))
+        override_frames = self._validate_frames(allow_indeterminate_smear_frames) if allow_indeterminate_smear_frames else ()
+        unknown_overrides = sorted(set(override_frames) - set(selected))
+        if unknown_overrides:
+            raise ValueError(
+                "indeterminate-smear override frames are absent from this fine-scan selection: "
+                + ", ".join(str(frame) for frame in unknown_overrides)
+            )
 
         root = path.parent
         transfer_cancel = threading.Event()
         records = list(plan.frames)
         record_indexes = {record.frame: index for index, record in enumerate(records)}
-        requires_transfer = any(
-            not _fine_record_valid(root, records[record_indexes[frame]], recipe)
-            for frame in selected
-        )
+        requires_transfer = any(not _fine_record_valid(root, records[record_indexes[frame]], recipe, plan.device_id) for frame in selected)
         if requires_transfer and plan.stage is RollStage.COMPLETE:
             # Persist a schema-valid, resumable state before the first changed
             # artifact. Per-frame checkpoints may temporarily contain mixed
@@ -1132,7 +1547,7 @@ class RollScanService:
                 break
             index = record_indexes[frame]
             record = records[index]
-            if _fine_record_valid(root, record, recipe):
+            if _fine_record_valid(root, record, recipe, plan.device_id):
                 continue
             registration = record.registration
             if registration is None:
@@ -1149,9 +1564,7 @@ class RollScanService:
                 transfer_cancel,
             )
             if result.dpi != recipe.dpi:
-                raise RuntimeError(
-                    f"frame {frame}: scanner returned {result.dpi} dpi for a {recipe.dpi} dpi request"
-                )
+                raise RuntimeError(f"frame {frame}: scanner returned {result.dpi} dpi for a {recipe.dpi} dpi request")
             if (result.ir is not None) != recipe.capture_ir:
                 expected = "with" if recipe.capture_ir else "without"
                 raise RuntimeError(f"frame {frame}: scanner result was not returned {expected} the requested IR channel")
@@ -1162,14 +1575,26 @@ class RollScanService:
             )
             fine_path = self._write_preview(result, root / "fine" / fine_filename)
             fine_output = root / fine_path
-            fine_rgb_shape, fine_dtype = _tiff_signature(fine_output)
-            if result.ir is None:
-                fine_ir_shape = None
-                fine_ir_dtype = None
-            else:
-                fine_ir_shape, fine_ir_dtype = _tiff_signature(
-                    fine_output.with_name(f"{fine_output.stem}_IR.tif")
-                )
+            _fine_qc_path(fine_output).unlink(missing_ok=True)
+            try:
+                fine_rgb_shape, fine_dtype = _tiff_signature(fine_output)
+                if result.ir is None:
+                    fine_ir_shape = None
+                    fine_ir_dtype = None
+                else:
+                    fine_ir_shape, fine_ir_dtype = _tiff_signature(fine_output.with_name(f"{fine_output.stem}_IR.tif"))
+            except (OSError, ValueError, tifffile.TiffFileError) as exc:
+                raise RuntimeError(f"frame {frame}: fine RGB artifact failed committed TIFF metadata QC") from exc
+            self._write_fine_qc(
+                root=root,
+                output=fine_output,
+                frame=frame,
+                device_id=plan.device_id,
+                recipe=recipe,
+                geometry=registration.geometry,
+                result=result,
+                allow_indeterminate_smear=frame in override_frames,
+            )
             records[index] = replace(
                 record,
                 fine_path=fine_path,
@@ -1184,7 +1609,9 @@ class RollScanService:
             _atomic_write_json(path, plan.to_dict())
 
         stage = (
-            RollStage.COMPLETE if all(_fine_record_valid(root, record, recipe) for record in records) else RollStage.APPROVED
+            RollStage.COMPLETE
+            if all(_fine_record_valid(root, record, recipe, plan.device_id) for record in records)
+            else RollStage.APPROVED
         )
         plan = replace(plan, stage=stage, frames=tuple(records))
         _atomic_write_json(path, plan.to_dict())

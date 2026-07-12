@@ -7,6 +7,7 @@ SANE_FRAME_RGB (pieusb convention). python-sane's C reader hardcodes
 misshaped — `_reinterpret_channels` recovers it from the frame geometry.
 """
 
+import math
 import threading
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,6 +18,7 @@ import pytest
 from negpy.infrastructure.scanners.params import RegisteredScanGeometry, ScanMode, ScanParams
 from negpy.infrastructure.scanners.sane_backend import (
     SaneBackend,
+    _align_split_ir,
     _caps_from_options,
     _detect_ir,
     _find_ir_option,
@@ -41,14 +43,12 @@ class FakeOption:
         return self.settable
 
 
-
 COOLSCAN3_OPT = {
     "infrared": FakeOption(),
     "depth": FakeOption(constraint=[8, 16]),
     "resolution": FakeOption(constraint=[4000, 2000, 1000]),
     "frame": FakeOption(constraint=(1, 40, 1)),
     "frame_count": FakeOption(constraint=(1, 40, 1)),
-
     "subframe": FakeOption(constraint=(0.0, 37.8333, 0.0)),
     "br_y": FakeOption(constraint=(0, 5958, 1)),
     "autofocus": FakeOption(),
@@ -242,14 +242,6 @@ class FakeSaneDev:
         self.recorded[name] = value
         self.events.append(("set", name, value))
 
-    def __getattr__(self, name: str) -> Any:
-        # python-sane exposes every known option as a readable attribute; the
-        # scan path hasattr-guards geometry writes, so reads must not raise.
-        if name in self.opt_map:
-            return self.recorded.get(name)
-        raise AttributeError(f"No readable SANE option: {name}")
-
-
     def start(self) -> None:
         self.events.append(("start",))
 
@@ -288,6 +280,81 @@ class ParameterOverrideFakeSaneDev(FakeSaneDev):
         return self.parameters
 
 
+class SplitCaptureFakeSaneDev(FakeSaneDev):
+    """Coolscan fake that rejects multisampled IR like the real LS-5000.
+
+    It accepts an N-pass RGB capture and a later 1-pass RGBI capture on the
+    same open handle.  Asking for N-pass RGBI reproduces the user-visible
+    failure that the split-capture path must avoid.
+
+    The exposure counter is enforced only while the `frame_count` option is
+    active, mirroring the real backend: a single-frame holder marks it
+    inactive and never decrements or checks it.
+    """
+
+    _INTERNAL = FakeSaneDev._INTERNAL + (
+        "multi_rgb",
+        "single_rgbi",
+        "active_frame",
+        "start_settings",
+        "remaining_frame_count",
+        "on_set",
+    )
+
+    def __init__(self, multi_rgb: np.ndarray, single_rgbi: np.ndarray, opt_map: dict | None = None) -> None:
+        super().__init__(single_rgbi, opt_map=opt_map)
+        object.__setattr__(self, "multi_rgb", multi_rgb)
+        object.__setattr__(self, "single_rgbi", single_rgbi)
+        object.__setattr__(self, "active_frame", single_rgbi)
+        object.__setattr__(self, "start_settings", [])
+        object.__setattr__(self, "remaining_frame_count", 1)
+        object.__setattr__(self, "on_set", None)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "frame_count":
+            object.__setattr__(self, "remaining_frame_count", int(value))
+        super().__setattr__(name, value)
+        hook = self.on_set
+        if hook is not None and name not in self._INTERNAL:
+            hook(name, value)
+
+    def _counter_enforced(self) -> bool:
+        option = self.opt_map.get("frame_count")
+        return option is not None and option.is_active()
+
+    def start(self) -> None:
+        if self._counter_enforced() and self.remaining_frame_count == 0:
+            raise OSError("no more frames")
+        settings = dict(self.recorded)
+        self.start_settings.append(settings)
+        self.events.append(("start",))
+        infrared = bool(settings.get("infrared", False))
+        samples = int(settings.get("samples_per_scan", 1))
+        if infrared and samples > 1:
+            object.__setattr__(self, "active_frame", None)
+        elif infrared:
+            object.__setattr__(self, "active_frame", self.single_rgbi)
+        else:
+            object.__setattr__(self, "active_frame", self.multi_rgb)
+
+    def get_parameters(self):
+        frame = self.active_frame if self.active_frame is not None else self.single_rgbi
+        h, w, channels = frame.shape
+        return ("color", 1, (w, h), 16, w * channels * 2)
+
+    def arr_snap(self, progress=None) -> np.ndarray:
+        if self.active_frame is None:
+            raise OSError("LS-5000 wedged by multisampled infrared")
+        frame = self.active_frame
+        if progress is not None:
+            for i in range(1, frame.shape[0] + 1):
+                progress(i, frame.shape[0])
+        object.__setattr__(self, "remaining_frame_count", 0)
+        if frame.shape[2] == 3:
+            return frame
+        return _emulate_python_sane_read(frame)
+
+
 @dataclass
 class FakeSaneModule:
     dev: FakeSaneDev
@@ -303,47 +370,7 @@ def _make_backend(dev: FakeSaneDev) -> SaneBackend:
     backend._sane = FakeSaneModule(dev)
     backend._sane_initialized = True
     backend._devices_cache = None
-    backend._id_remap = {}
-    backend._active_sessions = {}
-    backend._session_lock = threading.Lock()
     return backend
-
-
-def test_scan_initializes_sane_before_opening_a_fresh_backend() -> None:
-    true = np.zeros((6, 5, 3), dtype=np.uint16)
-    dev = FakeSaneDev(true)
-
-    class InitRequiredSaneModule:
-        def __init__(self) -> None:
-            self.initialized = False
-            self.init_calls = 0
-
-        def init(self) -> None:
-            self.initialized = True
-            self.init_calls += 1
-
-        def open(self, _device_id: str) -> FakeSaneDev:
-            assert self.initialized
-            return dev
-
-    module = InitRequiredSaneModule()
-    backend = SaneBackend.__new__(SaneBackend)
-    backend._sane = module
-    backend._sane_initialized = False
-    backend._devices_cache = None
-    backend._id_remap = {}
-    backend._active_sessions = {}
-    backend._session_lock = threading.Lock()
-
-    result = backend.scan(
-        "coolscan3:usb:test",
-        ScanParams(dpi=1000, depth=16, capture_ir=False),
-        None,
-        threading.Event(),
-    )
-
-    assert module.init_calls == 1
-    assert result.rgb.shape == (6, 5, 3)
 
 
 class TestScanWithOptionStrategy:
@@ -362,6 +389,7 @@ class TestScanWithOptionStrategy:
         assert result.ir is not None and result.ir.shape == (6, 5)
         assert np.array_equal(result.rgb, true[:, :, :3])
         assert np.array_equal(result.ir, true[:, :, 3])
+        assert result.ir_alignment is None  # single-capture path measures nothing
 
     def test_ir_split_with_python_sane_truncation(self) -> None:
         # 4h % 3 == 1: python-sane drops the stream tail (real LS-5000 case);
@@ -573,7 +601,7 @@ class TestPieusbCompatibility:
 
     def test_direct_pieusb_keeps_internal_strategy_and_flags(self) -> None:
         rng = np.random.default_rng(710)
-        true = rng.integers(0, 65535, size=(6, 5, 4), dtype=np.uint16)
+        true = rng.integers(0, 65535, size=(6, 5, 3), dtype=np.uint16)
         dev = FakeSaneDev(true, opt_map=self._options())
         backend = _make_backend(dev)
 
@@ -584,10 +612,10 @@ class TestPieusbCompatibility:
             threading.Event(),
         )
 
-        assert dev.recorded["mode"] == "RGBI"
-        assert dev.recorded["clean_image"] is False
+        assert dev.recorded["mode"] == "Color"
+        assert dev.recorded["clean_image"] is True
         assert dev.recorded["correct_infrared"] is True
-        assert result.ir is not None
+        assert result.ir is None
 
     def test_net_pieusb_prefix_alone_does_not_add_film_sources(self) -> None:
         caps = _caps_from_options({}, "net:scanner:pieusb:libusb:001:004")
@@ -645,8 +673,8 @@ class TestGenericRgbiCompatibility:
         assert result.ir is None
 
 
-class TestAutofocusControls:
-    """Autofocus plumbing and archival fail-loud semantics."""
+class TestArchivalControls:
+    """Autofocus + multi-sampling plumbing and archival fail-loud semantics."""
 
     def _scan(self, params: ScanParams, dev: FakeSaneDev):
         backend = _make_backend(dev)
@@ -664,6 +692,216 @@ class TestAutofocusControls:
         self._scan(ScanParams(dpi=1000, depth=16, capture_ir=True, autofocus=False), dev)
         assert "autofocus" not in dev.recorded
 
+    @pytest.mark.parametrize("constraint", ((1, 16, 1), [1, 2, 4, 16]))
+    def test_supported_samples_per_scan_recorded(self, constraint: tuple[int, ...] | list[int]) -> None:
+        rng = np.random.default_rng(15)
+        opt = dict(COOLSCAN3_OPT)
+        opt["samples_per_scan"] = FakeOption(constraint=constraint)
+        dev = FakeSaneDev(rng.integers(0, 65535, size=(6, 5, 3), dtype=np.uint16), opt_map=opt)
+        self._scan(ScanParams(dpi=1000, depth=16, capture_ir=False, samples_per_scan=16), dev)
+        assert dev.recorded.get("samples_per_scan") == 16
+
+    def test_coolscan_multisample_ir_uses_two_captures_without_repositioning(self) -> None:
+        rng = np.random.default_rng(151)
+        multi_rgb = rng.integers(0, 65535, size=(6, 5, 3), dtype=np.uint16)
+        ir = rng.integers(0, 65535, size=(6, 5), dtype=np.uint16)
+        single_rgbi = np.dstack((multi_rgb, ir))
+        dev = SplitCaptureFakeSaneDev(multi_rgb, single_rgbi)
+        backend = _make_backend(dev)
+
+        result = backend.scan(
+            "coolscan3:usb:libusb:001:007",
+            ScanParams(
+                dpi=4000,
+                depth=16,
+                capture_ir=True,
+                samples_per_scan=4,
+                frame=3,
+                auto_exposure=True,
+            ),
+            None,
+            threading.Event(),
+        )
+
+        assert np.array_equal(result.rgb, multi_rgb)
+        assert result.ir is not None and np.array_equal(result.ir, ir)
+        # One reservation is a design requirement: both captures must ride a
+        # single sane.open() so the feeder can never be repositioned between.
+        assert backend._sane.opened == ["coolscan3:usb:libusb:001:007"]
+        assert result.ir_alignment is not None
+        assert result.ir_alignment.mode == "identity"
+        assert result.ir_alignment.dx_px == 0.0 and result.ir_alignment.dy_px == 0.0
+        assert len(dev.start_settings) == 2
+        assert dev.start_settings[0]["samples_per_scan"] == 4
+        assert dev.start_settings[0].get("infrared", False) is False
+        assert dev.start_settings[0]["autofocus"] is True
+        assert dev.start_settings[0]["ae"] is True
+        assert dev.start_settings[1]["samples_per_scan"] == 1
+        assert dev.start_settings[1]["infrared"] is True
+        assert dev.start_settings[1]["autofocus"] is False
+        assert dev.start_settings[1]["ae"] is False
+
+        start_indices = [i for i, event in enumerate(dev.events) if event == ("start",)]
+        frame_sets = [i for i, event in enumerate(dev.events) if event[:2] == ("set", "frame")]
+        frame_count_sets = [i for i, event in enumerate(dev.events) if event[:2] == ("set", "frame_count")]
+        assert len(start_indices) == 2
+        assert len(frame_sets) == 1 and frame_sets[0] < start_indices[0]
+        assert frame_count_sets and start_indices[0] < frame_count_sets[-1] < start_indices[1]
+
+    def test_coolscan_split_capture_validates_second_pass_rgbi_metadata(self) -> None:
+        class ThreeChannelSecondPassMetadata(SplitCaptureFakeSaneDev):
+            def get_parameters(self):
+                frame_format, last, (width, lines), depth, bytes_per_line = super().get_parameters()
+                if len(self.start_settings) == 2:
+                    bytes_per_line = width * 3 * math.ceil(depth / 8)
+                return frame_format, last, (width, lines), depth, bytes_per_line
+
+        rng = np.random.default_rng(706)
+        multi_rgb = rng.integers(0, 65535, size=(6, 5, 3), dtype=np.uint16)
+        ir = rng.integers(0, 65535, size=(6, 5), dtype=np.uint16)
+        dev = ThreeChannelSecondPassMetadata(multi_rgb, np.dstack((multi_rgb, ir)))
+        backend = _make_backend(dev)
+
+        with pytest.raises(RuntimeError, match="Single-pass Coolscan.*bytes_per_line 30.*expected 40"):
+            backend.scan(
+                "coolscan3:usb:libusb:001:007",
+                ScanParams(dpi=1000, depth=16, capture_ir=True, samples_per_scan=4),
+                None,
+                threading.Event(),
+            )
+
+        assert len(dev.start_settings) == 2
+        assert dev.cancelled
+
+    def test_coolscan_split_capture_rejects_nonterminal_second_pass_before_read(self) -> None:
+        class NonterminalSecondPass(SplitCaptureFakeSaneDev):
+            _INTERNAL = SplitCaptureFakeSaneDev._INTERNAL + ("read_count",)
+
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                object.__setattr__(self, "read_count", 0)
+
+            def get_parameters(self):
+                frame_format, last, dimensions, depth, bytes_per_line = super().get_parameters()
+                if len(self.start_settings) == 2:
+                    last = False
+                return frame_format, last, dimensions, depth, bytes_per_line
+
+            def arr_snap(self, progress=None) -> np.ndarray:
+                object.__setattr__(self, "read_count", self.read_count + 1)
+                return super().arr_snap(progress=progress)
+
+        rng = np.random.default_rng(708)
+        multi_rgb = rng.integers(0, 65535, size=(6, 5, 3), dtype=np.uint16)
+        ir = rng.integers(0, 65535, size=(6, 5), dtype=np.uint16)
+        dev = NonterminalSecondPass(multi_rgb, np.dstack((multi_rgb, ir)))
+        backend = _make_backend(dev)
+
+        with pytest.raises(RuntimeError, match="Single-pass Coolscan.*last_frame.*true"):
+            backend.scan(
+                "coolscan3:usb:libusb:001:007",
+                ScanParams(dpi=1000, depth=16, capture_ir=True, samples_per_scan=4),
+                None,
+                threading.Event(),
+            )
+
+        assert len(dev.start_settings) == 2
+        assert dev.read_count == 1
+        assert dev.cancelled
+
+    def test_coolscan_split_capture_aligns_ir_to_multisampled_rgb(self) -> None:
+        rng = np.random.default_rng(152)
+        height, width = 120, 160
+        dx, dy = 4, 3
+        base = rng.integers(2000, 62000, size=(height, width), dtype=np.uint16)
+        multi_rgb = np.repeat(base[:, :, None], 3, axis=2)
+        target_ir = rng.integers(1000, 64000, size=(height, width), dtype=np.uint16)
+
+        def shifted(array: np.ndarray) -> np.ndarray:
+            out = np.zeros_like(array)
+            out[dy:, dx:] = array[: height - dy, : width - dx]
+            return out
+
+        proxy_rgb = shifted(multi_rgb)
+        moving_ir = shifted(target_ir)
+        dev = SplitCaptureFakeSaneDev(
+            multi_rgb,
+            np.dstack((proxy_rgb, moving_ir)),
+        )
+
+        result = self._scan(
+            ScanParams(
+                dpi=4000,
+                depth=16,
+                capture_ir=True,
+                samples_per_scan=4,
+                frame=3,
+            ),
+            dev,
+        )
+
+        assert result.rgb.shape == (height - dy, width - dx, 3)
+        assert result.ir is not None and result.ir.shape == (height - dy, width - dx)
+        assert np.array_equal(result.rgb, multi_rgb[: height - dy, : width - dx])
+        error = np.abs(result.ir.astype(np.int32) - target_ir[: height - dy, : width - dx].astype(np.int32))
+        assert float(np.percentile(error, 99)) <= 2.0
+        alignment = result.ir_alignment
+        assert alignment is not None and alignment.mode == "phase-ecc"
+        assert abs(alignment.dx_px - dx) <= 0.5 and abs(alignment.dy_px - dy) <= 0.5
+        assert min(alignment.phase_responses) >= 0.10
+        assert alignment.ecc_coefficient is not None and alignment.ecc_coefficient >= 0.65
+
+    def test_coolscan_split_capture_progress_spans_both_reads(self) -> None:
+        rng = np.random.default_rng(153)
+        multi_rgb = rng.integers(0, 65535, size=(12, 10, 3), dtype=np.uint16)
+        ir = rng.integers(0, 65535, size=(12, 10), dtype=np.uint16)
+        dev = SplitCaptureFakeSaneDev(multi_rgb, np.dstack((multi_rgb, ir)))
+        backend = _make_backend(dev)
+        seen: list[float] = []
+
+        backend.scan(
+            "coolscan3:usb:libusb:001:007",
+            ScanParams(dpi=4000, depth=16, capture_ir=True, samples_per_scan=4),
+            seen.append,
+            threading.Event(),
+        )
+
+        assert seen[0] == 0.0 and seen[-1] == 1.0
+        assert seen == sorted(seen)
+        assert any(0.0 < value < 0.75 for value in seen)
+        assert any(0.75 < value < 1.0 for value in seen)
+
+    def test_coolscan_split_capture_cancelled_between_reads_never_starts_ir(self) -> None:
+        rng = np.random.default_rng(154)
+        multi_rgb = rng.integers(0, 65535, size=(12, 10, 3), dtype=np.uint16)
+        ir = rng.integers(0, 65535, size=(12, 10), dtype=np.uint16)
+        dev = SplitCaptureFakeSaneDev(multi_rgb, np.dstack((multi_rgb, ir)))
+        backend = _make_backend(dev)
+        cancel = threading.Event()
+
+        def stop_after_rgb(fraction: float) -> None:
+            if fraction >= 0.75:
+                cancel.set()
+
+        with pytest.raises(RuntimeError, match="cancelled"):
+            backend.scan(
+                "coolscan3:usb:libusb:001:007",
+                ScanParams(dpi=4000, depth=16, capture_ir=True, samples_per_scan=4),
+                stop_after_rgb,
+                cancel,
+            )
+
+        assert len(dev.start_settings) == 1
+
+    def test_samples_without_option_raises(self) -> None:
+        import pytest
+
+        rng = np.random.default_rng(16)
+        opt = {k: v for k, v in COOLSCAN3_OPT.items() if k != "samples_per_scan"}
+        dev = FakeSaneDev(rng.integers(0, 65535, size=(6, 5, 4), dtype=np.uint16), opt_map=opt)
+        with pytest.raises(RuntimeError, match="multi-sampling"):
+            self._scan(ScanParams(dpi=1000, depth=16, capture_ir=True, samples_per_scan=4), dev)
+
     def test_requested_ir_without_channel_raises(self) -> None:
         import pytest
 
@@ -674,6 +912,366 @@ class TestAutofocusControls:
         with pytest.raises(RuntimeError, match="no 4th channel"):
             self._scan(ScanParams(dpi=1000, depth=16, capture_ir=True), dev)
         assert dev.cancelled
+
+
+def _shifted(array: np.ndarray, dx: int, dy: int) -> np.ndarray:
+    """Displace content by (dx, dy) with zero fill; supports negative shifts."""
+    out = np.zeros_like(array)
+    h, w = array.shape[:2]
+    out[max(0, dy) : h + min(0, dy), max(0, dx) : w + min(0, dx)] = array[max(0, -dy) : h + min(0, -dy), max(0, -dx) : w + min(0, -dx)]
+    return out
+
+
+class TestSplitCaptureHardening:
+    """Fail-closed pre-hardware checklist: option preflight, second-capture
+    boundary failures, cancellation windows, and single-frame holders."""
+
+    DEVICE = "coolscan3:usb:libusb:001:007"
+
+    def _split_dev(self, seed: int = 200, h: int = 12, w: int = 10, opt_map: dict | None = None) -> SplitCaptureFakeSaneDev:
+        rng = np.random.default_rng(seed)
+        multi_rgb = rng.integers(0, 65535, size=(h, w, 3), dtype=np.uint16)
+        ir = rng.integers(0, 65535, size=(h, w), dtype=np.uint16)
+        return SplitCaptureFakeSaneDev(multi_rgb, np.dstack((multi_rgb, ir)), opt_map=opt_map)
+
+    def _params(self, **overrides) -> ScanParams:
+        base: dict[str, Any] = dict(dpi=1000, depth=16, capture_ir=True, samples_per_scan=4)
+        base.update(overrides)
+        return ScanParams(**base)
+
+    def test_single_frame_holder_with_inactive_frame_count_completes(self) -> None:
+        # A true single-frame holder marks frame_count inactive and coolscan3
+        # never decrements/checks it — the split capture must neither require
+        # nor write the option, and both starts must still complete.
+        opt = dict(COOLSCAN3_OPT)
+        opt["frame"] = FakeOption(constraint=(1, 0, 1), active=False)
+        opt["frame_count"] = FakeOption(constraint=(1, 0, 1), active=False)
+        dev = self._split_dev(opt_map=opt)
+        backend = _make_backend(dev)
+
+        result = backend.scan(self.DEVICE, self._params(), None, threading.Event())
+
+        assert result.ir is not None
+        assert len(dev.start_settings) == 2
+        assert not any(event[:2] == ("set", "frame_count") for event in dev.events)
+
+    def test_roll_frame_with_inactive_frame_count_fails_before_positioning(self) -> None:
+        opt = dict(COOLSCAN3_OPT)
+        opt["frame_count"] = FakeOption(constraint=(1, 0, 1), active=False)
+        dev = self._split_dev(opt_map=opt)
+        backend = _make_backend(dev)
+
+        with pytest.raises(RuntimeError, match="frame_count.*inactive"):
+            backend.scan(self.DEVICE, self._params(frame=3), None, threading.Event())
+
+        assert not any(event[0] == "set" and event[1] in {"frame", "subframe", "br_y"} for event in dev.events)
+        assert ("start",) not in dev.events
+
+    def test_inactive_boolean_ir_fails_before_transport_or_geometry_writes(self) -> None:
+        opt = dict(COOLSCAN3_OPT)
+        opt["infrared"] = FakeOption(active=False)
+        dev = self._split_dev(opt_map=opt)
+        backend = _make_backend(dev)
+        geometry = RegisteredScanGeometry(frame=3, subframe_mm=6.35, br_y_device_px=800)
+
+        with pytest.raises(RuntimeError, match="infrared.*inactive"):
+            backend.scan(
+                self.DEVICE,
+                self._params(registered_geometry=geometry),
+                None,
+                threading.Event(),
+            )
+
+        assert not any(event[0] == "set" and event[1] in {"frame", "subframe", "br_y"} for event in dev.events)
+        assert ("start",) not in dev.events
+
+    def test_read_only_boolean_ir_fails_before_transport_or_geometry_writes(self) -> None:
+        opt = dict(COOLSCAN3_OPT)
+        opt["infrared"] = FakeOption(active=True, settable=False)
+        dev = self._split_dev(opt_map=opt)
+        backend = _make_backend(dev)
+        geometry = RegisteredScanGeometry(frame=3, subframe_mm=6.35, br_y_device_px=800)
+
+        with pytest.raises(RuntimeError, match="infrared.*not settable"):
+            backend.scan(
+                self.DEVICE,
+                self._params(registered_geometry=geometry),
+                None,
+                threading.Event(),
+            )
+
+        assert not any(event[0] == "set" and event[1] in {"frame", "subframe", "br_y"} for event in dev.events)
+        assert ("start",) not in dev.events
+
+    def test_indeterminate_ir_settable_state_fails_closed_before_transport(self) -> None:
+        class IndeterminateSettableOption(FakeOption):
+            def is_settable(self) -> bool:
+                raise OSError("descriptor query failed")
+
+        opt = dict(COOLSCAN3_OPT)
+        opt["infrared"] = IndeterminateSettableOption()
+        dev = self._split_dev(opt_map=opt)
+        backend = _make_backend(dev)
+        geometry = RegisteredScanGeometry(frame=3, subframe_mm=6.35, br_y_device_px=800)
+
+        with pytest.raises(RuntimeError, match="Could not determine whether requested SANE option 'infrared' is settable"):
+            backend.scan(
+                self.DEVICE,
+                self._params(registered_geometry=geometry),
+                None,
+                threading.Event(),
+            )
+
+        assert not any(event[0] == "set" and event[1] in {"frame", "subframe", "br_y"} for event in dev.events)
+        assert ("start",) not in dev.events
+
+    def test_read_only_ir_without_is_active_still_fails_before_transport(self) -> None:
+        class SettableOnlyOption:
+            constraint = None
+
+            def is_settable(self) -> bool:
+                return False
+
+        opt = dict(COOLSCAN3_OPT)
+        opt["infrared"] = SettableOnlyOption()
+        dev = self._split_dev(opt_map=opt)
+        backend = _make_backend(dev)
+        geometry = RegisteredScanGeometry(frame=3, subframe_mm=6.35, br_y_device_px=800)
+
+        with pytest.raises(RuntimeError, match="infrared.*not settable"):
+            backend.scan(
+                self.DEVICE,
+                self._params(registered_geometry=geometry),
+                None,
+                threading.Event(),
+            )
+
+        assert not any(event[0] == "set" and event[1] in {"frame", "subframe", "br_y"} for event in dev.events)
+        assert ("start",) not in dev.events
+
+    @pytest.mark.parametrize("break_option", ("missing", "inactive"))
+    def test_multisample_option_validated_before_any_positioning(self, break_option: str) -> None:
+        if break_option == "missing":
+            opt = {k: v for k, v in COOLSCAN3_OPT.items() if k != "samples_per_scan"}
+            expected = "multi-sampling"
+        else:
+            opt = dict(COOLSCAN3_OPT)
+            opt["samples_per_scan"] = FakeOption(constraint=(1, 16, 1), active=False)
+            expected = "samples_per_scan.*inactive"
+        dev = self._split_dev(opt_map=opt)
+        backend = _make_backend(dev)
+        geometry = RegisteredScanGeometry(frame=3, subframe_mm=6.35, br_y_device_px=800)
+
+        with pytest.raises(RuntimeError, match=expected):
+            backend.scan(
+                self.DEVICE,
+                self._params(registered_geometry=geometry, auto_exposure=True),
+                None,
+                threading.Event(),
+            )
+
+        assert not any(event[0] == "set" and event[1] in {"frame", "subframe", "br_y"} for event in dev.events)
+        assert ("start",) not in dev.events
+
+    def test_out_of_range_multisample_value_fails_before_positioning(self) -> None:
+        dev = self._split_dev()
+        backend = _make_backend(dev)
+        geometry = RegisteredScanGeometry(frame=3, subframe_mm=6.35, br_y_device_px=800)
+
+        with pytest.raises(RuntimeError, match="samples_per_scan=17.*constraint"):
+            backend.scan(
+                self.DEVICE,
+                self._params(samples_per_scan=17, registered_geometry=geometry),
+                None,
+                threading.Event(),
+            )
+
+        assert not any(event[0] == "set" and event[1] in {"frame", "subframe", "br_y"} for event in dev.events)
+        assert ("start",) not in dev.events
+
+    def test_unlisted_multisample_value_fails_before_positioning(self) -> None:
+        opt = dict(COOLSCAN3_OPT)
+        opt["samples_per_scan"] = FakeOption(constraint=[1, 2, 4, 16])
+        dev = self._split_dev(opt_map=opt)
+        backend = _make_backend(dev)
+        geometry = RegisteredScanGeometry(frame=3, subframe_mm=6.35, br_y_device_px=800)
+
+        with pytest.raises(RuntimeError, match="samples_per_scan=8.*constraint"):
+            backend.scan(
+                self.DEVICE,
+                self._params(samples_per_scan=8, registered_geometry=geometry),
+                None,
+                threading.Event(),
+            )
+
+        assert not any(event[0] == "set" and event[1] in {"frame", "subframe", "br_y"} for event in dev.events)
+        assert ("start",) not in dev.events
+
+    def test_second_start_failure_is_contextualized_and_cleaned_up(self) -> None:
+        class FailingSecondStart(SplitCaptureFakeSaneDev):
+            def start(self) -> None:
+                if len(self.start_settings) == 1:
+                    raise OSError("SCAN rejected")
+                super().start()
+
+        rng = np.random.default_rng(201)
+        multi_rgb = rng.integers(0, 65535, size=(12, 10, 3), dtype=np.uint16)
+        ir = rng.integers(0, 65535, size=(12, 10), dtype=np.uint16)
+        dev = FailingSecondStart(multi_rgb, np.dstack((multi_rgb, ir)))
+        backend = _make_backend(dev)
+
+        with pytest.raises(RuntimeError, match="Infrared scan failed.*SCAN rejected"):
+            backend.scan(self.DEVICE, self._params(), None, threading.Event())
+
+        assert len(dev.start_settings) == 1
+        assert dev.cancelled and dev.closed
+
+    def test_second_read_failure_is_contextualized_and_cleaned_up(self) -> None:
+        class FailingSecondRead(SplitCaptureFakeSaneDev):
+            _INTERNAL = SplitCaptureFakeSaneDev._INTERNAL + ("reads",)
+
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                object.__setattr__(self, "reads", 0)
+
+            def arr_snap(self, progress=None) -> np.ndarray:
+                object.__setattr__(self, "reads", self.reads + 1)
+                if self.reads == 2:
+                    raise OSError("USB stall mid-frame")
+                return super().arr_snap(progress)
+
+        rng = np.random.default_rng(205)
+        multi_rgb = rng.integers(0, 65535, size=(12, 10, 3), dtype=np.uint16)
+        ir = rng.integers(0, 65535, size=(12, 10), dtype=np.uint16)
+        dev = FailingSecondRead(multi_rgb, np.dstack((multi_rgb, ir)))
+        backend = _make_backend(dev)
+
+        with pytest.raises(RuntimeError, match="Infrared scan failed.*USB stall"):
+            backend.scan(self.DEVICE, self._params(), None, threading.Event())
+
+        assert len(dev.start_settings) == 2
+        assert dev.cancelled and dev.closed
+
+    def test_cancel_immediately_before_second_start_prevents_it(self) -> None:
+        dev = self._split_dev()
+        backend = _make_backend(dev)
+        cancel = threading.Event()
+
+        def cancel_on_ir_enable(name: str, value: Any) -> None:
+            if name == "infrared" and value is True:
+                cancel.set()
+
+        dev.on_set = cancel_on_ir_enable
+
+        with pytest.raises(RuntimeError, match="Scan cancelled"):
+            backend.scan(self.DEVICE, self._params(), None, cancel)
+
+        assert len(dev.start_settings) == 1
+        assert dev.cancelled
+
+    def test_cancel_after_second_read_skips_registration_and_returns_nothing(self) -> None:
+        # Proxy is unrelated to the reference: if registration ran, it would
+        # fail loudly with an alignment error. Seeing "Scan cancelled" instead
+        # proves the post-read cancel check fires before any CV work.
+        rng = np.random.default_rng(202)
+        h, w = 24, 20
+        multi_rgb = rng.integers(0, 65535, size=(h, w, 3), dtype=np.uint16)
+        proxy = np.random.default_rng(203).integers(0, 65535, size=(h, w, 3), dtype=np.uint16)
+        ir = rng.integers(0, 65535, size=(h, w), dtype=np.uint16)
+        dev = SplitCaptureFakeSaneDev(multi_rgb, np.dstack((proxy, ir)))
+        backend = _make_backend(dev)
+        cancel = threading.Event()
+
+        def cancel_during_ir_read(fraction: float) -> None:
+            if 0.75 < fraction < 1.0:
+                cancel.set()
+
+        with pytest.raises(RuntimeError, match="Scan cancelled"):
+            backend.scan(self.DEVICE, self._params(), cancel_during_ir_read, cancel)
+
+        assert len(dev.start_settings) == 2
+        assert dev.cancelled
+
+    def test_negative_shift_alignment_and_crop(self) -> None:
+        rng = np.random.default_rng(204)
+        height, width = 120, 160
+        dx, dy = -4, -3
+        base = rng.integers(2000, 62000, size=(height, width), dtype=np.uint16)
+        multi_rgb = np.repeat(base[:, :, None], 3, axis=2)
+        target_ir = rng.integers(1000, 64000, size=(height, width), dtype=np.uint16)
+        dev = SplitCaptureFakeSaneDev(
+            multi_rgb,
+            np.dstack((_shifted(multi_rgb, dx, dy), _shifted(target_ir, dx, dy))),
+        )
+        backend = _make_backend(dev)
+
+        result = backend.scan(self.DEVICE, self._params(dpi=4000, frame=3), None, threading.Event())
+
+        assert result.rgb.shape == (height + dy, width + dx, 3)
+        assert result.ir is not None and result.ir.shape == (height + dy, width + dx)
+        assert np.array_equal(result.rgb, multi_rgb[-dy:, -dx:])
+        error = np.abs(result.ir.astype(np.int32) - target_ir[-dy:, -dx:].astype(np.int32))
+        assert float(np.percentile(error, 99)) <= 2.0
+        alignment = result.ir_alignment
+        assert alignment is not None and alignment.mode == "phase-ecc"
+        assert abs(alignment.dx_px - dx) <= 0.5 and abs(alignment.dy_px - dy) <= 0.5
+
+
+class TestAlignSplitIr:
+    """Direct geometry/confidence gates of _align_split_ir — all fail-closed."""
+
+    def _trio(self, h: int = 64, w: int = 96, seed: int = 51) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        rng = np.random.default_rng(seed)
+        reference = rng.integers(0, 65535, size=(h, w, 3), dtype=np.uint16)
+        ir = rng.integers(0, 65535, size=(h, w), dtype=np.uint16)
+        return reference, reference.copy(), ir
+
+    def test_rejects_unequal_widths(self) -> None:
+        reference, proxy, ir = self._trio()
+        with pytest.raises(RuntimeError, match="different widths"):
+            _align_split_ir(reference, proxy[:, :-1], ir[:, :-1])
+
+    def test_rejects_height_loss_beyond_known_tail_row(self) -> None:
+        reference, proxy, ir = self._trio()
+        with pytest.raises(RuntimeError, match="irreconcilable heights"):
+            _align_split_ir(reference, proxy[:-2], ir[:-2])
+
+    def test_rejects_proxy_taller_than_reference(self) -> None:
+        reference, proxy, ir = self._trio()
+        with pytest.raises(RuntimeError, match="irreconcilable heights"):
+            _align_split_ir(reference[:-1], proxy, ir)
+
+    def test_accepts_the_known_one_row_tail_loss(self) -> None:
+        reference, proxy, ir = self._trio()
+        rgb, aligned, alignment = _align_split_ir(reference, proxy[:-1], ir[:-1])
+        assert rgb.shape == (reference.shape[0] - 1, reference.shape[1], 3)
+        assert aligned.shape == rgb.shape[:2]
+        assert alignment.mode == "identity"
+
+    def test_low_texture_fails_closed(self) -> None:
+        h, w = 64, 96
+        reference = np.full((h, w, 3), 30000, dtype=np.uint16)
+        proxy = reference.copy()
+        proxy[0, 0, 0] += 1  # defeat the byte-identical fast path
+        ir = np.full((h, w), 15000, dtype=np.uint16)
+        with pytest.raises(RuntimeError, match="texture"):
+            _align_split_ir(reference, proxy, ir)
+
+    def test_byte_identical_uniform_pair_fails_closed(self) -> None:
+        h, w = 64, 96
+        reference = np.full((h, w, 3), 30000, dtype=np.uint16)
+        ir = np.full((h, w), 15000, dtype=np.uint16)
+
+        with pytest.raises(RuntimeError, match="texture"):
+            _align_split_ir(reference, reference.copy(), ir)
+
+    def test_unrelated_images_fail_closed(self) -> None:
+        h, w = 96, 128
+        reference = np.random.default_rng(52).integers(0, 65535, size=(h, w, 3), dtype=np.uint16)
+        proxy = np.random.default_rng(53).integers(0, 65535, size=(h, w, 3), dtype=np.uint16)
+        ir = np.random.default_rng(54).integers(0, 65535, size=(h, w), dtype=np.uint16)
+        with pytest.raises(RuntimeError, match="Could not safely align"):
+            _align_split_ir(reference, proxy, ir)
 
 
 class TestFrameSelection:
@@ -694,29 +1292,6 @@ class TestFrameSelection:
         dev = FakeSaneDev(rng.integers(0, 65535, size=(6, 5, 4), dtype=np.uint16))
         self._scan(ScanParams(dpi=1000, depth=16, capture_ir=True, frame=None), dev)
         assert "frame" not in dev.recorded
-
-    def test_any_offset_scan_shortens_the_feed_extent(self) -> None:
-        # The scan blacks out one pitch past the frame start (any frame) —
-        # the offset must shorten the extent, not deliver a black tail.
-        rng = np.random.default_rng(26)
-        dev = FakeSaneDev(rng.integers(0, 65535, size=(6, 5, 4), dtype=np.uint16))
-        self._scan(ScanParams(dpi=1000, depth=16, capture_ir=True, frame=12, frame_offset_mm=5.5), dev)
-        assert dev.recorded.get("subframe") == 5.5
-        assert dev.recorded.get("br_y") == int(round((1.0 - 5.5 / 37.8333) * 5958))
-
-    def test_zero_offset_keeps_the_full_extent(self) -> None:
-        rng = np.random.default_rng(27)
-        dev = FakeSaneDev(rng.integers(0, 65535, size=(6, 5, 4), dtype=np.uint16))
-        self._scan(ScanParams(dpi=1000, depth=16, capture_ir=True, frame=12, frame_offset_mm=0.0), dev)
-        assert "br_y" not in dev.recorded  # no window, no cap → geometry untouched
-
-    def test_negative_offset_is_clamped_to_zero(self) -> None:
-        # Below 0 is unreachable — the scan blacks out at the frame boundary.
-        rng = np.random.default_rng(25)
-        dev = FakeSaneDev(rng.integers(0, 65535, size=(6, 5, 4), dtype=np.uint16))
-        self._scan(ScanParams(dpi=1000, depth=16, capture_ir=True, frame=12, frame_offset_mm=-1.0), dev)
-        assert dev.recorded.get("frame") == 12
-        assert dev.recorded.get("subframe") == 0.0
 
     def test_frame_without_option_raises(self) -> None:
         import pytest
@@ -764,13 +1339,9 @@ class TestRegisteredGeometry:
 
     def test_generic_area_cannot_overwrite_a_registered_scan_window(self) -> None:
         rng = np.random.default_rng(28)
-        dev = FakeSaneDev(
-            rng.integers(0, 65535, size=(6, 5, 4), dtype=np.uint16)
-        )
+        dev = FakeSaneDev(rng.integers(0, 65535, size=(6, 5, 4), dtype=np.uint16))
         backend = _make_backend(dev)
-        geometry = RegisteredScanGeometry(
-            frame=3, subframe_mm=6.35, br_y_device_px=5003
-        )
+        geometry = RegisteredScanGeometry(frame=3, subframe_mm=6.35, br_y_device_px=5003)
 
         with pytest.raises(RuntimeError, match="area.*registered geometry"):
             backend.scan(
@@ -786,11 +1357,7 @@ class TestRegisteredGeometry:
                 threading.Event(),
             )
 
-        assert not any(
-            event[0] == "set"
-            and event[1] in {"frame", "subframe", "br_y", "autofocus", "ae"}
-            for event in dev.events
-        )
+        assert not any(event[0] == "set" and event[1] in {"frame", "subframe", "br_y", "autofocus", "ae"} for event in dev.events)
         assert ("start",) not in dev.events
 
     @pytest.mark.parametrize("missing_option", ("br_y", "ae"))
@@ -843,6 +1410,7 @@ class TestRegisteredGeometry:
 
         assert not any(event[0] == "set" and event[1] in {"frame", "subframe", "br_y", "autofocus", "ae"} for event in dev.events)
         assert ("start",) not in dev.events
+
 
 class TestSnapProgressForwarding:
     """Cancellation responsiveness: progress forwarding during arr_snap()'s

@@ -16,6 +16,7 @@ import pytest
 import tifffile
 
 from negpy.infrastructure.scanners.result import ScanResult
+from negpy.services.scanning import writer
 from negpy.services.scanning.writer import write_tiff_16bit
 
 
@@ -59,6 +60,67 @@ class TestIrFailureAfterRgbSucceeds:
             )
             # No temp files left behind either.
             assert os.listdir(tmpdir) == []
+
+    def test_existing_pair_survives_ir_commit_failure(self, monkeypatch, tmp_path) -> None:
+        """Replacing a complete scan must not sacrifice it for a partial update."""
+        rgb_path = tmp_path / "frame.tif"
+        ir_path = tmp_path / "frame_IR.tif"
+        old_rgb = np.full((7, 9, 3), 1111, dtype=np.uint16)
+        old_ir = np.full((7, 9), 2222, dtype=np.uint16)
+        tifffile.imwrite(rgb_path, old_rgb, photometric="rgb")
+        tifffile.imwrite(ir_path, old_ir, photometric="minisblack")
+
+        real_replace = writer.os.replace
+        failed = False
+
+        def fail_first_ir_commit(src, dst) -> None:
+            nonlocal failed
+            if os.fspath(dst) == os.fspath(ir_path) and not failed:
+                failed = True
+                raise OSError("simulated IR commit failure")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(writer.os, "replace", fail_first_ir_commit)
+
+        with pytest.raises(OSError, match="IR commit failure"):
+            write_tiff_16bit(_result(with_ir=True), str(rgb_path))
+
+        assert np.array_equal(tifffile.imread(rgb_path), old_rgb)
+        assert np.array_equal(tifffile.imread(ir_path), old_ir)
+        assert sorted(path.name for path in tmp_path.iterdir()) == ["frame.tif", "frame_IR.tif"]
+
+    @pytest.mark.parametrize("failed_replace", (1, 2, 3, 4))
+    def test_existing_pair_survives_failure_at_each_commit_rename(
+        self,
+        monkeypatch,
+        tmp_path,
+        failed_replace: int,
+    ) -> None:
+        rgb_path = tmp_path / "frame.tif"
+        ir_path = tmp_path / "frame_IR.tif"
+        old_rgb = np.full((7, 9, 3), 3333, dtype=np.uint16)
+        old_ir = np.full((7, 9), 4444, dtype=np.uint16)
+        tifffile.imwrite(rgb_path, old_rgb, photometric="rgb")
+        tifffile.imwrite(ir_path, old_ir, photometric="minisblack")
+
+        real_replace = writer.os.replace
+        calls = 0
+
+        def fail_selected_replace(src, dst) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == failed_replace:
+                raise OSError(f"simulated commit rename {failed_replace} failure")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(writer.os, "replace", fail_selected_replace)
+
+        with pytest.raises(OSError, match=f"commit rename {failed_replace} failure"):
+            write_tiff_16bit(_result(with_ir=True), str(rgb_path))
+
+        assert np.array_equal(tifffile.imread(rgb_path), old_rgb)
+        assert np.array_equal(tifffile.imread(ir_path), old_ir)
+        assert sorted(path.name for path in tmp_path.iterdir()) == ["frame.tif", "frame_IR.tif"]
 
     def test_rgb_write_failure_leaves_nothing(self, monkeypatch) -> None:
         """Sanity companion: a failure on the *first* (RGB) write must also

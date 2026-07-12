@@ -1,32 +1,35 @@
 """Tests for ScannerService with a FakeBackend."""
 
 import os
+import sys
 import threading
 import time
 
 import numpy as np
 import pytest
 
-from negpy.infrastructure.scanners.base import (
-    ScanMode,
-    ScannerCapabilities,
-    ScannerDevice,
-    TransientScanError,
-)
+from negpy.infrastructure.scanners.base import ScanMode, ScannerCapabilities, ScannerDevice
 from negpy.infrastructure.scanners.params import ScanParams
 from negpy.infrastructure.scanners.result import ScanResult
-from negpy.services.scanning.service import _SCAN_IO_RETRY_ATTEMPTS, ScannerService
+from negpy.infrastructure.scanners.sane_backend import SaneBackend
+from negpy.services.scanning.service import ScannerService
 
 
 class FakeBackend:
     """In-memory ScannerBackend for testing."""
 
-    def __init__(self, devices: list[ScannerDevice] | None = None) -> None:
+    def __init__(
+        self,
+        devices: list[ScannerDevice] | None = None,
+        *,
+        fresh_devices: list[ScannerDevice] | None = None,
+    ) -> None:
         self._devices = devices or []
+        self._fresh_devices = fresh_devices if fresh_devices is not None else self._devices
         self._should_raise: Exception | None = None
         self._scan_delay: float = 0.0
-        self.scan_calls: int = 0
-        self.transient_failures: int = 0  # raise a transient I/O error this many times, then succeed
+        self.refresh_calls = 0
+        self.scan_calls = 0
 
     def list_devices(self) -> list[ScannerDevice]:
         if self._should_raise:
@@ -34,10 +37,11 @@ class FakeBackend:
         return self._devices
 
     def refresh_devices(self) -> list[ScannerDevice]:
-        return self.list_devices()
-
-    def eject(self, device_id: str) -> bool:
-        return False
+        self.refresh_calls += 1
+        if self._should_raise:
+            raise self._should_raise
+        self._devices = self._fresh_devices
+        return self._devices
 
     def scan(
         self,
@@ -47,9 +51,6 @@ class FakeBackend:
         cancel: threading.Event,
     ) -> ScanResult:
         self.scan_calls += 1
-        if self.transient_failures > 0:
-            self.transient_failures -= 1
-            raise TransientScanError("RGB scan failed: Error during device I/O")
         if self._should_raise:
             raise self._should_raise
 
@@ -101,6 +102,127 @@ class TestScannerServiceWithFakeBackend:
         assert devices[0].id == "fake:001"
         assert devices[0].vendor == "FakeCorp"
 
+    def test_probe_device_returns_the_exact_device_from_fresh_enumeration(
+        self,
+        fake_caps: ScannerCapabilities,
+    ) -> None:
+        stale_device = ScannerDevice(
+            id="fake:stale",
+            vendor="FakeCorp",
+            model="Disconnected Scanner",
+            capabilities=fake_caps,
+        )
+        fresh_device = ScannerDevice(
+            id="fake:fresh",
+            vendor="FakeCorp",
+            model="Connected Scanner",
+            capabilities=fake_caps,
+        )
+        backend = FakeBackend(
+            devices=[stale_device],
+            fresh_devices=[fresh_device],
+        )
+        service = ScannerService()
+        service._backend = backend
+
+        assert service.list_devices() == [stale_device]
+
+        probed = service.probe_device(fresh_device.id)
+
+        assert probed is fresh_device
+        assert backend.refresh_calls == 1
+        assert backend.scan_calls == 0
+
+    def test_probe_device_reports_the_requested_id_when_missing(
+        self,
+        fake_device: ScannerDevice,
+    ) -> None:
+        service = ScannerService()
+        service._backend = FakeBackend(fresh_devices=[fake_device])
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"Scanner device 'fake:missing' was not found during fresh enumeration",
+        ):
+            service.probe_device("fake:missing")
+
+    def test_probe_device_wraps_enumeration_failure_with_context(self) -> None:
+        enumeration_error = OSError("SANE bus unavailable")
+        backend = FakeBackend()
+        backend._should_raise = enumeration_error
+        service = ScannerService()
+        service._backend = backend
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"Could not probe scanner device 'fake:001': fresh enumeration failed: SANE bus unavailable",
+        ) as raised:
+            service.probe_device("fake:001")
+
+        assert raised.value.__cause__ is enumeration_error
+        assert backend.refresh_calls == 1
+        assert backend.scan_calls == 0
+
+    def test_probe_device_preserves_production_sane_initialization_failure(
+        self,
+        monkeypatch,
+    ) -> None:
+        initialization_error = OSError("saned unavailable")
+
+        class FailingSaneModule:
+            def init(self) -> None:
+                raise initialization_error
+
+        monkeypatch.setitem(sys.modules, "sane", FailingSaneModule())
+        service = ScannerService()
+        service._backend = SaneBackend()
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                r"Could not probe scanner device 'net:scanner:coolscan3:usb': "
+                r"fresh enumeration failed: SANE initialization failed: saned unavailable"
+            ),
+        ) as raised:
+            service.probe_device("net:scanner:coolscan3:usb")
+
+        assert raised.value.__cause__ is not None
+        assert raised.value.__cause__.__cause__ is initialization_error
+
+    def test_probe_device_preserves_selected_production_device_open_failure(
+        self,
+        monkeypatch,
+    ) -> None:
+        device_id = "net:scanner:coolscan3:usb"
+        open_error = PermissionError("scanner is busy")
+
+        class FailingSaneModule:
+            def init(self) -> None:
+                pass
+
+            def get_devices(self):
+                return [(device_id, "Nikon", "LS-5000 ED", "film scanner")]
+
+            def open(self, requested_device_id: str):
+                assert requested_device_id == device_id
+                raise open_error
+
+        monkeypatch.setitem(sys.modules, "sane", FailingSaneModule())
+        service = ScannerService()
+        service._backend = SaneBackend()
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                r"Could not probe scanner device 'net:scanner:coolscan3:usb': fresh enumeration failed: "
+                r"Could not open scanner device 'net:scanner:coolscan3:usb' during fresh probe: scanner is busy"
+            ),
+        ) as raised:
+            service.probe_device(device_id)
+
+        assert raised.value.__cause__ is not None
+        assert raised.value.__cause__.__cause__ is open_error
+
     def test_run_scan(self, fake_device: ScannerDevice) -> None:
         service = ScannerService()
         service._backend = FakeBackend(devices=[fake_device])
@@ -149,40 +271,6 @@ class TestScannerServiceWithFakeBackend:
         devices = service.list_devices()
         assert devices == []
 
-    def test_run_scan_retries_once_on_transient_device_io(self, fake_device: ScannerDevice) -> None:
-        service = ScannerService()
-        backend = FakeBackend(devices=[fake_device])
-        backend.transient_failures = 1  # one glitch, then a clean scan
-        service._backend = backend
-
-        params = ScanParams(dpi=1200, depth=16, capture_ir=False)
-        result = service.run_scan(fake_device.id, params, lambda _: None, threading.Event(), retry_delay=0)
-
-        assert result.rgb.shape == (100, 150, 3)
-        assert backend.scan_calls == 2
-
-    def test_run_scan_gives_up_after_bounded_transient_retries(self, fake_device: ScannerDevice) -> None:
-        service = ScannerService()
-        backend = FakeBackend(devices=[fake_device])
-        backend.transient_failures = 99  # never recovers
-        service._backend = backend
-
-        params = ScanParams(dpi=1200, depth=16, capture_ir=False)
-        with pytest.raises(RuntimeError, match="device I/O"):
-            service.run_scan(fake_device.id, params, lambda _: None, threading.Event(), retry_delay=0)
-        assert backend.scan_calls == _SCAN_IO_RETRY_ATTEMPTS  # bounded — not an infinite loop
-
-    def test_run_scan_does_not_retry_a_non_transient_error(self, fake_device: ScannerDevice) -> None:
-        service = ScannerService()
-        backend = FakeBackend(devices=[fake_device])
-        backend._should_raise = RuntimeError("Could not set frame=3")
-        service._backend = backend
-
-        params = ScanParams(dpi=1200, depth=16, capture_ir=False)
-        with pytest.raises(RuntimeError, match="Could not set frame"):
-            service.run_scan(fake_device.id, params, lambda _: None, threading.Event(), retry_delay=0)
-        assert backend.scan_calls == 1  # a real error fails fast
-
 
 class TestRenderScanFilename:
     def test_basic_template(self) -> None:
@@ -223,18 +311,3 @@ class TestRenderScanFilename:
             assert os.path.exists(path1)
             assert os.path.exists(path2)
             assert path1 != path2
-
-    def test_write_refuses_a_pattern_that_does_not_vary_with_sequence(self) -> None:
-        import tempfile
-
-        import numpy as np
-
-        from negpy.infrastructure.scanners.result import ScanResult
-
-        result = ScanResult(rgb=np.zeros((4, 4, 3), dtype=np.uint16), ir=None, dpi=300, device_model="Test")
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            service = ScannerService()
-            service._backend = FakeBackend()
-            with pytest.raises(ValueError, match="different basename"):
-                service.write_result(result, tmpdir, "fixed_name", "TIFF")

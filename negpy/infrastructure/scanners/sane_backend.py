@@ -1,20 +1,22 @@
 import math
-import subprocess
 import sys
 import threading
 from typing import Callable
 
+import cv2
 import numpy as np
 
-from negpy.infrastructure.scanners.base import (
-    ScanMode,
-    ScannerCapabilities,
-    ScannerDevice,
-    ScannerUnavailable,
-    TransientScanError,
+from negpy.infrastructure.scanners.base import ScanMode, ScannerCapabilities, ScannerDevice
+from negpy.infrastructure.scanners.params import ScanParams
+from negpy.infrastructure.scanners.result import ScanResult, SplitIrAlignment
+from negpy.infrastructure.scanners.split_alignment_policy import (
+    SPLIT_MAX_CHANNEL_SPREAD_PX as _SPLIT_MAX_CHANNEL_SPREAD_PX,
+    SPLIT_MAX_ECC_DIVERGENCE_PX as _SPLIT_MAX_ECC_DIVERGENCE_PX,
+    SPLIT_MIN_ECC as _SPLIT_MIN_ECC,
+    SPLIT_MIN_OVERLAP_FRACTION as _SPLIT_MIN_OVERLAP_FRACTION,
+    SPLIT_MIN_PHASE_RESPONSE as _SPLIT_MIN_PHASE_RESPONSE,
+    SPLIT_MIN_TEXTURE_STD as _SPLIT_MIN_TEXTURE_STD,
 )
-from negpy.infrastructure.scanners.params import ScanParams, clamp_frame_offset_mm
-from negpy.infrastructure.scanners.result import ScanResult
 from negpy.kernel.system.logging import get_logger
 
 logger = get_logger(__name__)
@@ -44,38 +46,8 @@ _IR_OPTION_NAMES = ("ir", "preview_ir")
 # with different semantics, so it must stay backend-scoped.
 _COOLSCAN3_IR_OPTION_NAME = "infrared"
 
-# Vendor eject/unload action option (SANE_TYPE_BUTTON on the coolscan3 backend).
-# Presence-only, like _find_ir_option — a device without it has no eject.
-_EJECT_OPTION_NAMES = ("eject",)
-
-# python-sane 2.9.2 cannot activate a SANE_TYPE_BUTTON — setattr raises "Buttons
-# don't have values", set_option raises "...can't be set", set_auto_option raises
-# "Invalid argument" (all verified on an LS-50). So eject is pressed by shelling
-# out to `scanimage --eject`, which performs the C-level sane_control_option
-# SET_VALUE. scanimage then runs a spurious sane_start that exits non-zero with
-# "out of documents"; the eject has already fired, so that exit is expected.
-_EJECT_TIMEOUT_S = 30.0
-_EJECT_BENIGN_STDERR_MARKERS = ("out of documents", "no documents", "no more documents")
-
-# Standard SANE option-unit enum values. Kept local so capability detection
-# does not require importing the optional python-sane extension.
-_SANE_UNIT_PIXEL = 1
-_SANE_UNIT_MM = 3
-
 _PIEUSB_PREFIX = "pieusb:"
 _COOLSCAN3_PREFIX = "coolscan3:"
-
-# Stable SANE status strings for transport glitches worth one retry (a Coolscan's
-# USB link occasionally hiccups mid-strip). A real error — bad option, missing
-# frame — carries a different message and must fail fast.
-_TRANSIENT_IO_MARKERS = ("error during device i/o", "device busy")
-
-
-def _as_scan_error(exc: Exception, message: str) -> Exception:
-    """Re-type a SANE failure so the service can retry without reading messages."""
-    msg = str(exc).lower()
-    cls = TransientScanError if any(marker in msg for marker in _TRANSIENT_IO_MARKERS) else RuntimeError
-    return cls(message)
 
 
 def _strip_net_prefix(device_id: str) -> str:
@@ -118,7 +90,7 @@ def _infer_film_scanner(opt, device_id: str) -> bool:
         if "negative" in desc and "film" in desc:
             return True
     # Preserve pieusb's historical direct-ID inference. Coolscan support is
-    # saned-aware because the tested scanner is remote.
+    # intentionally saned-aware because the tested scanner is remote.
     return device_id.startswith(_PIEUSB_PREFIX) or _strip_net_prefix(device_id).startswith(_COOLSCAN3_PREFIX)
 
 
@@ -192,110 +164,19 @@ def _detect_explicit_sources(opt) -> tuple[ScanMode, ...]:
 
 
 def _detect_max_area(opt) -> tuple[float, float]:
-    # opt keys are py_names (hyphens → underscores). constraint is a
-    # (min, max, step) range. Pixel maxima are inclusive coordinates.
-    def _upper_and_unit(name: str) -> tuple[float, int | None]:
+    # opt keys are py_names (hyphens → underscores). constraint is a (min, max, step) range.
+    def _upper(name: str) -> float:
         if name not in opt:
-            return (-1.0, None)
-        option = opt[name]
-        constraint = option.constraint
-        if isinstance(constraint, (list, tuple)) and len(constraint) >= 2:
-            return (float(constraint[1]), getattr(option, "unit", None))
-        return (-1.0, None)
-
-    (br_x, unit_x), (br_y, unit_y) = _upper_and_unit("br_x"), _upper_and_unit("br_y")
-    if br_x <= 0 or br_y <= 0 or unit_x != unit_y:
-        return (36.0, 25.0)
-    if unit_x == _SANE_UNIT_MM:
-        return (br_x, br_y)
-    if unit_x == _SANE_UNIT_PIXEL:
-        supported_dpi = _detect_dpi(opt)
-        if supported_dpi:
-            native_dpi = max(supported_dpi)
-            return ((br_x + 1.0) * 25.4 / native_dpi, (br_y + 1.0) * 25.4 / native_dpi)
-    return (36.0, 25.0)  # default 35mm frame
-
-
-def _axis_extent(opt, names: tuple[str, ...]) -> tuple[float | None, bool]:
-    """Max value and int-ness of the first present option (coolscan3 px vs SANE_FIXED mm)."""
-    for name in names:
-        if name not in opt:
-            continue
+            return -1.0
         constraint = opt[name].constraint
-        hi = None
-        if isinstance(constraint, tuple) and len(constraint) >= 2:
-            hi = constraint[1]
-        elif isinstance(constraint, list) and constraint:
-            hi = max(constraint)
-        if hi is not None:
-            return float(hi), isinstance(hi, int)
-    return None, False
+        if isinstance(constraint, (list, tuple)) and len(constraint) >= 2:
+            return float(constraint[1])
+        return -1.0
 
-
-def _window_to_option_values(opt, window: tuple[float, float, float, float]) -> dict[str, int | float]:
-    """Normalized window (0..1) → geometry option values in each option's native type
-    (coolscan3 int px, SANE_FIXED mm). tl emitted before br so a full default narrows, never inverts."""
-    x1, y1, x2, y2 = window
-    x_hi, x_int = _axis_extent(opt, ("br_x", "tl_x"))
-    y_hi, y_int = _axis_extent(opt, ("br_y", "tl_y"))
-    values: dict[str, int | float] = {}
-    for name, frac, hi, is_int in (
-        ("tl_x", x1, x_hi, x_int),
-        ("br_x", x2, x_hi, x_int),
-        ("tl_y", y1, y_hi, y_int),
-        ("br_y", y2, y_hi, y_int),
-    ):
-        if hi is None or name not in opt:
-            continue
-        value = frac * hi
-        values[name] = int(round(value)) if is_int else float(value)
-    return values
-
-
-def _feed_pitch_mm(opt) -> float:
-    """One frame pitch along the feed axis: the `subframe` option's range max.
-
-    coolscan3 positions the scan at frame_pitch x (N-1) + subframe, and caps
-    subframe at exactly one pitch (37.83 mm on an LS-50) — past that you would
-    simply index the next frame. 0.0 when the device has no usable range.
-    """
-    if "subframe" not in opt:
-        return 0.0
-    constraint = opt["subframe"].constraint
-    if isinstance(constraint, tuple) and len(constraint) >= 2 and constraint[1]:
-        return float(constraint[1])
-    return 0.0
-
-
-def _frame_extent_cap(opt, offset_mm: float) -> float | None:
-    """Feed-axis fraction scannable under a positive offset (None = no cap).
-
-    The scanner delivers film only up to one pitch past the frame start — any
-    frame, mid-strip included (measured offset + delivered ≈ 38.0 mm on an
-    LS-50) — and pads the overrun with black, so the window must shrink by the
-    offset. The subframe range max is the pitch, just under the measured limit.
-    """
-    if offset_mm <= 0:
-        return None
-    pitch = _feed_pitch_mm(opt)
-    if pitch <= 0:
-        return None
-    return max(0.0, 1.0 - offset_mm / pitch)
-
-
-def _apply_frame_offset(dev, offset_mm: float) -> None:
-    """Set coolscan3 `subframe` (feed-axis offset, mm) if present. Absent → skip; set fails → raise.
-
-    Always written, including 0.0 — options latch on an open handle, so a scan
-    on a held session must reset a previous frame's offset, not skip it.
-    """
-    opt = dev.opt if hasattr(dev, "opt") else {}
-    if "subframe" not in opt:
-        return
-    try:
-        dev.subframe = float(offset_mm)
-    except Exception as e:
-        raise RuntimeError(f"Could not set frame offset (subframe)={offset_mm}: {e}") from e
+    br_x, br_y = _upper("br_x"), _upper("br_y")
+    if br_x > 0 and br_y > 0:
+        return (br_x, br_y)
+    return (36.0, 25.0)  # default 35mm frame
 
 
 def _find_ir_option(opt) -> str | None:
@@ -306,58 +187,8 @@ def _find_ir_option(opt) -> str | None:
     return None
 
 
-def _find_eject_option(opt) -> str | None:
-    """Return the device's vendor eject/unload action option, if any."""
-    for key in opt:
-        if str(key).lower().replace("-", "_").strip("_") in _EJECT_OPTION_NAMES:
-            return str(key)
-    return None
-
-
-def _scanimage_eject(device_id: str) -> None:
-    """Press the vendor eject button via `scanimage --eject`.
-
-    The only working path: python-sane cannot activate a SANE_TYPE_BUTTON (see
-    _EJECT_* notes above). The device must already be closed — SANE allows a
-    single open handle and scanimage opens its own. scanimage runs a spurious
-    scan after the press and exits non-zero with "out of documents"; the eject
-    has fired by then, so that specific failure is treated as success.
-    """
-    try:
-        proc = subprocess.run(
-            ["scanimage", "-d", device_id, "--eject"],
-            capture_output=True,
-            text=True,
-            timeout=_EJECT_TIMEOUT_S,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError("Cannot eject: `scanimage` (sane-utils) is not installed") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Eject timed out after {_EJECT_TIMEOUT_S:g}s for {device_id!r}") from exc
-
-    if proc.returncode == 0:
-        return
-    stderr = (proc.stderr or "").lower()
-    if any(marker in stderr for marker in _EJECT_BENIGN_STDERR_MARKERS):
-        return
-    detail = (proc.stderr or "").strip() or f"exit code {proc.returncode}"
-    raise RuntimeError(f"scanimage --eject failed for {device_id!r}: {detail}")
-
-
-def _sane_container_depth(requested_depth: int) -> int:
-    """The container SANE ships `requested_depth` samples in — 8 or 16 bits.
-
-    coolscan3 takes the scanner's native depth on the `depth` option (10, 12 or
-    14 on some Coolscans; an LS-50 offers 8 and 14), then reports 16 back from
-    get_parameters() and rescales the samples to fill the wider container. So a
-    14-bit request yields full-range uint16, and the container — never the
-    requested value — decides the dtype.
-    """
-    return 8 if requested_depth <= 8 else 16
-
-
 def _option_is_usable(option) -> bool:
-    """Fail-closed capability probe: is the option active and settable?"""
+    """Fail-closed capability probe for the new coolscan3 inline option."""
     for method_name in ("is_active", "is_settable"):
         method = getattr(option, method_name, None)
         if not callable(method):
@@ -389,28 +220,11 @@ def _detect_ir(opt, device_id: str = "") -> bool:
     return coolscan_ir is not None and _option_is_usable(opt[coolscan_ir])
 
 
-def _has_usable_option(opt, name: str) -> bool:
-    """True if `name` is present AND the device will actually accept it.
-
-    Presence alone is not capability: a backend advertises an option it has
-    compiled in, then marks it SANE_CAP_INACTIVE for devices that lack the
-    feature. coolscan3 does exactly this — an LS-50 carries `ae`/`samples_per_scan`
-    but reports them inactive. Gating on presence would offer a control whose
-    every non-default value SaneBackend.scan() then refuses.
-    """
-    return name in opt and _option_is_usable(opt[name])
-
-
-def _detect_auto_exposure(opt) -> bool:
-    """True if the device exposes usable hardware auto-exposure (SANE `ae`).
-    UI-gating only — scan() fails loud on its own if an unavailable option is requested."""
-    return _has_usable_option(opt, "ae")
-
-
-def _detect_eject(opt) -> bool:
-    """True when the device exposes a usable eject/unload action."""
-    option_name = _find_eject_option(opt)
-    return option_name is not None and _option_is_usable(opt[option_name])
+def _detect_multi_sample(opt) -> bool:
+    """True if the device exposes a samples-per-scan option (hardware
+    multi-sampling, e.g. Nikon Coolscan). UI-gating only — the actual
+    fail-loud enforcement lives in SaneBackend.scan()."""
+    return "samples_per_scan" in opt
 
 
 def _detect_adapter_frame_capacity(opt) -> int | None:
@@ -427,15 +241,23 @@ def _detect_adapter_frame_capacity(opt) -> int | None:
     return None
 
 
-def _detect_adapter_frame_control(opt) -> bool:
-    """True when SANE exposes a frame-position control.
+def _option_is_active(opt, option_name: str) -> bool:
+    """True when a SANE option exists and is currently active.
 
-    Presence is intentional: Coolscan marks this option inactive and reports a
-    1..0 constraint while a feeder is parked. Capacity detection stays
-    conservative, but callers still need to distinguish that state from a device
-    with no frame transport control at all.
+    Used for mid-scan decisions (e.g. whether coolscan3's `frame_count` needs
+    a reset between split captures). Unknown/error states count as inactive:
+    skipping the write is safe — a later start on a truly-consumed counter
+    fails loud without moving film — while writing an inactive option raises.
     """
-    return "frame" in opt
+    if option_name not in opt:
+        return False
+    is_active = getattr(opt[option_name], "is_active", None)
+    if not callable(is_active):
+        return True
+    try:
+        return bool(is_active())
+    except Exception:
+        return False
 
 
 def _require_writable_option(opt, option_name: str, absent_message: str) -> None:
@@ -460,26 +282,23 @@ def _require_writable_option(opt, option_name: str, absent_message: str) -> None
             raise RuntimeError(f"Requested SANE option {option_name!r} is not settable")
 
 
-def _detect_multi_sample(opt) -> bool:
-    """True if the device exposes a samples-per-scan option (hardware
-    multi-sampling, e.g. Nikon Coolscan). UI-gating only — the actual
-    fail-loud enforcement lives in SaneBackend.scan()."""
-    return "samples_per_scan" in opt
-
-
-def _detect_adapter_frame_capacity(opt) -> int | None:
-    """Return the adapter's advertised transport bound, not an exposure count."""
-    if "frame" not in opt:
-        return None
-    constraint = opt["frame"].constraint
-    if isinstance(constraint, tuple) and len(constraint) >= 2:
-        capacity = int(constraint[1])
-        return capacity if capacity > 0 else None
-    if isinstance(constraint, list) and constraint:
-        capacity = max(int(value) for value in constraint)
-        return capacity if capacity > 0 else None
-    return None
-
+def _require_supported_option_value(opt, option_name: str, value: int) -> None:
+    """Reject a numeric option value that violates its SANE constraint."""
+    constraint = opt[option_name].constraint
+    if isinstance(constraint, list):
+        supported = value in constraint
+    elif isinstance(constraint, tuple) and len(constraint) >= 2:
+        minimum, maximum = float(constraint[0]), float(constraint[1])
+        supported = minimum <= value <= maximum
+        if supported and len(constraint) >= 3:
+            quantum = float(constraint[2])
+            if quantum > 0:
+                steps = (value - minimum) / quantum
+                supported = math.isclose(steps, round(steps), rel_tol=0.0, abs_tol=1e-9)
+    else:
+        return
+    if not supported:
+        raise RuntimeError(f"Requested {option_name}={value} is not supported by SANE constraint {constraint!r}")
 
 
 def _caps_from_options(opt, device_id: str = "") -> ScannerCapabilities:
@@ -495,12 +314,8 @@ def _caps_from_options(opt, device_id: str = "") -> ScannerCapabilities:
         supported_depths=_detect_depths(opt),
         sources=sources,
         max_area_mm=_detect_max_area(opt),
-        auto_exposure=_detect_auto_exposure(opt),
-        adapter_frame_capacity=_detect_adapter_frame_capacity(opt),
-        adapter_frame_control=_detect_adapter_frame_control(opt),
-        can_eject=_detect_eject(opt),
-        frame_pitch_mm=_feed_pitch_mm(opt),
         multi_sample=_detect_multi_sample(opt),
+        adapter_frame_capacity=_detect_adapter_frame_capacity(opt),
     )
 
 
@@ -527,12 +342,8 @@ def _validate_inline_rgbi_parameters(
         raise RuntimeError(f"{context} reported last_frame={last_frame!r}; expected true for one inline RGBI frame")
     if type(returned_depth) is not int or returned_depth not in (8, 16):
         raise RuntimeError(f"{context} reported unusable sample depth {returned_depth!r}; expected 8 or 16 bits")
-    expected_container = _sane_container_depth(requested_depth)
-    if returned_depth != expected_container:
-        raise RuntimeError(
-            f"{context} reported sample depth {returned_depth}, but the scan requested {requested_depth} "
-            f"(expected a {expected_container}-bit container)"
-        )
+    if returned_depth != requested_depth:
+        raise RuntimeError(f"{context} reported sample depth {returned_depth}, but the scan requested {requested_depth}")
     if type(pixels_per_line) is not int or pixels_per_line <= 0 or type(lines) is not int or lines <= 0:
         raise RuntimeError(f"{context} reported invalid frame dimensions {pixels_per_line!r}x{lines!r}")
     expected_bytes_per_line = pixels_per_line * 4 * math.ceil(returned_depth / 8)
@@ -541,6 +352,239 @@ def _validate_inline_rgbi_parameters(
             f"{context} reported bytes_per_line {bytes_per_line!r}; expected {expected_bytes_per_line} "
             f"for {pixels_per_line} pixels, four channels, and {returned_depth}-bit samples"
         )
+
+
+# Split-capture registration acceptance gates come from the dependency-neutral
+# policy module. Private aliases remain here for compatibility with existing
+# backend-focused tests and downstream diagnostics.
+
+
+def _estimate_split_shift(reference_rgb: np.ndarray, proxy_rgb: np.ndarray) -> tuple[float, float, dict]:
+    """Estimate the (dx, dy) translation of `proxy_rgb` relative to
+    `reference_rgb` at full resolution, fail-closed.
+
+    Per-channel normalized+blurred phase correlation must agree across R/G/B
+    and lock with sufficient response; a translation-only ECC refinement on
+    the mean-RGB proxy must corroborate it. Raises RuntimeError whenever the
+    registration cannot be trusted. Returns the refined shift and the metrics
+    that acceptance tooling records.
+    """
+    height, width = reference_rgb.shape[:2]
+    scale = max(1.0, max(height, width) / 1024.0)
+    if scale > 1.0:
+        estimate_width = max(8, round(width / scale))
+        estimate_height = max(8, round(height / scale))
+        estimate_size = (estimate_width, estimate_height)
+        ref_small = cv2.resize(reference_rgb, estimate_size, interpolation=cv2.INTER_AREA)
+        mov_small = cv2.resize(proxy_rgb, estimate_size, interpolation=cv2.INTER_AREA)
+    else:
+        estimate_width, estimate_height = width, height
+        ref_small, mov_small = reference_rgb, proxy_rgb
+
+    full_scale = float(np.iinfo(reference_rgb.dtype).max) if np.issubdtype(reference_rgb.dtype, np.integer) else 1.0
+    window = cv2.createHanningWindow((estimate_width, estimate_height), cv2.CV_32F)
+
+    normalized_ref: list[np.ndarray] = []
+    normalized_mov: list[np.ndarray] = []
+    shifts: list[tuple[float, float]] = []
+    responses: list[float] = []
+    for channel in range(3):
+        pair: list[np.ndarray] = []
+        for image in (ref_small, mov_small):
+            plane = np.ascontiguousarray(image[:, :, channel], dtype=np.float32) / full_scale
+            plane = cv2.GaussianBlur(plane, (0, 0), 1.0)
+            deviation = float(plane.std())
+            if not math.isfinite(deviation) or deviation < _SPLIT_MIN_TEXTURE_STD:
+                raise RuntimeError(
+                    f"Coolscan split capture has too little texture to register (channel {channel} std={deviation:.2e} of full scale)"
+                )
+            pair.append((plane - float(plane.mean())) / deviation)
+        normalized_ref.append(pair[0])
+        normalized_mov.append(pair[1])
+        (channel_dx, channel_dy), response = cv2.phaseCorrelate(pair[0], pair[1], window)
+        shifts.append((float(channel_dx), float(channel_dy)))
+        responses.append(float(response))
+
+    channel_spread = max(
+        max(s[0] for s in shifts) - min(s[0] for s in shifts),
+        max(s[1] for s in shifts) - min(s[1] for s in shifts),
+    )
+    finite = all(math.isfinite(v) for s in shifts for v in s) and all(math.isfinite(r) for r in responses)
+    if not finite or min(responses) < _SPLIT_MIN_PHASE_RESPONSE:
+        raise RuntimeError(
+            "Could not safely align the Coolscan infrared capture: phase correlation "
+            f"did not lock (responses={[f'{r:.3f}' for r in responses]}, "
+            f"minimum required {_SPLIT_MIN_PHASE_RESPONSE})"
+        )
+    if channel_spread > _SPLIT_MAX_CHANNEL_SPREAD_PX:
+        raise RuntimeError(
+            "Could not safely align the Coolscan infrared capture: R/G/B channels "
+            f"disagree on the shift (spread={channel_spread:.2f} px at estimation scale, "
+            f"shifts={[(f'{s[0]:.2f}', f'{s[1]:.2f}') for s in shifts]})"
+        )
+
+    phase_dx = sum(s[0] for s in shifts) / 3.0
+    phase_dy = sum(s[1] for s in shifts) / 3.0
+
+    # Translation-only ECC on the mean-RGB proxy corroborates (and sub-pixel
+    # refines) the Fourier-domain estimate from actual pixel overlap. ECC's
+    # gradient descent is only trustworthy near zero displacement — seeded
+    # with a large shift it can settle in a local optimum and the zero-fill
+    # bands bias its correlation (observed on the corpus cross-session pair).
+    # So crop both images to the phase-predicted common overlap first and let
+    # ECC measure only the sub-pixel residual.
+    seed_dx, seed_dy = int(round(phase_dx)), int(round(phase_dy))
+    ref_top, ref_bottom = max(0, -seed_dy), estimate_height + min(0, -seed_dy)
+    ref_left, ref_right = max(0, -seed_dx), estimate_width + min(0, -seed_dx)
+    overlap_height, overlap_width = ref_bottom - ref_top, ref_right - ref_left
+    if overlap_height < max(8, _SPLIT_MIN_OVERLAP_FRACTION * estimate_height) or overlap_width < max(
+        8, _SPLIT_MIN_OVERLAP_FRACTION * estimate_width
+    ):
+        raise RuntimeError(
+            "Could not safely align the Coolscan infrared capture: the phase shift "
+            f"({phase_dx:.2f}, {phase_dy:.2f}) leaves insufficient common overlap "
+            f"({overlap_width}x{overlap_height} of {estimate_width}x{estimate_height})"
+        )
+    ref_mean = (normalized_ref[0] + normalized_ref[1] + normalized_ref[2]) / 3.0
+    mov_mean = (normalized_mov[0] + normalized_mov[1] + normalized_mov[2]) / 3.0
+    ref_overlap = np.ascontiguousarray(ref_mean[ref_top:ref_bottom, ref_left:ref_right])
+    mov_overlap = np.ascontiguousarray(mov_mean[ref_top + seed_dy : ref_bottom + seed_dy, ref_left + seed_dx : ref_right + seed_dx])
+    warp = np.asarray([[1.0, 0.0, phase_dx - seed_dx], [0.0, 1.0, phase_dy - seed_dy]], dtype=np.float32)
+    ecc_mask = np.full(ref_overlap.shape, 255, dtype=np.uint8)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-5)
+    try:
+        ecc, warp = cv2.findTransformECC(ref_overlap, mov_overlap, warp, cv2.MOTION_TRANSLATION, criteria, ecc_mask, 5)
+    except cv2.error as e:
+        raise RuntimeError(
+            "Could not safely align the Coolscan infrared capture: ECC refinement "
+            f"did not converge from phase seed ({phase_dx:.2f}, {phase_dy:.2f}): {e}"
+        ) from e
+    ecc = float(ecc)
+    ecc_dx, ecc_dy = seed_dx + float(warp[0, 2]), seed_dy + float(warp[1, 2])
+    if not all(math.isfinite(v) for v in (ecc, ecc_dx, ecc_dy)) or ecc < _SPLIT_MIN_ECC:
+        raise RuntimeError(
+            f"Could not safely align the Coolscan infrared capture: ECC coefficient {ecc:.3f} is below the {_SPLIT_MIN_ECC} acceptance gate"
+        )
+    if max(abs(ecc_dx - phase_dx), abs(ecc_dy - phase_dy)) > _SPLIT_MAX_ECC_DIVERGENCE_PX:
+        raise RuntimeError(
+            "Could not safely align the Coolscan infrared capture: ECC refinement "
+            f"({ecc_dx:.2f}, {ecc_dy:.2f}) diverges from the phase estimate "
+            f"({phase_dx:.2f}, {phase_dy:.2f})"
+        )
+
+    dx = ecc_dx * width / estimate_width
+    dy = ecc_dy * height / estimate_height
+    metrics = {
+        "phase_responses": tuple(responses),
+        "channel_spread_px": float(channel_spread),
+        "ecc_coefficient": ecc,
+    }
+    return dx, dy, metrics
+
+
+def _align_split_ir(
+    reference_rgb: np.ndarray,
+    proxy_rgb: np.ndarray,
+    ir: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, SplitIrAlignment]:
+    """Register a single-pass Coolscan IR plane to a multisampled RGB frame.
+
+    The RGB channels captured alongside IR are a registration proxy.  Estimate
+    their translation relative to the multisampled RGB, apply that exact
+    transform to IR, and crop both arrays to the common valid overlap so no
+    synthetic border can be mistaken for a dust defect.
+    """
+    if reference_rgb.ndim != 3 or reference_rgb.shape[2] != 3:
+        raise RuntimeError(f"Multisampled RGB has an unexpected shape {reference_rgb.shape}")
+    if proxy_rgb.ndim != 3 or proxy_rgb.shape[2] != 3 or ir.ndim != 2:
+        raise RuntimeError(f"Single-pass RGB/IR shapes are invalid: rgb={proxy_rgb.shape}, ir={ir.shape}")
+    if proxy_rgb.shape[:2] != ir.shape:
+        raise RuntimeError(f"Single-pass RGB and IR dimensions differ: {proxy_rgb.shape[:2]} vs {ir.shape}")
+
+    # Both captures use one unchanged scan window, so the only legitimate
+    # geometry difference is python-sane's known dropped RGBI tail row.
+    # Anything else means the two captures did not see the same window —
+    # cropping that away would silently hide a positioning fault.
+    if proxy_rgb.shape[1] != reference_rgb.shape[1]:
+        raise RuntimeError(
+            f"Coolscan split captures have different widths ({reference_rgb.shape[1]} vs {proxy_rgb.shape[1]}) — refusing to align"
+        )
+    height_loss = reference_rgb.shape[0] - proxy_rgb.shape[0]
+    if height_loss not in (0, 1):
+        raise RuntimeError(
+            "Coolscan split captures have irreconcilable heights "
+            f"({reference_rgb.shape[0]} vs {proxy_rgb.shape[0]}); only the known "
+            "one-row RGBI tail loss is permitted"
+        )
+
+    height, width = proxy_rgb.shape[:2]
+    reference_rgb = reference_rgb[:height]
+
+    # The common case is byte-identical geometry; avoid introducing a
+    # needless resample when the two RGB captures already coincide.
+    if np.array_equal(reference_rgb, proxy_rgb):
+        full_scale = float(np.iinfo(reference_rgb.dtype).max) if np.issubdtype(reference_rgb.dtype, np.integer) else 1.0
+        for channel in range(3):
+            deviation = float(np.asarray(reference_rgb[:, :, channel], dtype=np.float32).std()) / full_scale
+            if not math.isfinite(deviation) or deviation < _SPLIT_MIN_TEXTURE_STD:
+                raise RuntimeError(
+                    f"Coolscan split capture has too little texture to register (channel {channel} std={deviation:.2e} of full scale)"
+                )
+        return reference_rgb, ir, SplitIrAlignment(mode="identity", dx_px=0.0, dy_px=0.0)
+    if height < 8 or width < 8:
+        raise RuntimeError(f"Coolscan split capture is too small to register ({width}x{height})")
+
+    dx, dy, metrics = _estimate_split_shift(reference_rgb, proxy_rgb)
+    # Phase correlation on a truly integer translation can land a few
+    # hundredths away from the exact pixel because of edge/window effects.
+    # Snapping only that tiny numerical residue avoids needlessly blurring IR.
+    if abs(dx - round(dx)) < 0.05:
+        dx = float(round(dx))
+    if abs(dy - round(dy)) < 0.05:
+        dy = float(round(dy))
+    max_shift = max(16.0, width * 0.05)
+    if not all(math.isfinite(value) for value in (dx, dy)) or max(abs(dx), abs(dy)) > max_shift:
+        raise RuntimeError(
+            "Could not safely align the Coolscan infrared capture "
+            f"(shift=({dx:.2f}, {dy:.2f}) px exceeds the same-reservation bound {max_shift:.1f} px)"
+        )
+
+    transform = np.asarray([[1.0, 0.0, -dx], [0.0, 1.0, -dy]], dtype=np.float32)
+    aligned_ir = cv2.warpAffine(
+        ir,
+        transform,
+        (width, height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+    left = max(0, math.ceil(-dx))
+    right = min(width, math.floor(width - dx))
+    top = max(0, math.ceil(-dy))
+    bottom = min(height, math.floor(height - dy))
+    if right <= left or bottom <= top:
+        raise RuntimeError(f"Coolscan infrared alignment has no common overlap (shift=({dx:.2f}, {dy:.2f}))")
+
+    alignment = SplitIrAlignment(
+        mode="phase-ecc",
+        dx_px=dx,
+        dy_px=dy,
+        phase_responses=metrics["phase_responses"],
+        channel_spread_px=metrics["channel_spread_px"],
+        ecc_coefficient=metrics["ecc_coefficient"],
+    )
+    logger.info(
+        "aligned single-pass Coolscan IR to multisampled RGB: "
+        f"dx={dx:.2f}px dy={dy:.2f}px phase_responses="
+        f"{[f'{r:.3f}' for r in alignment.phase_responses]} "
+        f"channel_spread={alignment.channel_spread_px:.2f}px ecc={alignment.ecc_coefficient:.3f}"
+    )
+    return (
+        reference_rgb[top:bottom, left:right],
+        aligned_ir[top:bottom, left:right],
+        alignment,
+    )
 
 
 def _reinterpret_channels(arr: np.ndarray, width: int, lines: int) -> np.ndarray:
@@ -552,8 +596,9 @@ def _reinterpret_channels(arr: np.ndarray, width: int, lines: int) -> np.ndarray
     bytes_per_line = 4 x pixels_per_line x sample size) arrives misshaped.
     Worse, a partial final chunk is *discarded* at EOF: when `4 * lines` is
     not a multiple of 3, the stream's trailing `(4 * lines mod 3) * width`
-    samples are lost. The loss is confined to the tail of the last row, so we
-    drop that one edge row rather than lose the IR plane.
+    samples are lost (both 1489- and 5959-line LS-5000 frames hit this).
+    The loss is confined to the tail of the last row, so we pad the missing
+    samples and drop that one edge row rather than lose the IR plane.
     """
     if width <= 0 or lines <= 0:
         return arr
@@ -562,9 +607,9 @@ def _reinterpret_channels(arr: np.ndarray, width: int, lines: int) -> np.ndarray
     missing = expected - total
     if missing in (width, 2 * width):
         flat = arr.reshape(-1)
-        # Every sample through the penultimate row is present. Reshape only that
-        # complete prefix as a zero-copy view; padding a full 188 MB RGBI frame
-        # merely to discard its incomplete last row can double peak RAM.
+        # Every sample through the penultimate row is present.  Reshape only
+        # that complete prefix as a zero-copy view; padding a full 188 MB RGBI
+        # frame merely to discard its incomplete last row can double peak RAM.
         complete = (lines - 1) * width * 4
         return flat[:complete].reshape(lines - 1, width, 4)
     if total % (width * lines):
@@ -582,12 +627,27 @@ def _snap_progress_callback(progress: Callable[[float], None] | None) -> Callabl
     to NegPy's fractional `progress(float)` callable, so the UI progress bar moves
     during the blocking read instead of only jumping 0% -> 100%.
 
-    Forwarding only — does NOT raise to abort the read early. python-sane 2.9.2's
-    C reader `Py_DECREF`s the callback's return value before checking
-    `PyErr_Occurred()`; `Py_DECREF(NULL)` after a raised exception is undefined
-    behaviour and segfaults against the real compiled `_sane` extension.
-    Cancellation stays on the pre-start/post-read `threading.Event` checks in
-    SaneBackend.scan() — a mid-read cancel is honored once arr_snap() returns.
+    Forwarding only — does NOT raise to abort the read early, even though
+    NegPy's cancel Event is available at the call site. python-sane 2.9.2's C
+    reader (`_sane.c` `SaneDev_snap`) invokes this callback once per output
+    line and checks `PyErr_Occurred()` afterward to support early abort, but
+    it unconditionally `Py_DECREF`s the callback's return value *before* that
+    check:
+
+        PyObject *result = PyObject_Call(progress, progArgs, NULL);
+        Py_DECREF(result);              // result is NULL if the call raised
+        Py_DECREF(progArgs);
+        if (PyErr_Occurred()) { ... }
+
+    `Py_DECREF` requires a non-NULL argument (`Py_XDECREF` is the NULL-safe
+    variant), so `Py_DECREF(NULL)` here is undefined behaviour and segfaults
+    in practice once this callback is driven by the real compiled `_sane`
+    extension rather than a pure-Python fake. Raising from this callback
+    against real hardware would therefore very likely crash the desktop app
+    on cancel instead of cleanly aborting the scan, so we deliberately don't.
+    Cancellation stays on the pre-start/post-read `threading.Event` checks
+    already in `SaneBackend.scan()` — a mid-read cancel click is still
+    honored, just only once the current blocking `arr_snap()` call returns.
     """
 
     def _cb(current: int, total: int) -> None:
@@ -601,69 +661,19 @@ def _snap_progress_callback(progress: Callable[[float], None] | None) -> Callabl
     return _cb
 
 
-class SaneSession:
-    """Exclusive hold on one scanner: opened once, N scans, released once.
+def _progress_segment(
+    progress: Callable[[float], None] | None,
+    start: float,
+    end: float,
+) -> Callable[[float], None] | None:
+    """Map one capture's 0..1 progress into a larger multi-capture span."""
+    if progress is None:
+        return None
 
-    The handover seam for batch/roll workflows that must own the device for a
-    whole strip — SANE hardware is single-open, and the Coolscan feeder
-    auto-parks after any session closes mid-roll. While a session is open the
-    backend refuses scan()/eject() on the device and list_devices() reuses the
-    cached entry instead of probing (a probe would open the held device).
-    eject() ends the session: the handle must close before scanimage's own open.
-    """
+    def _mapped(fraction: float) -> None:
+        progress(start + (end - start) * min(1.0, max(0.0, fraction)))
 
-    def __init__(self, backend: "SaneBackend", device_id: str, dev, opened_id: str, device: ScannerDevice | None) -> None:
-        self._backend = backend
-        self._dev = dev
-        self.device_id = device_id
-        self.opened_id = opened_id
-        self.device = device
-        self.closed = False
-
-    def __enter__(self) -> "SaneSession":
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
-
-    def scan(
-        self,
-        params: ScanParams,
-        progress: Callable[[float], None],
-        cancel: threading.Event,
-    ) -> ScanResult:
-        """Scan one frame on the held handle. Blocks until complete or cancelled."""
-        if self.closed:
-            raise RuntimeError(f"Scanner session for {self.device_id} is closed")
-        return self._backend._scan_on_device(self._dev, self.device_id, params, progress, cancel)
-
-    def eject(self) -> bool:
-        """Press the vendor eject action, if any. Always ends the session.
-
-        Capability-gated like SaneBackend.eject(): returns False as a clean
-        no-op when the device has no usable 'eject' option. The handle is
-        closed either way — scanimage needs the single open slot.
-        """
-        if self.closed:
-            raise RuntimeError(f"Scanner session for {self.device_id} is closed")
-        option_map = self._dev.opt if hasattr(self._dev, "opt") else {}
-        eject_option = _find_eject_option(option_map)
-        has_eject = eject_option is not None and _option_is_usable(option_map[eject_option])
-        self.close()
-        if not has_eject:
-            return False
-        _scanimage_eject(self.opened_id)
-        return True
-
-    def close(self) -> None:
-        """Release the device. Idempotent."""
-        if self.closed:
-            return
-        self.closed = True
-        try:
-            self._dev.close()
-        finally:
-            self._backend._release_session(self)
+    return _mapped
 
 
 class SaneBackend:
@@ -675,44 +685,27 @@ class SaneBackend:
         try:
             import sane  # noqa: F811
         except ImportError:
-            raise ScannerUnavailable(f"python-sane not importable. {_resolve_install_hint()}") from None
+            raise ImportError(f"python-sane not importable. {_resolve_install_hint()}") from None
         self._sane = sane
         self._sane_initialized = False
         self._devices_cache: list[ScannerDevice] | None = None
-        # Stale device id -> its post-re-enumeration id (see _open_device).
-        self._id_remap: dict[str, str] = {}
-        # device_id -> exclusive session holding the device (see open_session).
-        self._active_sessions: dict[str, SaneSession] = {}
-        self._session_lock = threading.Lock()
-
-    def _ensure_initialized(self) -> None:
-        if self._sane_initialized:
-            return
-        self._sane.init()
-        self._sane_initialized = True
 
     def list_devices(self) -> list[ScannerDevice]:
         if self._devices_cache is not None:
             return self._devices_cache
 
-        try:
-            self._ensure_initialized()
-        except Exception as e:
-            logger.error(f"SANE init failed: {e}")
-            return []
+        if not self._sane_initialized:
+            try:
+                self._sane.init()
+                self._sane_initialized = True
+            except Exception as e:
+                logger.error(f"SANE init failed: {e}")
+                return []
 
         raw_devices = self._sane.get_devices()
         logger.info(f"SANE found {len(raw_devices)} raw device(s): {[r[0] for r in raw_devices]}")
         devices: list[ScannerDevice] = []
         for raw in raw_devices:
-            held = self._session_holding(raw[0])
-            if held is not None:
-                # Single-open hardware — probing would open the held device.
-                if held.device is not None:
-                    devices.append(held.device)
-                else:
-                    logger.warning(f"Device {raw[0]} is held by an active session — skipping probe")
-                continue
             try:
                 dev = self._sane.open(raw[0])
                 caps = self._detect_caps(dev, raw[0])
@@ -737,98 +730,60 @@ class SaneBackend:
         return devices
 
     def refresh_devices(self) -> list[ScannerDevice]:
-        """Clear cache and rescan.
-
-        Enough to pick up film loaded after NegPy started, despite coolscan3(5)
-        BUGS claiming the --frame option is fixed at backend init: coolscan3
-        senses the adapter in cs3_full_inquiry(), which sane_open() calls, so
-        the re-open below rebuilds the frame option from the live strip. Do not
-        add a sane.exit()/init() cycle here — sane_exit() frees the device list
-        that open handles still point into.
-        """
+        """Clear cache and rescan."""
         self._devices_cache = None
         return self.list_devices()
 
-    def _open_device(self, device_id: str):
-        """Open a device, self-healing across USB re-enumeration.
+    def probe_device(self, device_id: str) -> ScannerDevice | None:
+        """Strictly probe one freshly enumerated device.
 
-        A mid-session USB re-enumeration changes the libusb address embedded in
-        the SANE id (observed on the LS-50: ...:003:006 → ...:003:007), so the
-        cached id goes stale and sane.open() raises "Invalid argument". On
-        failure, re-list, remap to the same physical scanner, retry once, and
-        remember the remap so later opens skip straight to the fresh id. Returns
-        (dev, opened_id) — callers that keep addressing the device (eject) must
-        use opened_id, not the stale one they passed in.
+        Unlike best-effort device listing, transport and option-inspection
+        failures are propagated so callers can distinguish an unavailable
+        scanner stack from a device ID that is genuinely absent.
         """
-        target = self._id_remap.get(device_id, device_id)
-        try:
-            return self._sane.open(target), target
-        except Exception:
-            fresh_id = self._find_reenumerated_id(device_id)
-            if fresh_id is None or fresh_id == target:
-                raise
-            dev = self._sane.open(fresh_id)
-            self._id_remap[device_id] = fresh_id
-            logger.info(f"Scanner {device_id} re-enumerated; remapped to {fresh_id}")
-            return dev, fresh_id
 
-    def open_session(self, device_id: str) -> SaneSession:
-        """Open an exclusive scanning session — the batch/roll handover seam.
+        if not self._sane_initialized:
+            try:
+                self._sane.init()
+                self._sane_initialized = True
+            except Exception as exc:
+                raise RuntimeError(f"SANE initialization failed: {exc}") from exc
 
-        The device is opened once (self-healing via _open_device) and stays
-        open until SaneSession.close()/eject(). One session per device.
-        """
         try:
-            self._ensure_initialized()
+            raw_devices = self._sane.get_devices()
         except Exception as exc:
-            raise RuntimeError(f"Failed to initialize SANE before opening a session: {exc}") from exc
+            raise RuntimeError(f"SANE device enumeration failed: {exc}") from exc
 
-        with self._session_lock:
-            if self._session_holding(device_id) is not None:
-                raise RuntimeError(f"Scanner {device_id} is already held by an active session")
-            dev, opened_id = self._open_device(device_id)
-            device = next((d for d in (self._devices_cache or []) if d.id == device_id), None)
-            session = SaneSession(self, device_id, dev, opened_id, device)
-            self._active_sessions[device_id] = session
-        return session
-
-    def _session_holding(self, device_id: str) -> SaneSession | None:
-        """The active session holding `device_id`, matching stale or remapped ids.
-
-        Lock-free read: the only check-then-act race worth serializing is
-        open_session's duplicate check, which holds _session_lock itself.
-        """
-        for session in self._active_sessions.values():
-            if device_id in (session.device_id, session.opened_id):
-                return session
-        return None
-
-    def _release_session(self, session: SaneSession) -> None:
-        with self._session_lock:
-            if self._active_sessions.get(session.device_id) is session:
-                del self._active_sessions[session.device_id]
-
-    def _find_reenumerated_id(self, device_id: str) -> str | None:
-        """After an open failure, re-enumerate and return the scanner's new id.
-
-        Matches by vendor+model when the stale device is still cached, else by
-        the sole device sharing the backend/transport prefix (the single-scanner
-        case). Returns None when no unambiguous match exists.
-        """
-        stale = {d.id: d for d in (self._devices_cache or [])}.get(device_id)
-        try:
-            fresh = self.refresh_devices()
-        except Exception:
+        raw = next((candidate for candidate in raw_devices if candidate[0] == device_id), None)
+        if raw is None:
             return None
-        if stale is not None:
-            same = [d for d in fresh if d.vendor == stale.vendor and d.model == stale.model]
-            if len(same) == 1:
-                return same[0].id
-        prefix = device_id.rsplit(":", 2)[0]
-        same_prefix = [d for d in fresh if d.id.rsplit(":", 2)[0] == prefix]
-        if len(same_prefix) == 1:
-            return same_prefix[0].id
-        return None
+
+        try:
+            dev = self._sane.open(device_id)
+        except Exception as exc:
+            raise RuntimeError(f"Could not open scanner device {device_id!r} during fresh probe: {exc}") from exc
+
+        try:
+            caps = self._detect_caps(dev, device_id)
+        except Exception as exc:
+            try:
+                dev.close()
+            except Exception:
+                pass
+            raise RuntimeError(f"Could not inspect scanner device {device_id!r} during fresh probe: {exc}") from exc
+        try:
+            dev.close()
+        except Exception as exc:
+            raise RuntimeError(f"Could not close scanner device {device_id!r} after fresh probe: {exc}") from exc
+
+        if not caps.sources:
+            return None
+        return ScannerDevice(
+            id=device_id,
+            vendor=raw[1] if len(raw) > 1 else "Unknown",
+            model=raw[2] if len(raw) > 2 else device_id,
+            capabilities=caps,
+        )
 
     def scan(
         self,
@@ -837,54 +792,29 @@ class SaneBackend:
         progress: Callable[[float], None],
         cancel: threading.Event,
     ) -> ScanResult:
-        """Execute a one-shot scan via SANE (open, scan, close). Blocks until complete or cancelled."""
+        """Execute a scan via SANE. Blocks until complete or cancelled."""
 
         if params.registered_geometry is not None and params.area is not None:
-            raise RuntimeError(
-                "A generic scan area cannot be combined with registered geometry"
-            )
+            raise RuntimeError("A generic scan area cannot be combined with registered geometry")
 
         try:
-            self._ensure_initialized()
-        except Exception as exc:
-            raise RuntimeError(f"Failed to initialize SANE before scanning: {exc}") from exc
-
-        if self._session_holding(device_id) is not None:
-            raise RuntimeError(f"Scanner {device_id} is held by an active session — scan through that session")
-
-        try:
-            dev, _ = self._open_device(device_id)
+            dev = self._sane.open(device_id)
         except Exception as e:
-            raise _as_scan_error(e, f"Failed to open scanner {device_id}: {e}") from e
+            raise RuntimeError(f"Failed to open scanner {device_id}: {e}") from e
 
-        try:
-            return self._scan_on_device(dev, device_id, params, progress, cancel)
-        finally:
-            try:
-                dev.close()
-            except Exception:
-                pass
-
-    def _scan_on_device(
-        self,
-        dev,
-        device_id: str,
-        params: ScanParams,
-        progress: Callable[[float], None],
-        cancel: threading.Event,
-    ) -> ScanResult:
-        """Scan one frame on an already-open handle. sane_cancel()s the frame when
-        done (required between frames on a held session) but never closes."""
         try:
             # IR capture strategy decides the scan mode (RGBI yields a 4th channel inline).
             ir_strategy = self._ir_strategy(dev, device_id) if params.capture_ir else None
             if params.capture_ir and ir_strategy is None:
                 raise RuntimeError("IR capture requested but the device exposes no usable infrared mechanism")
+            split_coolscan_ir = (
+                ir_strategy == "option" and params.samples_per_scan > 1 and _strip_net_prefix(device_id).startswith(_COOLSCAN3_PREFIX)
+            )
 
-            # Not every backend has a `mode` option (coolscan3 exposes none) —
-            # only touch options the device has.
+            # Configure SANE parameters. Not every backend has a `mode` option
+            # (coolscan3 exposes none) — only touch options the device has.
             if hasattr(dev, "opt") and "mode" in dev.opt:
-                dev.mode = "RGBI" if (ir_strategy == "rgbi" or ir_strategy == "rgbi-hw3") else "Color"
+                dev.mode = "RGBI" if ir_strategy == "rgbi" else "Color"
             dev.depth = params.depth
             dev.resolution = params.dpi
 
@@ -896,18 +826,23 @@ class SaneBackend:
             if geometry is not None and geometry.frame is not None:
                 if requested_frame is not None and requested_frame != geometry.frame:
                     raise RuntimeError(
-                        f"Conflicting frame positions requested: frame={requested_frame}, "
-                        f"registered geometry frame={geometry.frame}"
+                        f"Conflicting frame positions requested: frame={requested_frame}, registered geometry frame={geometry.frame}"
                     )
                 requested_frame = geometry.frame
 
             # Validate the complete requested option set before applying any
-            # of it, so a missing option never leaves the feeder half-positioned.
+            # of it. A missing window option must not leave the feeder moved
+            # to a frame with only half of its registered geometry applied.
             option_map = dev.opt if hasattr(dev, "opt") else {}
             ir_opt = _find_coolscan3_ir_option(option_map, device_id) if ir_strategy == "option" else None
             required_options: list[tuple[str, str]] = []
             if requested_frame is not None:
-                required_options.append(("frame", f"Frame {requested_frame} requested but the device has no frame-selection option"))
+                required_options.append(
+                    (
+                        "frame",
+                        f"Frame {requested_frame} requested but the device has no frame-selection option",
+                    )
+                )
             if geometry is not None:
                 required_options.extend(
                     (
@@ -917,18 +852,43 @@ class SaneBackend:
                 )
             if params.auto_exposure:
                 required_options.append(("ae", "Auto-exposure requested but the device has no 'ae' option"))
+            if params.samples_per_scan > 1:
+                # An unsupported archival multisample request must fail here,
+                # before any frame/geometry write repositions the film.
+                required_options.append(
+                    (
+                        "samples_per_scan",
+                        f"{params.samples_per_scan}x multi-sampling requested but the device has no samples-per-scan option",
+                    )
+                )
             if ir_strategy == "option":
                 if ir_opt is None:
                     raise RuntimeError("IR option strategy selected but the device's IR option is unavailable")
-                required_options.append((ir_opt, "IR option strategy selected but the device's IR option is unavailable"))
+                required_options.append(
+                    (
+                        ir_opt,
+                        "IR option strategy selected but the device's IR option is unavailable",
+                    )
+                )
+            if split_coolscan_ir and requested_frame is not None:
+                # Only a roll-frame workflow decrements/checks the exposure
+                # counter, so only it needs `frame_count` active and reset
+                # between the two captures. A true single-frame holder marks
+                # the option inactive and must not be rejected for that.
+                required_options.append(
+                    (
+                        "frame_count",
+                        "Coolscan roll multisample+IR capture requires the 'frame-count' option",
+                    )
+                )
             for option_name, absent_message in required_options:
                 _require_writable_option(option_map, option_name, absent_message)
+            if params.samples_per_scan > 1:
+                _require_supported_option_value(option_map, "samples_per_scan", params.samples_per_scan)
 
-            # Position the film before autofocus, auto-exposure, or scan start.
-            # The scan blacks out at the frame boundary — below 0 is unreachable.
-            offset_mm = clamp_frame_offset_mm(params.frame_offset_mm, _feed_pitch_mm(option_map))
+            # Position the film and shorten its inclusive device-pixel window
+            # before autofocus, auto-exposure, or scan start.
             if requested_frame is not None:
-
                 try:
                     dev.frame = requested_frame
                 except Exception as e:
@@ -944,15 +904,13 @@ class SaneBackend:
                     except Exception as e:
                         raise RuntimeError(f"Could not set registered geometry {option_name}={value}: {e}") from e
 
-            _apply_frame_offset(dev, offset_mm)
-
-            # Autofocus where the device supports it (the LS-5000 powers up at
-            # an uncalibrated focus position — unfocused otherwise).
+            # Autofocus where the device supports it (the LS-5000 powers up
+            # at an uncalibrated focus position — unfocused otherwise).
             if params.autofocus and hasattr(dev, "opt") and "autofocus" in dev.opt:
                 try:
                     dev.autofocus = True
                 except Exception as e:
-                    raise RuntimeError(f"Could not enable autofocus: {e}") from e
+                    logger.warning(f"Could not enable autofocus: {e}")
 
             # Hardware auto-exposure must meter the already-positioned frame.
             if params.auto_exposure:
@@ -962,42 +920,46 @@ class SaneBackend:
                     raise RuntimeError(f"Could not enable auto-exposure: {e}") from e
 
             # Hardware multi-sampling: explicitly requested for archival
-            # quality — refuse to silently degrade to a single pass.
+            # quality — refuse to silently degrade to a single pass. The
+            # option's presence/activity was already validated pre-positioning.
             if params.samples_per_scan > 1:
-                if not (hasattr(dev, "opt") and "samples_per_scan" in dev.opt):
-                    raise RuntimeError(f"{params.samples_per_scan}x multi-sampling requested but the device has no samples-per-scan option")
                 try:
                     dev.samples_per_scan = params.samples_per_scan
                 except Exception as e:
                     raise RuntimeError(f"Could not set samples-per-scan={params.samples_per_scan}: {e}") from e
 
             # Inline IR via a boolean option (coolscan3 `infrared`): the 4th
-            # sample rides in the same frame, no mode/source change. IR was
-            # explicitly requested — fail loud rather than silently drop it.
+            # sample rides in the same frame, no mode/source change involved.
+            # IR was explicitly requested — fail loud rather than silently
+            # returning a scan without the channel.
             if ir_strategy == "option":
-
                 if ir_opt is None:
                     raise RuntimeError("IR option strategy selected but the device's IR option is unavailable")
                 try:
-                    setattr(dev, ir_opt, True)
+                    # The LS-5000 wedges when coolscan3 requests multisampling
+                    # on the IR window.  Capture the multisampled RGB first;
+                    # the 1x RGBI capture follows on this same open reservation.
+                    setattr(dev, ir_opt, not split_coolscan_ir)
                 except Exception as e:
                     raise RuntimeError(f"IR capture requested but enabling option {ir_opt!r} failed: {e}") from e
 
+            # Apply hardware-specific optimizations
             if device_id.startswith(_PIEUSB_PREFIX):
                 self._set_pieusb_flags(dev, params.capture_ir)
 
-            # offset + extent must stay within one pitch — the overrun comes back black.
-            window = params.window
-            extent_cap = _frame_extent_cap(option_map, offset_mm)
-            if extent_cap is not None:
-                x1, y1, x2, y2 = window if window is not None else (0.0, 0.0, 1.0, 1.0)
-                y2 = min(y2, extent_cap)
-                window = (x1, min(y1, y2), x2, y2)
-            if window is not None:
-                for name, value in _window_to_option_values(option_map, window).items():
-                    if hasattr(dev, name):
-                        setattr(dev, name, value)
+            # Set scan area if specified
+            if params.area is not None:
+                tl_x, tl_y, br_x, br_y = params.area
+                if hasattr(dev, "tl_x"):
+                    dev.tl_x = tl_x
+                if hasattr(dev, "tl_y"):
+                    dev.tl_y = tl_y
+                if hasattr(dev, "br_x"):
+                    dev.br_x = br_x
+                if hasattr(dev, "br_y"):
+                    dev.br_y = br_y
 
+            # Emit start progress
             if progress:
                 try:
                     progress(0.0)
@@ -1008,10 +970,11 @@ class SaneBackend:
                 dev.cancel()
                 raise RuntimeError("Scan cancelled before start")
 
+            # Start scan
             dev.start()
             rgb_array = None
             ir_array = None
-            ir_valid_mask: np.ndarray | None = None
+            ir_alignment: SplitIrAlignment | None = None
 
             # Frame geometry truth, for channel reinterpretation below
             # (python-sane assumes 3 samples/pixel; see _reinterpret_channels).
@@ -1023,7 +986,7 @@ class SaneBackend:
                 px_per_line = n_lines = -1
                 returned_depth = bytes_per_line = -1
 
-            if ir_strategy == "option":
+            if not split_coolscan_ir and ir_strategy == "option":
                 _validate_inline_rgbi_parameters(
                     frame_format=frame_format,
                     last_frame=last_frame,
@@ -1037,26 +1000,113 @@ class SaneBackend:
 
             # Read RGB frame. Use arr_snap() (numpy path) — snap() goes via PIL
             # which is 8-bit only and silently truncates 16-bit RGB buffers.
+            # progress is forwarded per-line so the UI bar moves during the
+            # read; see _snap_progress_callback for why it can't also cancel
+            # the read early.
             try:
-                rgb_array = dev.arr_snap(progress=_snap_progress_callback(progress))
+                first_progress = _progress_segment(progress, 0.0, 0.75) if split_coolscan_ir else progress
+                rgb_array = dev.arr_snap(progress=_snap_progress_callback(first_progress))
             except Exception as e:
                 dev.cancel()
-                raise _as_scan_error(e, f"RGB scan failed: {e}") from e
+                raise RuntimeError(f"RGB scan failed: {e}") from e
+
+            if split_coolscan_ir:
+                if ir_opt is None:
+                    dev.cancel()
+                    raise RuntimeError("Coolscan split capture lost its preflighted infrared option")
+                if rgb_array.ndim != 3 or rgb_array.shape[2] != 3:
+                    dev.cancel()
+                    raise RuntimeError(f"Coolscan multisample RGB capture yielded an unexpected shape {rgb_array.shape}")
+                if cancel.is_set():
+                    dev.cancel()
+                    raise RuntimeError("Scan cancelled")
+
+                # sane_read() consumes coolscan3's one-frame counter at EOF —
+                # but only when the exposure counter is in play (roll adapter).
+                # A single-frame holder marks `frame_count` inactive and never
+                # checks it; writing an inactive option would itself error.
+                # Reset only that counter; do not touch `frame`, `subframe`, or
+                # the scan window, so the feeder never repositions between the
+                # RGB and RGBI captures.
+                try:
+                    fresh_options = dev.opt if hasattr(dev, "opt") else {}
+                    if _option_is_active(fresh_options, "frame_count"):
+                        dev.frame_count = 1
+                    dev.samples_per_scan = 1
+                    setattr(dev, ir_opt, True)
+                    if params.autofocus and "autofocus" in option_map:
+                        dev.autofocus = False
+                    if params.auto_exposure and "ae" in option_map:
+                        dev.ae = False
+                except Exception as e:
+                    dev.cancel()
+                    raise RuntimeError(f"Could not prepare the single-pass Coolscan IR capture: {e}") from e
+
+                # Last chance to stop without wasting the IR traversal — after
+                # this start, cancellation waits for the read to finish (a
+                # transfer must never be interrupted mid-flight).
+                if cancel.is_set():
+                    dev.cancel()
+                    raise RuntimeError("Scan cancelled")
+                try:
+                    dev.start()
+                except Exception as e:
+                    dev.cancel()
+                    raise RuntimeError(f"Infrared scan failed: {e}") from e
+                try:
+                    ir_format, ir_last_frame, (ir_px_per_line, ir_n_lines), ir_depth, ir_bytes_per_line = dev.get_parameters()
+                except Exception:
+                    ir_format = None
+                    ir_last_frame = None
+                    ir_px_per_line = ir_n_lines = -1
+                    ir_depth = ir_bytes_per_line = -1
+                _validate_inline_rgbi_parameters(
+                    frame_format=ir_format,
+                    last_frame=ir_last_frame,
+                    pixels_per_line=ir_px_per_line,
+                    lines=ir_n_lines,
+                    returned_depth=ir_depth,
+                    bytes_per_line=ir_bytes_per_line,
+                    requested_depth=params.depth,
+                    context="Single-pass Coolscan infrared frame",
+                )
+                try:
+                    rgbi_array = dev.arr_snap(progress=_snap_progress_callback(_progress_segment(progress, 0.75, 1.0)))
+                except Exception as e:
+                    dev.cancel()
+                    raise RuntimeError(f"Infrared scan failed: {e}") from e
+
+                # Honor a mid-IR-read cancel before spending CV time on a
+                # result nobody wants; never return a partial (RGB-only) scan.
+                if cancel.is_set():
+                    dev.cancel()
+                    raise RuntimeError("Scan cancelled")
+
+                rgbi_array = _reinterpret_channels(rgbi_array, ir_px_per_line, ir_n_lines)
+                if rgbi_array.ndim != 3 or rgbi_array.shape[2] != 4:
+                    dev.cancel()
+                    raise RuntimeError(f"Single-pass Coolscan IR capture yielded no 4th channel (shape={rgbi_array.shape})")
+                rgb_proxy, ir_array = _split_rgbi(rgbi_array)
+                rgb_array, ir_array, ir_alignment = _align_split_ir(rgb_array, rgb_proxy, ir_array)
 
             # Inline-IR frames carry infrared as the 4th channel — recover the
             # true shape (python-sane misreads 4-sample frames) and split it off.
-            if ir_strategy == "option" or ir_strategy == "rgbi-hw3":
+            if not split_coolscan_ir and ir_strategy == "option":
                 rgb_array = _reinterpret_channels(rgb_array, px_per_line, n_lines)
                 if rgb_array.ndim == 3 and rgb_array.shape[2] == 4:
                     rgb_array, ir_array = _split_rgbi(rgb_array)
                 else:
+                    # IR was explicitly requested; a long archival scan must
+                    # not quietly complete without its defect channel.
                     dev.cancel()
                     raise RuntimeError(f"IR strategy '{ir_strategy}' yielded no 4th channel (shape={rgb_array.shape})")
             elif ir_strategy == "rgbi" and rgb_array.ndim == 3 and rgb_array.shape[2] == 4:
-                # Generic RGBI devices: native four-channel ndarrays split directly.
+                # Preserve the pre-Coolscan contract for generic RGBI devices:
+                # native four-channel ndarrays are split directly, without
+                # coolscan3 raw-stream reinterpretation or metadata gates.
                 rgb_array, ir_array = _split_rgbi(rgb_array)
 
-            expected_dtype = np.uint16 if _sane_container_depth(params.depth) == 16 else np.uint8
+            expected_dtype = np.uint16 if params.depth == 16 else np.uint8
             if rgb_array.dtype != expected_dtype:
                 logger.warning(
                     f"Scanner returned {rgb_array.dtype} for depth={params.depth}; "
@@ -1087,9 +1137,6 @@ class SaneBackend:
                 except Exception:
                     pass
 
-            if ir_array is not None and ir_valid_mask is None:
-                ir_valid_mask = np.ones(ir_array.shape[:2], dtype=np.bool_)
-
             # Look up real vendor/model from cached device list (dev itself has no such attrs).
             sd = next((d for d in (self._devices_cache or []) if d.id == device_id), None)
             model = f"{sd.vendor} {sd.model}" if sd else device_id
@@ -1099,7 +1146,7 @@ class SaneBackend:
                 ir=ir_array[:, :, 0] if ir_array is not None and ir_array.ndim == 3 else ir_array,
                 dpi=params.dpi,
                 device_model=model,
-                ir_valid_mask=ir_valid_mask,
+                ir_alignment=ir_alignment,
             )
 
         finally:
@@ -1107,57 +1154,10 @@ class SaneBackend:
                 dev.cancel()
             except Exception:
                 pass
-
-    def eject(self, device_id: str) -> bool:
-        """Trigger the device's vendor eject action, if it exposes one.
-
-        Mirrors Nikon Scan's behaviour of ejecting film at completion instead of
-        leaving it parked (the LS-5000 feeder auto-parks a few minutes after any
-        session closes; a parked feeder needs a power-cycle to recover mid-roll).
-        Capability-gated: returns False as a clean no-op when the device has no
-        active, settable 'eject' option.
-
-        python-sane cannot press a SANE_TYPE_BUTTON, so once capability is
-        confirmed the handle is closed and the button is pressed via `scanimage
-        --eject` (see _scanimage_eject). Raises when the open/close or the eject fail.
-        """
-
-        try:
-            self._ensure_initialized()
-        except Exception as exc:
-            raise RuntimeError(f"Failed to initialize SANE before eject: {exc}") from exc
-
-        if self._session_holding(device_id) is not None:
-            raise RuntimeError(f"Scanner {device_id} is held by an active session — eject through that session")
-
-        try:
-            dev, opened_id = self._open_device(device_id)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to open scanner {device_id} to eject: {exc}") from exc
-
-        try:
-            option_map = dev.opt if hasattr(dev, "opt") else {}
-            eject_option = _find_eject_option(option_map)
-            has_eject = eject_option is not None and _option_is_usable(option_map[eject_option])
-        except Exception as exc:
             try:
                 dev.close()
             except Exception:
                 pass
-            raise RuntimeError(f"Could not inspect eject capability on {device_id!r}: {exc}") from exc
-
-        # Close before pressing: SANE allows a single open handle and scanimage opens its own.
-        try:
-            dev.close()
-        except Exception as exc:
-            raise RuntimeError(f"Could not close scanner device {device_id!r} before eject: {exc}") from exc
-
-        if not has_eject:
-            return False
-
-        # opened_id, not device_id: a re-enumeration may have remapped the address.
-        _scanimage_eject(opened_id)
-        return True
 
     def _set_pieusb_flags(self, dev, capture_ir) -> None:
         """Apply hardware-specific optimizations for pieusb scanners."""
@@ -1169,7 +1169,7 @@ class SaneBackend:
             "correct_shading": True,
         }
         if capture_ir:
-            opts["clean_image"] = False
+            opts["clean_image"] = True
             opts["correct_infrared"] = True
 
         for name, val in opts.items():
@@ -1187,11 +1187,11 @@ class SaneBackend:
     def _ir_strategy(dev, device_id) -> str | None:
         """How to capture IR for this device: 'rgbi' (RGBI scan mode), 'option'
         (boolean IR option, 4th channel inline — coolscan3), 'source' (Plustek
-        second scan), 'rgbi-hw3' (just 4th channel inline) or None."""
+        second scan), 'internal' (applied by the Backend/Scanner itself) or None."""
         opt = dev.opt if hasattr(dev, "opt") else {}
         backend_id = _strip_net_prefix(device_id)
         if device_id.startswith(_PIEUSB_PREFIX):
-            return "rgbi-hw3"
+            return "internal"
         if _mode_has_rgbi(opt):
             return "rgbi"
         # Inline-boolean IR is a coolscan3 contract (4th sample in the same

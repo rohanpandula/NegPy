@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import json
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,8 +18,9 @@ import pytest
 import tifffile
 
 import negpy.services.scanning.roll_service as roll_service_module
+from negpy.infrastructure.scanners.base import ScannerCapabilities, ScannerDevice
 from negpy.infrastructure.scanners.params import RegisteredScanGeometry, ScanParams
-from negpy.infrastructure.scanners.result import ScanResult
+from negpy.infrastructure.scanners.result import ScanResult, SplitIrAlignment
 from negpy.services.scanning.roll_service import (
     AlignmentVerification,
     FrameRegistration,
@@ -31,22 +33,180 @@ class FakeScanner:
     def __init__(self) -> None:
         self.calls: list[ScanParams] = []
         self.after_scan = None
+        self.probe_calls: list[str] = []
 
     def run_scan(self, device_id, params, progress, cancel):
         assert device_id == "coolscan3:test"
         assert not cancel.is_set()
         self.calls.append(params)
-        dtype = np.uint8 if params.depth == 8 else np.uint16
-        fill = (
-            (100 if params.registered_geometry is None else 200)
-            if dtype == np.uint8
-            else (1000 if params.registered_geometry is None else 2000)
-        )
-        rgb = np.full((12, 16, 3), fill + int(params.frame or 0), dtype=dtype)
-        ir = np.full((12, 16), 500 + int(params.frame or 0), dtype=np.uint16) if params.capture_ir else None
-        result = ScanResult(rgb=rgb, ir=ir, dpi=params.dpi, device_model="Fake Coolscan")
+        if params.dpi == 4000:
+            rng = np.random.default_rng(4000 + int(params.frame or 0))
+            rgb = rng.integers(1000, 64000, size=(128, 80, 3), dtype=np.uint16)
+            ir = np.full(rgb.shape[:2], 500 + int(params.frame or 0), dtype=np.uint16) if params.capture_ir else None
+            alignment = SplitIrAlignment(mode="identity", dx_px=0.0, dy_px=0.0) if params.capture_ir else None
+            result = ScanResult(
+                rgb=rgb,
+                ir=ir,
+                dpi=params.dpi,
+                device_model="Fake Coolscan",
+                ir_alignment=alignment,
+            )
+        else:
+            dtype = np.uint8 if params.depth == 8 else np.uint16
+            fill = (
+                (100 if params.registered_geometry is None else 200)
+                if dtype == np.uint8
+                else (1000 if params.registered_geometry is None else 2000)
+            )
+            rgb = np.full((12, 16, 3), fill + int(params.frame or 0), dtype=dtype)
+            ir = np.full((12, 16), 500 + int(params.frame or 0), dtype=np.uint16) if params.capture_ir else None
+            result = ScanResult(rgb=rgb, ir=ir, dpi=params.dpi, device_model="Fake Coolscan")
         if self.after_scan is not None:
             self.after_scan(params)
+        return result
+
+    def probe_device(self, device_id: str) -> ScannerDevice:
+        self.probe_calls.append(device_id)
+        return ScannerDevice(
+            id=device_id,
+            vendor="Nikon",
+            model="LS-5000 ED",
+            capabilities=ScannerCapabilities(
+                ir_channel=True,
+                supported_dpi=(400, 4000),
+                supported_depths=(16,),
+                sources=(),
+                max_area_mm=(36.0, 25.0),
+                multi_sample=True,
+                adapter_frame_capacity=40,
+            ),
+        )
+
+
+class QualityScanner(FakeScanner):
+    """Software-only scanner double that emits a QC-measurable fine frame."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.probe_calls: list[str] = []
+
+    def run_scan(self, device_id, params, progress, cancel):
+        result = super().run_scan(device_id, params, progress, cancel)
+        if params.dpi != 4000:
+            return result
+        rng = np.random.default_rng(4000 + int(params.frame or 0))
+        rgb = rng.integers(1000, 64000, size=(128, 80, 3), dtype=np.uint16)
+        ir = np.full(rgb.shape[:2], 12000, dtype=np.uint16) if params.capture_ir else None
+        alignment = SplitIrAlignment(mode="identity", dx_px=0.0, dy_px=0.0) if params.capture_ir else None
+        return ScanResult(
+            rgb=rgb,
+            ir=ir,
+            dpi=params.dpi,
+            device_model="Nikon Coolscan LS-5000 ED",
+            ir_alignment=alignment,
+        )
+
+    def probe_device(self, device_id: str) -> ScannerDevice:
+        self.probe_calls.append(device_id)
+        return ScannerDevice(
+            id=device_id,
+            vendor="Nikon",
+            model="LS-5000 ED",
+            capabilities=ScannerCapabilities(
+                ir_channel=True,
+                supported_dpi=(400, 4000),
+                supported_depths=(16,),
+                sources=(),
+                max_area_mm=(36.0, 25.0),
+                multi_sample=True,
+                adapter_frame_capacity=40,
+            ),
+        )
+
+
+class IndeterminateQualityScanner(QualityScanner):
+    def run_scan(self, device_id, params, progress, cancel):
+        result = super().run_scan(device_id, params, progress, cancel)
+        if params.dpi != 4000:
+            return result
+        rgb = np.full((128, 80, 3), 20000, dtype=np.uint16)
+        ir = np.full(rgb.shape[:2], 12000, dtype=np.uint16) if params.capture_ir else None
+        return ScanResult(
+            rgb=rgb,
+            ir=ir,
+            dpi=params.dpi,
+            device_model=result.device_model,
+            ir_alignment=result.ir_alignment,
+        )
+
+
+class SmearQualityScanner(QualityScanner):
+    def run_scan(self, device_id, params, progress, cancel):
+        result = super().run_scan(device_id, params, progress, cancel)
+        if params.dpi != 4000:
+            return result
+        rng = np.random.default_rng(47)
+        rgb = rng.integers(1000, 64000, size=(160, 80, 3), dtype=np.uint16)
+        rgb[-70:] = rgb[-71]
+        ir = np.full(rgb.shape[:2], 12000, dtype=np.uint16) if params.capture_ir else None
+        return ScanResult(
+            rgb=rgb,
+            ir=ir,
+            dpi=params.dpi,
+            device_model=result.device_model,
+            ir_alignment=result.ir_alignment,
+        )
+
+
+class ProbeFailingQualityScanner(QualityScanner):
+    def probe_device(self, device_id: str) -> ScannerDevice:
+        self.probe_calls.append(device_id)
+        raise OSError("probe offline")
+
+
+class FailLaterProbeQualityScanner(QualityScanner):
+    fail_probe = False
+
+    def probe_device(self, device_id: str) -> ScannerDevice:
+        if self.fail_probe:
+            self.probe_calls.append(device_id)
+            raise OSError("probe offline")
+        return super().probe_device(device_id)
+
+
+class MissingAlignmentQualityScanner(QualityScanner):
+    def run_scan(self, device_id, params, progress, cancel):
+        result = super().run_scan(device_id, params, progress, cancel)
+        if params.dpi != 4000:
+            return result
+        return ScanResult(
+            rgb=result.rgb,
+            ir=result.ir,
+            dpi=result.dpi,
+            device_model=result.device_model,
+            ir_alignment=None,
+        )
+
+
+class MismatchedPairQualityScanner(QualityScanner):
+    def run_scan(self, device_id, params, progress, cancel):
+        result = super().run_scan(device_id, params, progress, cancel)
+        if params.dpi != 4000 or result.ir is None:
+            return result
+        return ScanResult(
+            rgb=result.rgb,
+            ir=result.ir[:-1],
+            dpi=result.dpi,
+            device_model=result.device_model,
+            ir_alignment=result.ir_alignment,
+        )
+
+
+class ClippedQualityScanner(QualityScanner):
+    def run_scan(self, device_id, params, progress, cancel):
+        result = super().run_scan(device_id, params, progress, cancel)
+        if params.dpi == 4000:
+            result.rgb[:4, :, 0] = np.iinfo(np.uint16).max
         return result
 
 
@@ -71,10 +231,7 @@ class FakeRegistration:
 
     def calibrate(self, previews):
         self.calibrated_frames = tuple(previews)
-        self.calibrated_signatures = tuple(
-            (frame, np.dtype(preview.dtype).name, int(preview.max()))
-            for frame, preview in previews.items()
-        )
+        self.calibrated_signatures = tuple((frame, np.dtype(preview.dtype).name, int(preview.max())) for frame, preview in previews.items())
         return {
             frame: FrameRegistration(
                 frame=frame,
@@ -91,9 +248,7 @@ class FakeRegistration:
         }
 
     def verify(self, frame, preview, registration):
-        self.verification_signatures += (
-            (frame, np.dtype(preview.dtype).name, int(preview.max())),
-        )
+        self.verification_signatures += ((frame, np.dtype(preview.dtype).name, int(preview.max())),)
         expected_values = {2000 + frame, (200 + frame) * 257}
         assert int(preview.min()) == int(preview.max())
         assert int(preview.max()) in expected_values
@@ -356,6 +511,758 @@ def test_fine_scan_can_target_frame_three_and_reuses_its_verified_geometry(tmp_p
     assert fine_path.with_name(f"{fine_path.stem}_IR.tif").is_file()
 
 
+def test_fine_scan_writes_a_fully_bound_qc_sidecar_after_fresh_probe(tmp_path: Path) -> None:
+    scanner = QualityScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False),
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "roll-scan.json")
+
+    plan = service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=ScanParams(
+            dpi=4000,
+            depth=16,
+            capture_ir=True,
+            samples_per_scan=4,
+        ),
+        stop=threading.Event(),
+    )
+
+    assert plan.frames[0].fine_path is not None
+    rgb_path = tmp_path / plan.frames[0].fine_path
+    qc_path = Path(f"{rgb_path}.qc.json")
+    assert qc_path.is_file()
+    sidecar = json.loads(qc_path.read_text())
+    assert sidecar["version"] == 1
+    assert sidecar["accepted"] is True
+    assert sidecar["frame"] == 3
+    assert sidecar["device_id"] == "coolscan3:test"
+    assert sidecar["fine_recipe"] == {
+        "dpi": 4000,
+        "depth": 16,
+        "capture_ir": True,
+        "autofocus": True,
+        "samples_per_scan": 4,
+        "auto_exposure": False,
+    }
+    assert sidecar["registered_geometry"] == {
+        "frame": 3,
+        "subframe_mm": 1.28,
+        "br_y_device_px": 4997,
+    }
+    assert sidecar["artifacts"]["rgb"]["path"] == plan.frames[0].fine_path
+    assert sidecar["artifacts"]["ir"]["path"].endswith("_IR.tif")
+    for artifact in sidecar["artifacts"].values():
+        artifact_path = tmp_path / artifact["path"]
+        assert artifact["bytes"] == artifact_path.stat().st_size
+        assert len(artifact["sha256"]) == 64
+        assert artifact["dtype"] == "uint16"
+        assert artifact["page_count"] == 1
+        assert artifact["payload_within_file"] is True
+        assert artifact["x_resolution"] == [4000, 1]
+        assert artifact["y_resolution"] == [4000, 1]
+        assert artifact["resolution_unit"] == "INCH"
+    assert sidecar["artifacts"]["rgb"]["shape"] == [128, 80, 3]
+    assert sidecar["artifacts"]["ir"]["shape"] == [128, 80]
+    assert sidecar["split_alignment"] == {
+        "mode": "identity",
+        "dx_px": 0.0,
+        "dy_px": 0.0,
+        "phase_responses": [],
+        "channel_spread_px": None,
+        "ecc_coefficient": None,
+    }
+    assert sidecar["stopped_transport_smear"]["verdict"] == "clean"
+    assert sidecar["clipping"]["warning"] is False
+    assert sidecar["focus_detail"]["verdict"] == "measured"
+    assert sidecar["human_overrides"] == {
+        "allow_indeterminate_stopped_transport_smear": False,
+    }
+    assert sidecar["device_health"] == {
+        "fresh_probe": True,
+        "id": "coolscan3:test",
+        "vendor": "Nikon",
+        "model": "LS-5000 ED",
+    }
+    assert scanner.probe_calls == ["coolscan3:test"]
+
+
+def test_missing_qc_sidecar_demotes_complete_plan_and_safe_resume_rescans(tmp_path: Path) -> None:
+    scanner = QualityScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    preview_params = ScanParams(dpi=400, depth=16, capture_ir=False)
+    fine_params = ScanParams(
+        dpi=4000,
+        depth=16,
+        capture_ir=True,
+        samples_per_scan=4,
+    )
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=preview_params,
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "roll-scan.json")
+    completed = service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=fine_params,
+        stop=threading.Event(),
+    )
+    assert completed.stage is RollStage.COMPLETE
+    assert completed.frames[0].fine_path is not None
+    qc_path = Path(f"{tmp_path / completed.frames[0].fine_path}.qc.json")
+    qc_path.unlink()
+    calls_before_prepare = len(scanner.calls)
+
+    demoted = service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=preview_params,
+        stop=threading.Event(),
+    )
+
+    assert demoted.stage is RollStage.APPROVED
+    assert len(scanner.calls) == calls_before_prepare
+
+    resumed = service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=fine_params,
+        stop=threading.Event(),
+    )
+
+    assert [call.frame for call in scanner.calls[calls_before_prepare:]] == [3]
+    assert resumed.stage is RollStage.COMPLETE
+    assert qc_path.is_file()
+
+
+def test_fine_resume_rescans_when_artifact_hash_no_longer_matches_sidecar(tmp_path: Path) -> None:
+    scanner = QualityScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    fine_params = ScanParams(
+        dpi=4000,
+        depth=16,
+        capture_ir=True,
+        samples_per_scan=4,
+    )
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False),
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "roll-scan.json")
+    completed = service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=fine_params,
+        stop=threading.Event(),
+    )
+    assert completed.frames[0].fine_path is not None
+    output = tmp_path / completed.frames[0].fine_path
+    tampered = tifffile.imread(output)
+    tampered[0, 0, 0] ^= np.uint16(1)
+    tifffile.imwrite(
+        output,
+        tampered,
+        photometric="rgb",
+        resolution=(4000, 4000),
+        resolutionunit="INCH",
+    )
+    calls_before_resume = len(scanner.calls)
+
+    resumed = service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=fine_params,
+        stop=threading.Event(),
+    )
+
+    assert [call.frame for call in scanner.calls[calls_before_resume:]] == [3]
+    assert resumed.stage is RollStage.COMPLETE
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "tampered_value"),
+    [
+        ("fine_recipe", "samples_per_scan", 99),
+        ("registered_geometry", "br_y_device_px", 123),
+    ],
+)
+def test_fine_resume_rescans_when_qc_recipe_or_geometry_binding_is_tampered(
+    tmp_path: Path,
+    section: str,
+    field: str,
+    tampered_value: object,
+) -> None:
+    scanner = QualityScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    fine_params = ScanParams(
+        dpi=4000,
+        depth=16,
+        capture_ir=True,
+        samples_per_scan=4,
+    )
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False),
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "roll-scan.json")
+    completed = service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=fine_params,
+        stop=threading.Event(),
+    )
+    assert completed.frames[0].fine_path is not None
+    qc_path = Path(f"{tmp_path / completed.frames[0].fine_path}.qc.json")
+    sidecar = json.loads(qc_path.read_text())
+    sidecar[section][field] = tampered_value
+    qc_path.write_text(json.dumps(sidecar))
+    calls_before_resume = len(scanner.calls)
+
+    resumed = service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=fine_params,
+        stop=threading.Event(),
+    )
+
+    assert [call.frame for call in scanner.calls[calls_before_resume:]] == [3]
+    assert resumed.stage is RollStage.COMPLETE
+
+
+@pytest.mark.parametrize(
+    ("field", "tampered_value"),
+    [
+        ("path", "fine/not-the-captured-frame.tif"),
+        ("bytes", 1),
+        ("shape", [1, 1, 3]),
+        ("dtype", "uint8"),
+        ("page_count", 2),
+        ("payload_within_file", False),
+        ("x_resolution", [3999, 1]),
+        ("y_resolution", None),
+        ("resolution_unit", "CENTIMETER"),
+    ],
+)
+def test_fine_resume_rejects_tampered_qc_artifact_metadata(
+    tmp_path: Path,
+    field: str,
+    tampered_value: object,
+) -> None:
+    scanner = QualityScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    fine_params = ScanParams(
+        dpi=4000,
+        depth=16,
+        capture_ir=True,
+        samples_per_scan=4,
+    )
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False),
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "roll-scan.json")
+    completed = service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=fine_params,
+        stop=threading.Event(),
+    )
+    assert completed.frames[0].fine_path is not None
+    qc_path = Path(f"{tmp_path / completed.frames[0].fine_path}.qc.json")
+    sidecar = json.loads(qc_path.read_text())
+    sidecar["artifacts"]["rgb"][field] = tampered_value
+    qc_path.write_text(json.dumps(sidecar))
+    calls_before_resume = len(scanner.calls)
+
+    service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=fine_params,
+        stop=threading.Event(),
+    )
+
+    assert [call.frame for call in scanner.calls[calls_before_resume:]] == [3]
+
+
+@pytest.mark.parametrize(
+    ("field", "tampered_value"),
+    [
+        ("device_id", "coolscan3:other"),
+        ("split_alignment", None),
+        (
+            "split_alignment",
+            {
+                "mode": "identity",
+                "dx_px": None,
+                "dy_px": 0.0,
+                "phase_responses": [],
+                "channel_spread_px": None,
+                "ecc_coefficient": None,
+            },
+        ),
+        ("stopped_transport_smear", {"verdict": "clean"}),
+        ("clipping", None),
+        ("focus_detail", None),
+        ("device_health", {"fresh_probe": False}),
+    ],
+)
+def test_fine_resume_rejects_semantically_tampered_qc_sidecar(
+    tmp_path: Path,
+    field: str,
+    tampered_value: object,
+) -> None:
+    scanner = QualityScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    fine_params = ScanParams(
+        dpi=4000,
+        depth=16,
+        capture_ir=True,
+        samples_per_scan=4,
+    )
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False),
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "roll-scan.json")
+    completed = service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=fine_params,
+        stop=threading.Event(),
+    )
+    assert completed.frames[0].fine_path is not None
+    qc_path = Path(f"{tmp_path / completed.frames[0].fine_path}.qc.json")
+    sidecar = json.loads(qc_path.read_text())
+    sidecar[field] = tampered_value
+    qc_path.write_text(json.dumps(sidecar))
+    calls_before_resume = len(scanner.calls)
+
+    service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=fine_params,
+        stop=threading.Event(),
+    )
+
+    assert [call.frame for call in scanner.calls[calls_before_resume:]] == [3]
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "tampered_value"),
+    [
+        ("stopped_transport_smear", "start_row", 0),
+        ("stopped_transport_smear", "suffix_rows", 1),
+        ("stopped_transport_smear", "minimum_matches", 0),
+        ("stopped_transport_smear", "tail_median_rms", -1.0),
+        ("stopped_transport_smear", "tail_min_corr", 1.1),
+        ("stopped_transport_smear", "texture_span", -1.0),
+        ("clipping", "fractions", [1.1, 0.0, 0.0]),
+        ("clipping", "clip_level", 0.0),
+        ("clipping", "warning_fraction", -0.1),
+        ("clipping", "warning", True),
+        ("focus_detail", "method", "unknown-method"),
+        ("focus_detail", "verdict", "indeterminate"),
+        ("focus_detail", "score", -0.1),
+        ("focus_detail", "texture_span", -1.0),
+    ],
+)
+def test_fine_resume_rejects_impossible_qc_telemetry(
+    tmp_path: Path,
+    section: str,
+    field: str,
+    tampered_value: object,
+) -> None:
+    scanner = QualityScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    fine_params = ScanParams(
+        dpi=4000,
+        depth=16,
+        capture_ir=True,
+        samples_per_scan=4,
+    )
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False),
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "roll-scan.json")
+    completed = service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=fine_params,
+        stop=threading.Event(),
+    )
+    assert completed.frames[0].fine_path is not None
+    qc_path = Path(f"{tmp_path / completed.frames[0].fine_path}.qc.json")
+    sidecar = json.loads(qc_path.read_text())
+    sidecar[section][field] = tampered_value
+    qc_path.write_text(json.dumps(sidecar))
+    calls_before_resume = len(scanner.calls)
+
+    service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=fine_params,
+        stop=threading.Event(),
+    )
+
+    assert [call.frame for call in scanner.calls[calls_before_resume:]] == [3]
+
+
+def test_indeterminate_smear_requires_explicit_frame_override_and_persists_it(tmp_path: Path) -> None:
+    scanner = IndeterminateQualityScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    fine_params = ScanParams(
+        dpi=4000,
+        depth=16,
+        capture_ir=True,
+        samples_per_scan=4,
+    )
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False),
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "roll-scan.json")
+
+    with pytest.raises(RuntimeError, match="indeterminate.*explicit human override"):
+        service.scan_fine(
+            plan_path=tmp_path / "roll-scan.json",
+            fine_params=fine_params,
+            stop=threading.Event(),
+        )
+
+    saved_after_refusal = json.loads((tmp_path / "roll-scan.json").read_text())
+    assert saved_after_refusal["frames"][0]["fine_path"] is None
+    assert len(list((tmp_path / "fine").glob("*.tif"))) == 2
+    assert list((tmp_path / "fine").glob("*.qc.json")) == []
+    assert scanner.probe_calls == []
+
+    completed = service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=fine_params,
+        stop=threading.Event(),
+        allow_indeterminate_smear_frames=(3,),
+    )
+
+    assert completed.stage is RollStage.COMPLETE
+    assert completed.frames[0].fine_path is not None
+    qc_path = Path(f"{tmp_path / completed.frames[0].fine_path}.qc.json")
+    sidecar = json.loads(qc_path.read_text())
+    assert sidecar["stopped_transport_smear"]["verdict"] == "indeterminate"
+    assert sidecar["focus_detail"]["verdict"] == "indeterminate"
+    assert sidecar["human_overrides"] == {
+        "allow_indeterminate_stopped_transport_smear": True,
+    }
+    assert scanner.probe_calls == ["coolscan3:test"]
+
+
+def test_detected_smear_cannot_be_human_overridden_or_checkpointed(tmp_path: Path) -> None:
+    scanner = SmearQualityScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False),
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "roll-scan.json")
+
+    with pytest.raises(RuntimeError, match="detected stopped-transport smear"):
+        service.scan_fine(
+            plan_path=tmp_path / "roll-scan.json",
+            fine_params=ScanParams(
+                dpi=4000,
+                depth=16,
+                capture_ir=True,
+                samples_per_scan=4,
+            ),
+            stop=threading.Event(),
+            allow_indeterminate_smear_frames=(3,),
+        )
+
+    saved = json.loads((tmp_path / "roll-scan.json").read_text())
+    assert saved["frames"][0]["fine_path"] is None
+    assert len(list((tmp_path / "fine").glob("*.tif"))) == 2
+    assert list((tmp_path / "fine").glob("*.qc.json")) == []
+    assert scanner.probe_calls == []
+
+
+def test_probe_failure_happens_after_write_without_sidecar_checkpoint_or_retry(tmp_path: Path) -> None:
+    scanner = ProbeFailingQualityScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False),
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "roll-scan.json")
+    fine_calls_before = len(scanner.calls)
+
+    with pytest.raises(
+        RuntimeError,
+        match="frame 3: fresh scanner health probe failed: probe offline",
+    ) as raised:
+        service.scan_fine(
+            plan_path=tmp_path / "roll-scan.json",
+            fine_params=ScanParams(
+                dpi=4000,
+                depth=16,
+                capture_ir=True,
+                samples_per_scan=4,
+            ),
+            stop=threading.Event(),
+        )
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert [call.frame for call in scanner.calls[fine_calls_before:]] == [3]
+    assert len(list((tmp_path / "fine").glob("*.tif"))) == 2
+    assert list((tmp_path / "fine").glob("*.qc.json")) == []
+    saved = json.loads((tmp_path / "roll-scan.json").read_text())
+    assert saved["frames"][0]["fine_path"] is None
+    assert scanner.probe_calls == ["coolscan3:test"]
+
+
+def test_failed_replacement_probe_cannot_leave_previous_qc_sidecar_trusted(tmp_path: Path) -> None:
+    scanner = FailLaterProbeQualityScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    fine_params = ScanParams(
+        dpi=4000,
+        depth=16,
+        capture_ir=True,
+        samples_per_scan=4,
+    )
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False),
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "roll-scan.json")
+    completed = service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=fine_params,
+        stop=threading.Event(),
+    )
+    assert completed.frames[0].fine_path is not None
+    output = tmp_path / completed.frames[0].fine_path
+    qc_path = Path(f"{output}.qc.json")
+    tampered = tifffile.imread(output)
+    tampered[0, 0, 0] ^= np.uint16(1)
+    tifffile.imwrite(
+        output,
+        tampered,
+        photometric="rgb",
+        resolution=(4000, 4000),
+        resolutionunit="INCH",
+    )
+    scanner.fail_probe = True
+
+    with pytest.raises(RuntimeError, match="fresh scanner health probe failed"):
+        service.scan_fine(
+            plan_path=tmp_path / "roll-scan.json",
+            fine_params=fine_params,
+            stop=threading.Event(),
+        )
+
+    assert output.is_file()
+    assert not qc_path.exists()
+    saved = json.loads((tmp_path / "roll-scan.json").read_text())
+    assert saved["stage"] == "approved"
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["wrong_y_dpi", "non_inch", "uint8", "multipage", "payload_overrun"],
+)
+def test_invalid_committed_tiff_metadata_never_probes_or_checkpoints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    scanner = QualityScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False),
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "roll-scan.json")
+
+    def write_bad_pair(result: ScanResult, path: str) -> str:
+        rgb_path = Path(path)
+        ir_path = rgb_path.with_name(f"{rgb_path.stem}_IR.tif")
+        rgb = result.rgb.astype(np.uint8) if fault == "uint8" else result.rgb
+        resolution = (4000, 3999) if fault == "wrong_y_dpi" else (4000, 4000)
+        unit = "CENTIMETER" if fault == "non_inch" else "INCH"
+        if fault == "multipage":
+            with tifffile.TiffWriter(rgb_path) as document:
+                document.write(rgb, photometric="rgb", resolution=resolution, resolutionunit=unit)
+                document.write(rgb, photometric="rgb", resolution=resolution, resolutionunit=unit)
+        else:
+            tifffile.imwrite(
+                rgb_path,
+                rgb,
+                photometric="rgb",
+                resolution=resolution,
+                resolutionunit=unit,
+            )
+        assert result.ir is not None
+        tifffile.imwrite(
+            ir_path,
+            result.ir,
+            photometric="minisblack",
+            resolution=(4000, 4000),
+            resolutionunit="INCH",
+        )
+        if fault == "payload_overrun":
+            with tifffile.TiffFile(rgb_path) as document:
+                byteorder = document.byteorder
+                value_offset = document.pages[0].tags["StripOffsets"].valueoffset
+            with rgb_path.open("r+b") as stream:
+                stream.seek(value_offset)
+                stream.write(struct.pack(f"{byteorder}I", rgb_path.stat().st_size + 100))
+        return str(rgb_path)
+
+    monkeypatch.setattr(roll_service_module, "write_tiff_16bit", write_bad_pair)
+
+    with pytest.raises(
+        RuntimeError,
+        match="frame 3: fine RGB artifact failed committed TIFF metadata QC",
+    ):
+        service.scan_fine(
+            plan_path=tmp_path / "roll-scan.json",
+            fine_params=ScanParams(
+                dpi=4000,
+                depth=16,
+                capture_ir=True,
+                samples_per_scan=4,
+            ),
+            stop=threading.Event(),
+        )
+
+    assert len(list((tmp_path / "fine").glob("*.tif"))) == 2
+    assert list((tmp_path / "fine").glob("*.qc.json")) == []
+    saved = json.loads((tmp_path / "roll-scan.json").read_text())
+    assert saved["frames"][0]["fine_path"] is None
+    assert scanner.probe_calls == []
+
+
+@pytest.mark.parametrize(
+    ("scanner_type", "message"),
+    [
+        (MissingAlignmentQualityScanner, "split-capture alignment failed QC"),
+        (MismatchedPairQualityScanner, "RGB and IR shapes do not match"),
+    ],
+)
+def test_alignment_and_pair_shape_are_hard_gates_before_probe_or_checkpoint(
+    tmp_path: Path,
+    scanner_type,
+    message: str,
+) -> None:
+    scanner = scanner_type()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False),
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "roll-scan.json")
+
+    with pytest.raises(RuntimeError, match=message):
+        service.scan_fine(
+            plan_path=tmp_path / "roll-scan.json",
+            fine_params=ScanParams(
+                dpi=4000,
+                depth=16,
+                capture_ir=True,
+                samples_per_scan=4,
+            ),
+            stop=threading.Event(),
+        )
+
+    saved = json.loads((tmp_path / "roll-scan.json").read_text())
+    assert saved["frames"][0]["fine_path"] is None
+    assert list((tmp_path / "fine").glob("*.qc.json")) == []
+    assert scanner.probe_calls == []
+
+
+def test_clipping_warning_is_telemetry_and_does_not_block_checkpoint(tmp_path: Path) -> None:
+    scanner = ClippedQualityScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False),
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "roll-scan.json")
+
+    completed = service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=ScanParams(dpi=4000, depth=16, capture_ir=True),
+        stop=threading.Event(),
+    )
+
+    assert completed.stage is RollStage.COMPLETE
+    assert completed.frames[0].fine_path is not None
+    sidecar = json.loads(Path(f"{tmp_path / completed.frames[0].fine_path}.qc.json").read_text())
+    assert sidecar["clipping"]["warning"] is True
+
+
+def test_fine_stop_after_transfer_still_finishes_qc_and_checkpoint_before_stopping(tmp_path: Path) -> None:
+    scanner = QualityScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(2, 3),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False),
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "roll-scan.json")
+    stop = threading.Event()
+    scanner.after_scan = lambda params: stop.set() if params.dpi == 4000 else None
+    calls_before_fine = len(scanner.calls)
+
+    partial = service.scan_fine(
+        plan_path=tmp_path / "roll-scan.json",
+        fine_params=ScanParams(dpi=4000, depth=16, capture_ir=True),
+        stop=stop,
+    )
+
+    assert [call.frame for call in scanner.calls[calls_before_fine:]] == [2]
+    assert partial.stage is RollStage.APPROVED
+    assert partial.frames[0].fine_path is not None
+    assert partial.frames[1].fine_path is None
+    assert Path(f"{tmp_path / partial.frames[0].fine_path}.qc.json").is_file()
+    assert scanner.probe_calls == ["coolscan3:test"]
+
+
 def test_fine_scan_resume_skips_an_already_completed_frame(tmp_path: Path) -> None:
     scanner = FakeScanner()
     service = RollScanService(scanner=scanner, registration=FakeRegistration())
@@ -523,7 +1430,7 @@ def test_recipe_change_cannot_overwrite_the_artifact_named_by_the_old_plan(
         def run_scan(self, device_id, params, progress, cancel):
             result = super().run_scan(device_id, params, progress, cancel)
             if params.dpi == 4000:
-                result.rgb.fill(params.samples_per_scan)
+                result.rgb[0, 0, 0] = params.samples_per_scan
             return result
 
     scanner = RecipeMarkedScanner()
@@ -683,7 +1590,7 @@ def test_resume_rejects_a_valid_tiff_with_the_wrong_saved_dimensions(tmp_path: P
     )
 
     assert [call.frame for call in scanner.calls[calls_before_resume:]] == [3]
-    assert tifffile.imread(output).shape == (12, 16, 3)
+    assert tifffile.imread(output).shape == (128, 80, 3)
 
 
 def test_prepare_resume_keeps_a_finished_transfer_and_stops_before_the_next_one(tmp_path: Path) -> None:

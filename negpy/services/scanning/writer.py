@@ -2,6 +2,7 @@ import io
 import os
 import struct
 import tempfile
+from typing import cast
 
 import numpy as np
 import tifffile
@@ -23,9 +24,7 @@ def _to_uint16(arr: np.ndarray) -> np.ndarray:
     return arr.astype(np.uint16)
 
 
-def _write_temp_tiff(
-    data: np.ndarray, target_path: str, *, photometric: str, dpi: int | None = None
-) -> str:
+def _write_temp_tiff(data: np.ndarray, target_path: str, *, photometric: str, dpi: int | None = None) -> str:
     """Write `data` to a temp TIFF next to `target_path`. Returns the temp path.
 
     Caller commits it (os.replace to the real path) and is responsible for
@@ -49,20 +48,110 @@ def _write_temp_tiff(
     return tmp_path
 
 
+def _unused_sibling_path(target_path: str) -> str:
+    """Reserve a unique sibling name, then remove the placeholder.
+
+    The returned path is used as a rename target for an existing TIFF while a
+    replacement pair is committed. Keeping it in the same directory preserves
+    the atomic-rename guarantee of ``os.replace`` for each individual file.
+    """
+    fd, backup_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target_path)}.",
+        suffix=".bak",
+        dir=os.path.dirname(target_path) or ".",
+    )
+    os.close(fd)
+    os.unlink(backup_path)
+    return backup_path
+
+
+def _unlink_if_present(path: str | None) -> None:
+    if path is not None and os.path.exists(path):
+        os.unlink(path)
+
+
+def _commit_tiff_pair(tmp_rgb: str, tmp_ir: str | None, rgb_path: str, ir_path: str) -> None:
+    """Commit prepared TIFFs while preserving any prior pair on an error.
+
+    This protects against synchronous rename failures in the running process.
+    It is not a two-file filesystem transaction: a crash or power loss between
+    the sequential renames can leave destinations missing or mixed, with
+    sibling backup files requiring recovery.
+    """
+    backup_rgb = None
+    backup_ir = None
+    moved_old_rgb = False
+    moved_old_ir = False
+    committed_rgb = False
+    committed_ir = False
+
+    try:
+        backup_rgb = _unused_sibling_path(rgb_path) if os.path.exists(rgb_path) else None
+        backup_ir = _unused_sibling_path(ir_path) if os.path.exists(ir_path) else None
+        if backup_rgb is not None:
+            os.replace(rgb_path, backup_rgb)
+            moved_old_rgb = True
+        if backup_ir is not None:
+            os.replace(ir_path, backup_ir)
+            moved_old_ir = True
+
+        os.replace(tmp_rgb, rgb_path)
+        committed_rgb = True
+        tmp_rgb = ""
+        if tmp_ir is not None:
+            os.replace(tmp_ir, ir_path)
+            committed_ir = True
+            tmp_ir = None
+    except BaseException as commit_error:
+        rollback_errors: list[str] = []
+
+        def _restore(target: str, backup: str | None, moved_old: bool, committed_new: bool) -> None:
+            try:
+                if moved_old and backup is not None:
+                    os.replace(backup, target)
+                elif committed_new:
+                    _unlink_if_present(target)
+            except BaseException as rollback_error:
+                rollback_errors.append(f"{target}: {rollback_error}")
+
+        # Restore in reverse commit order. A successful os.replace both removes
+        # the new payload and returns the old payload to its original name.
+        _restore(ir_path, backup_ir, moved_old_ir, committed_ir)
+        _restore(rgb_path, backup_rgb, moved_old_rgb, committed_rgb)
+        for label, cleanup_path in (("RGB temp", tmp_rgb), ("IR temp", tmp_ir)):
+            try:
+                _unlink_if_present(cleanup_path)
+            except BaseException as cleanup_error:
+                rollback_errors.append(f"{label}: {cleanup_error}")
+
+        if rollback_errors:
+            details = "; ".join(rollback_errors)
+            raise RuntimeError(
+                f"TIFF pair commit failed and rollback was incomplete; preserved backup files may remain: {details}"
+            ) from commit_error
+        raise
+
+    # The replacement pair is complete. Backup deletion is cleanup, not part
+    # of the pair commit: if deletion fails, keep the valid new pair and leave
+    # the uniquely named backup recoverable instead of attempting a late
+    # rollback after one backup may already have been removed.
+    for backup_path in (backup_rgb, backup_ir):
+        try:
+            _unlink_if_present(backup_path)
+        except OSError as cleanup_error:
+            logger.warning(f"Could not remove TIFF transaction backup {backup_path}: {cleanup_error}")
+
+
 def write_tiff_16bit(result: ScanResult, path: str) -> str:
     """Write ScanResult to 16-bit TIFF. IR written as sidecar `<basename>_IR.tif`.
 
-    Transactional as a unit: RGB and (if present) IR are both written to temp
-    files first, and the real `path` / `ir_path` are only touched (via
-    os.replace) once every payload is fully on disk. If either temp write
-    fails, neither final path is touched. If the IR temp write succeeds but
-    its commit (os.replace) fails after the RGB commit already landed, the
-    RGB commit is rolled back too — this never leaves an orphan RGB file with
-    no IR when IR was requested. When this write has no IR, a stale
-    `<basename>_IR.tif` sidecar left over from a previous IR-enabled write of
-    the same target is removed so it can't be silently misattributed to the
-    new IR-less RGB frame (TiffLoader auto-discovers `_IR.tif` by filename
-    alone, with no cross-check against the RGB it's paired with).
+    RGB and (if present) IR are encoded completely before either destination
+    changes. A synchronous commit error restores the entire prior RGB/IR pair
+    and removes new temporary payloads. This is exception-safe, not a claim of
+    power-loss atomicity: two filenames require sequential filesystem renames,
+    so a process crash or power loss between them can expose a mixed pair.
+    When this write has no IR, a stale `<basename>_IR.tif` sidecar from the
+    prior pair is removed as part of the same exception-safe replacement.
 
     Returns final RGB path.
     """
@@ -87,50 +176,9 @@ def write_tiff_16bit(result: ScanResult, path: str) -> str:
             os.unlink(tmp_rgb)
             raise
 
-    # Phase 2: commit. Both temp files are known-good at this point; only a
-    # filesystem-level rename can fail from here.
-    try:
-        os.replace(tmp_rgb, path)
-    except Exception:
-        if os.path.exists(tmp_rgb):
-            os.unlink(tmp_rgb)
-        if tmp_ir and os.path.exists(tmp_ir):
-            os.unlink(tmp_ir)
-        raise
-
-    if tmp_ir is not None:
-        try:
-            
-            os.replace(tmp_ir, ir_path)
-        except Exception:
-            # RGB already committed but its IR pair didn't make it — undo
-            # the RGB commit rather than leave an orphan (IR was requested).
-            if os.path.exists(path):
-                os.unlink(path)
-            if os.path.exists(tmp_ir):
-                os.unlink(tmp_ir)
-            raise
-    elif os.path.exists(ir_path):
-        # No IR this write; drop a stale sidecar from a previous IR-enabled
-        # write of this same target so it isn't silently misattributed to
-        # the new IR-less RGB frame.
-        os.unlink(ir_path)
-
-    # Mask marking which IR pixels the scanner actually sampled. The loader
-    # fails closed on a malformed one, so write {0,255} the reader accepts.
-    if result.ir_valid_mask is not None:
-        base = os.path.splitext(path)[0]
-        valid_path = f"{base}_IR_VALID.tif"
-        valid_data = np.asarray(result.ir_valid_mask).astype(np.uint8) * 255
-        fd_v, tmp_v = tempfile.mkstemp(suffix=".tif", dir=os.path.dirname(valid_path) or ".")
-        os.close(fd_v)
-        try:
-            tifffile.imwrite(tmp_v, valid_data, photometric="minisblack", compression="zlib", predictor=True)
-            os.replace(tmp_v, valid_path)
-        except Exception:
-            if os.path.exists(tmp_v):
-                os.unlink(tmp_v)
-            raise
+    # Phase 2: swap the prepared payloads in, retaining any prior pair until
+    # every requested destination has been committed.
+    _commit_tiff_pair(tmp_rgb, tmp_ir, path, ir_path)
 
     return path
 
@@ -199,7 +247,8 @@ def _encode_dng(full_array: np.ndarray, extratags: list) -> bytes:
         tifffile.imwrite(buf, full_array, photometric=tifffile.PHOTOMETRIC.RGB, compression=None, metadata=None, extratags=extratags)
         data = bytearray(buf.getvalue())
         with tifffile.TiffFile(io.BytesIO(bytes(data))) as tf:
-            offset = tf.pages[0].tags["PhotometricInterpretation"].valueoffset
+            page = cast(tifffile.TiffPage, tf.pages[0])
+            offset = page.tags["PhotometricInterpretation"].valueoffset
             byteorder = tf.byteorder
         struct.pack_into(byteorder + "H", data, offset, 34892)  # RGB(2) → LinearRaw(34892)
         return bytes(data)
