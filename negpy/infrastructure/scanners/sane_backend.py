@@ -467,6 +467,21 @@ def _detect_multi_sample(opt) -> bool:
     return "samples_per_scan" in opt
 
 
+def _detect_adapter_frame_capacity(opt) -> int | None:
+    """Return the adapter's advertised transport bound, not an exposure count."""
+    if "frame" not in opt:
+        return None
+    constraint = opt["frame"].constraint
+    if isinstance(constraint, tuple) and len(constraint) >= 2:
+        capacity = int(constraint[1])
+        return capacity if capacity > 0 else None
+    if isinstance(constraint, list) and constraint:
+        capacity = max(int(value) for value in constraint)
+        return capacity if capacity > 0 else None
+    return None
+
+
+
 def _caps_from_options(opt, device_id: str = "") -> ScannerCapabilities:
     """Build ScannerCapabilities from a SANE option map. Pure — no `sane` import."""
     sources = _detect_explicit_sources(opt)
@@ -824,6 +839,11 @@ class SaneBackend:
     ) -> ScanResult:
         """Execute a one-shot scan via SANE (open, scan, close). Blocks until complete or cancelled."""
 
+        if params.registered_geometry is not None and params.area is not None:
+            raise RuntimeError(
+                "A generic scan area cannot be combined with registered geometry"
+            )
+
         try:
             self._ensure_initialized()
         except Exception as exc:
@@ -868,13 +888,33 @@ class SaneBackend:
             dev.depth = params.depth
             dev.resolution = params.dpi
 
-            # Validate the complete requested option set before applying any of
-            # it, so a missing option never leaves the feeder half-positioned.
+            # Registered geometry is an inseparable transport position/window
+            # pair. Keep legacy params.frame support for callers that only need
+            # frame selection, and reject contradictory duplicate positions.
+            geometry = params.registered_geometry
+            requested_frame = params.frame
+            if geometry is not None and geometry.frame is not None:
+                if requested_frame is not None and requested_frame != geometry.frame:
+                    raise RuntimeError(
+                        f"Conflicting frame positions requested: frame={requested_frame}, "
+                        f"registered geometry frame={geometry.frame}"
+                    )
+                requested_frame = geometry.frame
+
+            # Validate the complete requested option set before applying any
+            # of it, so a missing option never leaves the feeder half-positioned.
             option_map = dev.opt if hasattr(dev, "opt") else {}
             ir_opt = _find_coolscan3_ir_option(option_map, device_id) if ir_strategy == "option" else None
             required_options: list[tuple[str, str]] = []
-            if params.frame is not None:
-                required_options.append(("frame", f"Frame {params.frame} requested but the device has no frame-selection option"))
+            if requested_frame is not None:
+                required_options.append(("frame", f"Frame {requested_frame} requested but the device has no frame-selection option"))
+            if geometry is not None:
+                required_options.extend(
+                    (
+                        ("subframe", "Registered geometry requested but the device has no 'subframe' option"),
+                        ("br_y", "Registered geometry requested but the device has no 'br_y' option"),
+                    )
+                )
             if params.auto_exposure:
                 required_options.append(("ae", "Auto-exposure requested but the device has no 'ae' option"))
             if ir_strategy == "option":
@@ -887,11 +927,22 @@ class SaneBackend:
             # Position the film before autofocus, auto-exposure, or scan start.
             # The scan blacks out at the frame boundary — below 0 is unreachable.
             offset_mm = clamp_frame_offset_mm(params.frame_offset_mm, _feed_pitch_mm(option_map))
-            if params.frame is not None:
+            if requested_frame is not None:
+
                 try:
-                    dev.frame = params.frame
+                    dev.frame = requested_frame
                 except Exception as e:
-                    raise RuntimeError(f"Could not set frame={params.frame}: {e}") from e
+                    raise RuntimeError(f"Could not set frame={requested_frame}: {e}") from e
+
+            if geometry is not None:
+                for option_name, value in (
+                    ("subframe", geometry.subframe_mm),
+                    ("br_y", geometry.br_y_device_px),
+                ):
+                    try:
+                        setattr(dev, option_name, value)
+                    except Exception as e:
+                        raise RuntimeError(f"Could not set registered geometry {option_name}={value}: {e}") from e
 
             _apply_frame_offset(dev, offset_mm)
 
@@ -910,10 +961,21 @@ class SaneBackend:
                 except Exception as e:
                     raise RuntimeError(f"Could not enable auto-exposure: {e}") from e
 
+            # Hardware multi-sampling: explicitly requested for archival
+            # quality — refuse to silently degrade to a single pass.
+            if params.samples_per_scan > 1:
+                if not (hasattr(dev, "opt") and "samples_per_scan" in dev.opt):
+                    raise RuntimeError(f"{params.samples_per_scan}x multi-sampling requested but the device has no samples-per-scan option")
+                try:
+                    dev.samples_per_scan = params.samples_per_scan
+                except Exception as e:
+                    raise RuntimeError(f"Could not set samples-per-scan={params.samples_per_scan}: {e}") from e
+
             # Inline IR via a boolean option (coolscan3 `infrared`): the 4th
             # sample rides in the same frame, no mode/source change. IR was
             # explicitly requested — fail loud rather than silently drop it.
             if ir_strategy == "option":
+
                 if ir_opt is None:
                     raise RuntimeError("IR option strategy selected but the device's IR option is unavailable")
                 try:

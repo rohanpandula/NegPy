@@ -1,11 +1,35 @@
 from dataclasses import dataclass
 from enum import StrEnum
+from math import isfinite
 
 
 class ScanMode(StrEnum):
     NEGATIVE = "Negative"
     POSITIVE = "Positive"
     TRANSPARENCY = "Transparency"
+
+
+@dataclass(frozen=True)
+class RegisteredScanGeometry:
+    """Coupled transport position and scan window for one registered frame.
+
+    ``br_y_device_px`` is the inclusive bottom coordinate in the scanner's
+    native device-pixel grid, not a height and not an output-resolution row.
+    ``frame`` may be omitted for a single-frame carrier or the current adapter
+    position.
+    """
+
+    subframe_mm: float
+    br_y_device_px: int
+    frame: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.frame is not None and (type(self.frame) is not int or self.frame < 1):
+            raise ValueError("registered frame must be a positive integer or None")
+        if type(self.subframe_mm) not in (int, float) or not isfinite(self.subframe_mm) or self.subframe_mm < 0:
+            raise ValueError("registered subframe must be a finite non-negative distance")
+        if type(self.br_y_device_px) is not int or self.br_y_device_px < 0:
+            raise ValueError("registered bottom coordinate must be a non-negative integer")
 
 
 @dataclass(frozen=True)
@@ -24,6 +48,10 @@ class ScanParams:
     # frame is requested and the device has no frame option, the scan fails
     # rather than reading whatever frame is under the sensor.
     frame: int | None = None
+    # Registration geometry is opt-in and keeps the fine transport shift and
+    # shortened scan window inseparable. ``frame`` above remains supported for
+    # callers that only need legacy frame selection.
+    registered_geometry: RegisteredScanGeometry | None = None
     # Hardware auto-exposure (SANE `ae`), distinct from NegPy's rendering
     # auto-exposure. An explicit request fails if the option is unavailable.
     auto_exposure: bool = False

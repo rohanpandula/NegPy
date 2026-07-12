@@ -1,7 +1,9 @@
 """Tests for ScanParams dataclass and ScanMode validation."""
 
+import math
+
 import pytest
-from negpy.infrastructure.scanners.params import ScanMode, ScanParams
+from negpy.infrastructure.scanners.params import RegisteredScanGeometry, ScanMode, ScanParams
 from negpy.infrastructure.scanners.base import ScannerCapabilities
 
 
@@ -23,10 +25,39 @@ class TestScanParams:
         assert params.depth == 16
         assert params.capture_ir is False
         assert params.window is None
+        assert params.area is None
+        assert params.auto_exposure is False
+        assert params.frame is None
+        assert params.registered_geometry is None
 
     def test_with_window(self) -> None:
         params = ScanParams(dpi=2400, depth=8, capture_ir=True, window=(0.0, 0.0, 1.0, 1.0))
         assert params.window == (0.0, 0.0, 1.0, 1.0)
+
+    def test_registered_geometry_keeps_position_and_window_typed_together(self) -> None:
+        geometry = RegisteredScanGeometry(frame=3, subframe_mm=6.35, br_y_device_px=5003)
+        current_position = RegisteredScanGeometry(subframe_mm=6.35, br_y_device_px=5003)
+        params = ScanParams(dpi=4000, depth=16, capture_ir=True, registered_geometry=geometry)
+
+        assert params.registered_geometry == geometry
+        assert geometry.frame == 3
+        assert geometry.subframe_mm == 6.35
+        assert geometry.br_y_device_px == 5003
+        assert current_position.frame is None
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"frame": 0, "subframe_mm": 1.0, "br_y_device_px": 100},
+            {"frame": 1, "subframe_mm": -0.01, "br_y_device_px": 100},
+            {"frame": 1, "subframe_mm": math.nan, "br_y_device_px": 100},
+            {"frame": 1, "subframe_mm": 1.0, "br_y_device_px": -1},
+            {"frame": 1, "subframe_mm": 1.0, "br_y_device_px": True},
+        ],
+    )
+    def test_registered_geometry_rejects_impossible_values(self, kwargs) -> None:
+        with pytest.raises(ValueError):
+            RegisteredScanGeometry(**kwargs)
 
     def test_frozen(self) -> None:
         params = ScanParams(dpi=1200, depth=16, capture_ir=False)

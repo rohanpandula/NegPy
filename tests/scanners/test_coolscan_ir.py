@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from negpy.infrastructure.scanners.params import ScanMode, ScanParams
+from negpy.infrastructure.scanners.params import RegisteredScanGeometry, ScanMode, ScanParams
 from negpy.infrastructure.scanners.sane_backend import (
     SaneBackend,
     _caps_from_options,
@@ -41,12 +41,14 @@ class FakeOption:
         return self.settable
 
 
+
 COOLSCAN3_OPT = {
     "infrared": FakeOption(),
     "depth": FakeOption(constraint=[8, 16]),
     "resolution": FakeOption(constraint=[4000, 2000, 1000]),
     "frame": FakeOption(constraint=(1, 40, 1)),
     "frame_count": FakeOption(constraint=(1, 40, 1)),
+
     "subframe": FakeOption(constraint=(0.0, 37.8333, 0.0)),
     "br_y": FakeOption(constraint=(0, 5958, 1)),
     "autofocus": FakeOption(),
@@ -246,6 +248,7 @@ class FakeSaneDev:
         if name in self.opt_map:
             return self.recorded.get(name)
         raise AttributeError(f"No readable SANE option: {name}")
+
 
     def start(self) -> None:
         self.events.append(("start",))
@@ -726,6 +729,120 @@ class TestFrameSelection:
         # The missing-option check must fire before any attempt to set dev.frame.
         assert "frame" not in dev.recorded
 
+
+class TestRegisteredGeometry:
+    """Registered positioning is applied as one unit before AF, AE, and scan."""
+
+    def test_sets_coupled_geometry_and_auto_exposure_before_start(self) -> None:
+        rng = np.random.default_rng(25)
+        dev = FakeSaneDev(rng.integers(0, 65535, size=(6, 5, 4), dtype=np.uint16))
+        backend = _make_backend(dev)
+        geometry = RegisteredScanGeometry(frame=3, subframe_mm=6.35, br_y_device_px=5003)
+
+        backend.scan(
+            "coolscan3:usb:libusb:001:007",
+            ScanParams(
+                dpi=4000,
+                depth=16,
+                capture_ir=True,
+                registered_geometry=geometry,
+                auto_exposure=True,
+            ),
+            None,
+            threading.Event(),
+        )
+
+        assert dev.recorded["frame"] == 3
+        assert dev.recorded["subframe"] == 6.35
+        assert dev.recorded["br_y"] == 5003
+        assert dev.recorded["ae"] is True
+        ordered = [event[1] if event[0] == "set" else "start" for event in dev.events]
+        for positioning_option in ("frame", "subframe", "br_y"):
+            assert ordered.index(positioning_option) < ordered.index("autofocus")
+            assert ordered.index(positioning_option) < ordered.index("ae")
+            assert ordered.index(positioning_option) < ordered.index("start")
+
+    def test_generic_area_cannot_overwrite_a_registered_scan_window(self) -> None:
+        rng = np.random.default_rng(28)
+        dev = FakeSaneDev(
+            rng.integers(0, 65535, size=(6, 5, 4), dtype=np.uint16)
+        )
+        backend = _make_backend(dev)
+        geometry = RegisteredScanGeometry(
+            frame=3, subframe_mm=6.35, br_y_device_px=5003
+        )
+
+        with pytest.raises(RuntimeError, match="area.*registered geometry"):
+            backend.scan(
+                "coolscan3:usb:libusb:001:007",
+                ScanParams(
+                    dpi=4000,
+                    depth=16,
+                    capture_ir=True,
+                    area=(0, 0, 3945, 5958),
+                    registered_geometry=geometry,
+                ),
+                None,
+                threading.Event(),
+            )
+
+        assert not any(
+            event[0] == "set"
+            and event[1] in {"frame", "subframe", "br_y", "autofocus", "ae"}
+            for event in dev.events
+        )
+        assert ("start",) not in dev.events
+
+    @pytest.mark.parametrize("missing_option", ("br_y", "ae"))
+    def test_missing_requested_option_fails_before_any_positioning(self, missing_option: str) -> None:
+        rng = np.random.default_rng(26)
+        opt = {key: value for key, value in COOLSCAN3_OPT.items() if key != missing_option}
+        dev = FakeSaneDev(rng.integers(0, 65535, size=(6, 5, 4), dtype=np.uint16), opt_map=opt)
+        backend = _make_backend(dev)
+        geometry = RegisteredScanGeometry(frame=3, subframe_mm=6.35, br_y_device_px=5003)
+
+        with pytest.raises(RuntimeError, match=rf"{missing_option}.*option"):
+            backend.scan(
+                "coolscan3:usb:libusb:001:007",
+                ScanParams(
+                    dpi=4000,
+                    depth=16,
+                    capture_ir=True,
+                    registered_geometry=geometry,
+                    auto_exposure=True,
+                ),
+                None,
+                threading.Event(),
+            )
+
+        assert not any(event[0] == "set" and event[1] in {"frame", "subframe", "br_y", "autofocus", "ae"} for event in dev.events)
+        assert ("start",) not in dev.events
+
+    @pytest.mark.parametrize("inactive_option", ("subframe", "ae"))
+    def test_inactive_requested_option_fails_before_any_positioning(self, inactive_option: str) -> None:
+        rng = np.random.default_rng(27)
+        opt = dict(COOLSCAN3_OPT)
+        opt[inactive_option] = FakeOption(active=False)
+        dev = FakeSaneDev(rng.integers(0, 65535, size=(6, 5, 4), dtype=np.uint16), opt_map=opt)
+        backend = _make_backend(dev)
+        geometry = RegisteredScanGeometry(frame=3, subframe_mm=6.35, br_y_device_px=5003)
+
+        with pytest.raises(RuntimeError, match=rf"{inactive_option}.*inactive"):
+            backend.scan(
+                "coolscan3:usb:libusb:001:007",
+                ScanParams(
+                    dpi=4000,
+                    depth=16,
+                    capture_ir=True,
+                    registered_geometry=geometry,
+                    auto_exposure=True,
+                ),
+                None,
+                threading.Event(),
+            )
+
+        assert not any(event[0] == "set" and event[1] in {"frame", "subframe", "br_y", "autofocus", "ae"} for event in dev.events)
+        assert ("start",) not in dev.events
 
 class TestSnapProgressForwarding:
     """Cancellation responsiveness: progress forwarding during arr_snap()'s

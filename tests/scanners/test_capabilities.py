@@ -208,6 +208,7 @@ class TestCapsFromOptions:
 
         assert caps.can_eject is False
 
+
     # ── plain flatbed: no source, no film signals → still skipped ───────
 
     def test_flatbed_without_source_skipped(self) -> None:

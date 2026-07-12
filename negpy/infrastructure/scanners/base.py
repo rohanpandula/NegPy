@@ -37,6 +37,10 @@ class ScannerCapabilities:
     # Nikon Coolscan). UI-gating only — SaneBackend.scan() fails loud on its
     # own if samples_per_scan > 1 is requested against a device without it.
     multi_sample: bool = False
+    # Maximum transport position advertised by a roll adapter. This is a
+    # mechanical capacity bound (e.g. SA-30 reports 40), never an inferred
+    # count of exposures on the inserted strip or roll.
+    adapter_frame_capacity: int | None = None
 
 
 @dataclass(frozen=True)
