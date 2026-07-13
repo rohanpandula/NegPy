@@ -18,6 +18,7 @@ from negpy.features.rgbscan.models import RgbScanConfig
 from negpy.features.stitch.models import StitchConfig
 from negpy.features.metadata.models import MetadataConfig
 from negpy.domain.migrations import migrate_export_fmt, migrate_flat_config
+from negpy.features.nikonlook.models import NikonLookConfig
 from negpy.kernel.system.logging import get_logger
 import negpy.kernel.system.paths as paths
 
@@ -374,6 +375,9 @@ class WorkspaceConfig:
     finish: FinishConfig = field(default_factory=FinishConfig)
     metadata: MetadataConfig = field(default_factory=MetadataConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
+    # "Nikon Scan look (beta)" -- see negpy/features/nikonlook/. Additive,
+    # off by default; existing modes above are unaffected by its presence.
+    nikonlook: NikonLookConfig = field(default_factory=NikonLookConfig)
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -393,6 +397,7 @@ class WorkspaceConfig:
         res.update(asdict(self.finish))
         res.update(asdict(self.metadata))
         res.update(asdict(self.export))
+        res.update(asdict(self.nikonlook))
         return res
 
     @classmethod
@@ -418,6 +423,7 @@ class WorkspaceConfig:
             FinishConfig,
             MetadataConfig,
             ExportConfig,
+            NikonLookConfig,
         ]
         valid_keys = set()
         for cc in config_classes:
@@ -470,6 +476,7 @@ class WorkspaceConfig:
             finish=FinishConfig(**filter_keys(FinishConfig, data)),
             metadata=MetadataConfig(**filter_keys(MetadataConfig, data)),
             export=ExportConfig(**filter_keys(ExportConfig, data)),
+            nikonlook=NikonLookConfig(**filter_keys(NikonLookConfig, data)),
         )
 
 

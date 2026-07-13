@@ -157,6 +157,14 @@ class ImageProcessor:
         master is numerically exact and never subject to the looser GPU parity."""
         return settings.exposure.render_intent == RenderIntent.FLAT
 
+    @staticmethod
+    def _is_nikonlook(settings: WorkspaceConfig) -> bool:
+        """ "Nikon Scan look (beta)" (negpy/features/nikonlook/) is CPU-only and
+        runs an entirely separate render path (DarkroomEngine.process_nikonlook),
+        never the GPU engine or the normal .process() stage pipeline -- see that
+        method's docstring."""
+        return settings.nikonlook.nikonlook_enabled
+
     def _ir_ratio_gain(self, ir_buffer: np.ndarray, img: np.ndarray, source_key: str) -> tuple:
         """Cached (ratio_det, gain_det, degenerate, gammas) at detection scale."""
         # Key on the source shape — downsample_ir is deterministic in it, so this
@@ -365,6 +373,10 @@ class ImageProcessor:
             context.metrics["ir_degenerate"] = ir_degenerate
             if ir_corrected_mask is not None:
                 context.metrics["ir_corrected_mask"] = ir_corrected_mask
+
+        if self._is_nikonlook(settings):
+            processed = self.engine_cpu.process_nikonlook(img, settings, context)
+            return processed, context.metrics
 
         if self._is_flat(settings) or crop_preview_full:
             # The crop tool's "show full uncropped frame" preview only needs a single
@@ -610,7 +622,7 @@ class ImageProcessor:
             h_raw, w_raw = f32_buffer.shape[:2]
             export_scale = max(h_raw, w_raw) / float(APP_CONFIG.preview_render_size)
 
-            if self._is_flat(params):
+            if self._is_flat(params) or self._is_nikonlook(params):
                 prefer_gpu = False
 
             if prefer_gpu and self.engine_gpu:
@@ -622,7 +634,7 @@ class ImageProcessor:
                     readback_metrics=False,
                 )
             else:
-                buffer, _ = self.run_pipeline(
+                buffer, pipeline_metrics = self.run_pipeline(
                     f32_buffer,
                     params,
                     source_hash,
@@ -636,11 +648,58 @@ class ImageProcessor:
                 # Release full-res arrays pinned in the CPU stage cache.
                 self.engine_cpu.cache.clear()
 
+                if self._is_nikonlook(params):
+                    # nikonlook is always routed here (prefer_gpu forced False above);
+                    # its own color management (bundle ICC, no CMS transform) replaces
+                    # the shared _encode_export call below entirely.
+                    return self._encode_export_nikonlook(buffer, export_settings, pipeline_metrics.get("nikonlook_icc_bytes"))
+
             return self._encode_export(buffer, export_settings, color_space, working_color_space)
 
         except Exception as e:
             logger.error(f"Export pipeline failed: {e}")
             return None, str(e)
+
+    def _encode_export_nikonlook(
+        self,
+        buffer: np.ndarray,
+        export_settings,
+        icc_bytes: Optional[bytes],
+    ) -> Tuple[bytes, str]:
+        """Nikon Scan look (beta) export encoder: tags `icc_bytes` (the
+        bundle's own ICC, threaded through via
+        DarkroomEngine.process_nikonlook's `context.metrics["nikonlook_icc_bytes"]`)
+        directly onto the pixels, with NO color-management transform.
+        `buffer` is ALREADY final device values in that ICC's space (see
+        process_nikonlook's contract) -- running it through the normal
+        `_apply_color_management_u16_rgb` (which assumes `working_color_space`
+        input and would run ANOTHER LittleCMS transform) would double-process
+        and corrupt the colors. Mirrors
+        digital-ice-2026/negfit/nikonlook_preview.py's own `write_tiff()`: same
+        "clip to [0,1], scale to 16-bit, embed the exact ICC bytes verbatim"
+        contract.
+
+        TIFF only in this beta (see NEGPY-INTEGRATION-PLAN.md's honest scope
+        note) -- other export formats raise rather than silently mis-encoding.
+        In particular DNG is out of scope here: `write_dng_linear`
+        (negpy/services/scanning/writer.py) embeds no ICC tag at all today.
+        """
+        if export_settings.export_fmt != ExportFormat.TIFF:
+            raise NotImplementedError(
+                f"Nikon Scan look (beta) export currently only supports TIFF (got "
+                f"{export_settings.export_fmt!r}). Switch the export format to TIFF, "
+                f"or disable Nikon Scan look for this export."
+            )
+        img_u16 = float_to_uint16(buffer)
+        output_buf = io.BytesIO()
+        tifffile.imwrite(
+            output_buf,
+            img_u16,
+            photometric="rgb",
+            iccprofile=icc_bytes,
+            compression="lzw",
+        )
+        return output_buf.getvalue(), "tiff"
 
     def _encode_export(
         self,
@@ -799,7 +858,18 @@ class ImageProcessor:
         paper layout is bounded to the same size. Rendering the full-res source and
         discarding all but a tile cost ~3.5GB peak RSS (CPU) / ~8GB commit (GPU) per
         24MP frame, so a large roll exhausted memory and tiles were silently dropped.
+
+        Nikon Scan look (beta) is NOT wired here: its output is already final
+        device-encoded pixels in the bundle's own ICC space, not NegPy's scene-linear
+        working space, so running it through `apply_display_transform` below (which
+        assumes `working_color_space` input) would silently produce wrong-looking
+        colors rather than a clean failure. Until contact-sheet/on-canvas support is
+        added, a nikonlook-enabled file's tile is skipped (returns None, the same
+        contract as any other per-tile failure) -- export is the supported path (see
+        `process_export` / digital-ice-2026/negfit/NEGPY-INTEGRATION-PLAN.md).
         """
+        if self._is_nikonlook(params):
+            return None
         try:
             from negpy.infrastructure.display.color_mgmt import apply_display_transform
 
