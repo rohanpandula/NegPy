@@ -10,6 +10,36 @@ class ScanMode(StrEnum):
 
 
 @dataclass(frozen=True)
+class ScannerCaptureState:
+    """Replayable hardware state shared by adjacent source windows.
+
+    The LS-5000 meters RGB exposure times and chooses a focus position before
+    acquisition.  A full negative can span two feeder windows, so its second
+    source must reuse those exact values instead of independently focusing or
+    metering a different part of the photograph.
+    """
+
+    focus_position: int
+    exposure_multiplier: float
+    red_exposure_us: float
+    green_exposure_us: float
+    blue_exposure_us: float
+
+    def __post_init__(self) -> None:
+        if type(self.focus_position) is not int or self.focus_position < 0:
+            raise ValueError("focus_position must be a non-negative integer")
+        for field in (
+            "exposure_multiplier",
+            "red_exposure_us",
+            "green_exposure_us",
+            "blue_exposure_us",
+        ):
+            value = getattr(self, field)
+            if type(value) not in (int, float) or not isfinite(value) or value <= 0:
+                raise ValueError(f"{field} must be finite and positive")
+
+
+@dataclass(frozen=True)
 class RegisteredScanGeometry:
     """Coupled transport position and scan window for one registered frame.
 
@@ -59,6 +89,19 @@ class ScanParams:
     # if a value > 1 cannot be honored, the scan fails rather than silently
     # degrading to a single pass.
     samples_per_scan: int = 1
+    # Exact focus/exposure state captured from an earlier source window.  It
+    # is mutually exclusive with autofocus/auto-exposure: replay means replay,
+    # not a hint the backend may silently overwrite.
+    capture_state: ScannerCaptureState | None = None
+    # Full-negative capture keeps every RGB sample and carries an explicit IR
+    # validity mask instead of cropping both planes to their common overlap.
+    preserve_full_canvas: bool = False
+
+    def __post_init__(self) -> None:
+        if self.capture_state is not None and (self.autofocus or self.auto_exposure):
+            raise ValueError("locked capture state cannot be combined with autofocus or auto-exposure")
+        if self.preserve_full_canvas and not (self.capture_ir and self.samples_per_scan > 1):
+            raise ValueError("full-canvas IR preservation requires split RGB+IR capture")
 
 
 MIN_FRAME_EXTENT_MM = 1.0  # below this a capped scan is a useless sliver
@@ -90,3 +133,4 @@ def scan_window_to_area(
     x1, y1, x2, y2 = rect
     w, h = max_area_mm
     return (x1 * w, y1 * h, x2 * w, y2 * h)
+

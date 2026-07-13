@@ -12,6 +12,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+import cv2
 import numpy as np
 import pytest
 
@@ -21,7 +22,9 @@ from negpy.infrastructure.scanners.sane_backend import (
     _align_split_ir,
     _caps_from_options,
     _detect_ir,
+    _estimate_split_shift,
     _find_ir_option,
+    _persist_split_diagnostics,
     _reinterpret_channels,
     _strip_net_prefix,
 )
@@ -211,6 +214,25 @@ class TestReinterpretChannels:
         assert _reinterpret_channels(arr, 5, 6) is arr
 
 
+def test_split_diagnostics_preserve_both_rgb_views_and_ir_after_refusal(tmp_path) -> None:
+    reference = np.arange(6 * 5 * 3, dtype=np.uint16).reshape(6, 5, 3)
+    proxy = reference + 1
+    ir = np.arange(6 * 5, dtype=np.uint16).reshape(6, 5)
+
+    _persist_split_diagnostics(
+        str(tmp_path),
+        reference_rgb=reference,
+        proxy_rgb=proxy,
+        ir=ir,
+        error=RuntimeError("alignment refused"),
+    )
+
+    assert np.array_equal(np.load(tmp_path / "multisample-rgb.npy", allow_pickle=False), reference)
+    assert np.array_equal(np.load(tmp_path / "single-pass-rgb-proxy.npy", allow_pickle=False), proxy)
+    assert np.array_equal(np.load(tmp_path / "single-pass-ir.npy", allow_pickle=False), ir)
+    assert "alignment refused" in (tmp_path / "manifest.json").read_text(encoding="utf-8")
+
+
 class FakeSaneDev:
     """Mimics python-sane SaneDev for a coolscan3-like device.
 
@@ -371,6 +393,40 @@ def _make_backend(dev: FakeSaneDev) -> SaneBackend:
     backend._sane_initialized = True
     backend._devices_cache = None
     return backend
+
+
+def test_scan_initializes_sane_before_opening_a_fresh_backend() -> None:
+    true = np.zeros((6, 5, 3), dtype=np.uint16)
+    dev = FakeSaneDev(true)
+
+    class InitRequiredSaneModule:
+        def __init__(self) -> None:
+            self.initialized = False
+            self.init_calls = 0
+
+        def init(self) -> None:
+            self.initialized = True
+            self.init_calls += 1
+
+        def open(self, _device_id: str) -> FakeSaneDev:
+            assert self.initialized
+            return dev
+
+    module = InitRequiredSaneModule()
+    backend = SaneBackend.__new__(SaneBackend)
+    backend._sane = module
+    backend._sane_initialized = False
+    backend._devices_cache = None
+
+    result = backend.scan(
+        "coolscan3:usb:test",
+        ScanParams(dpi=1000, depth=16, capture_ir=False),
+        None,
+        threading.Event(),
+    )
+
+    assert module.init_calls == 1
+    assert result.rgb.shape == (6, 5, 3)
 
 
 class TestScanWithOptionStrategy:
@@ -812,7 +868,7 @@ class TestArchivalControls:
     def test_coolscan_split_capture_aligns_ir_to_multisampled_rgb(self) -> None:
         rng = np.random.default_rng(152)
         height, width = 120, 160
-        dx, dy = 4, 3
+        dx, dy = 2, 8
         base = rng.integers(2000, 62000, size=(height, width), dtype=np.uint16)
         multi_rgb = np.repeat(base[:, :, None], 3, axis=2)
         target_ir = rng.integers(1000, 64000, size=(height, width), dtype=np.uint16)
@@ -1195,7 +1251,7 @@ class TestSplitCaptureHardening:
     def test_negative_shift_alignment_and_crop(self) -> None:
         rng = np.random.default_rng(204)
         height, width = 120, 160
-        dx, dy = -4, -3
+        dx, dy = -2, -8
         base = rng.integers(2000, 62000, size=(height, width), dtype=np.uint16)
         multi_rgb = np.repeat(base[:, :, None], 3, axis=2)
         target_ir = rng.integers(1000, 64000, size=(height, width), dtype=np.uint16)
@@ -1272,6 +1328,314 @@ class TestAlignSplitIr:
         ir = np.random.default_rng(54).integers(0, 65535, size=(h, w), dtype=np.uint16)
         with pytest.raises(RuntimeError, match="Could not safely align"):
             _align_split_ir(reference, proxy, ir)
+
+    def test_rejects_corroborated_horizontal_displacement_over_two_pixels(self) -> None:
+        reference, _proxy, ir = self._trio(h=120, w=160, seed=8154)
+        proxy = _shifted(reference, 3, 0)
+
+        with pytest.raises(RuntimeError, match="horizontal.*2.0 px"):
+            _align_split_ir(reference, proxy, ir)
+
+    def test_rejects_corroborated_vertical_displacement_over_eight_pixels(self) -> None:
+        reference, _proxy, ir = self._trio(h=120, w=160, seed=8155)
+        proxy = _shifted(reference, 0, 9)
+
+        with pytest.raises(RuntimeError, match="vertical.*8.0 px"):
+            _align_split_ir(reference, proxy, ir)
+
+    def test_full_frame_phase_inputs_are_preserved_for_ecc_at_optimal_dft_size(self, monkeypatch) -> None:
+        rng = np.random.default_rng(8153)
+        height, width = 512, 768
+        assert cv2.getOptimalDFTSize(height) == height
+        assert cv2.getOptimalDFTSize(width) == width
+        expected_dx, expected_dy = 1.25, -0.75
+        reference = rng.integers(1000, 64000, size=(height, width, 3), dtype=np.uint16)
+        proxy = cv2.warpAffine(
+            reference,
+            np.asarray([[1.0, 0.0, expected_dx], [0.0, 1.0, expected_dy]], dtype=np.float32),
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+        real_phase_correlate = cv2.phaseCorrelate
+        real_find_transform_ecc = cv2.findTransformECC
+        phase_sources: list[tuple[np.ndarray, np.ndarray]] = []
+        phase_shifts: list[tuple[float, float]] = []
+
+        def observe_real_phase(reference_plane, moving_plane, window):
+            reference_before = reference_plane.copy()
+            moving_before = moving_plane.copy()
+            shift, response = real_phase_correlate(reference_plane, moving_plane, window)
+            if reference_plane.shape == (height, width):
+                phase_sources.append((reference_before, moving_before))
+                phase_shifts.append((float(shift[0]), float(shift[1])))
+            return shift, response
+
+        def assert_preserved_before_real_ecc(template, moving, warp, *args):
+            assert len(phase_sources) == 3
+            phase_dx = sum(shift[0] for shift in phase_shifts) / 3.0
+            phase_dy = sum(shift[1] for shift in phase_shifts) / 3.0
+            seed_dx, seed_dy = int(round(phase_dx)), int(round(phase_dy))
+            ref_top, ref_bottom = max(0, -seed_dy), height + min(0, -seed_dy)
+            ref_left, ref_right = max(0, -seed_dx), width + min(0, -seed_dx)
+            expected_reference = (phase_sources[0][0] + phase_sources[1][0] + phase_sources[2][0]) / 3.0
+            expected_moving = (phase_sources[0][1] + phase_sources[1][1] + phase_sources[2][1]) / 3.0
+            np.testing.assert_array_equal(
+                template,
+                expected_reference[ref_top:ref_bottom, ref_left:ref_right],
+            )
+            np.testing.assert_array_equal(
+                moving,
+                expected_moving[
+                    ref_top + seed_dy : ref_bottom + seed_dy,
+                    ref_left + seed_dx : ref_right + seed_dx,
+                ],
+            )
+            return real_find_transform_ecc(template, moving, warp, *args)
+
+        monkeypatch.setattr(cv2, "phaseCorrelate", observe_real_phase)
+        monkeypatch.setattr(cv2, "findTransformECC", assert_preserved_before_real_ecc)
+
+        dx, dy, metrics = _estimate_split_shift(reference, proxy)
+
+        assert metrics["mode"] == "phase-ecc"
+        assert dx == pytest.approx(expected_dx, abs=0.05)
+        assert dy == pytest.approx(expected_dy, abs=0.05)
+
+    def test_corroborating_ecc_drift_beyond_subpixel_yields_the_phase_estimate(self, monkeypatch) -> None:
+        # ECC that agrees within the divergence gate but disagrees by more
+        # than a sub-pixel refinement must not relocate the estimate: its
+        # optimum tracks photometric agreement and slid whole pixels on the
+        # 2026-07-12 live captures while three-channel phase held the truth.
+        rng = np.random.default_rng(8157)
+        height, width = 512, 768
+        reference = rng.integers(1000, 64000, size=(height, width, 3), dtype=np.uint16)
+        proxy = reference.copy()
+        drift_px = 1.5
+
+        def drifted_ecc(template, moving, warp, *args):
+            drifted = warp.copy()
+            drifted[0, 2] += np.float32(drift_px)
+            return 0.93, drifted
+
+        monkeypatch.setattr(cv2, "findTransformECC", drifted_ecc)
+
+        dx, dy, metrics = _estimate_split_shift(reference, proxy)
+
+        assert metrics["mode"] == "phase-ecc"
+        assert metrics["ecc_coefficient"] == pytest.approx(0.93)
+        assert dx == pytest.approx(0.0, abs=0.1)
+        assert dy == pytest.approx(0.0, abs=0.1)
+
+    def test_subpixel_corroborating_ecc_still_refines_the_phase_estimate(self, monkeypatch) -> None:
+        rng = np.random.default_rng(8158)
+        height, width = 512, 768
+        reference = rng.integers(1000, 64000, size=(height, width, 3), dtype=np.uint16)
+        proxy = reference.copy()
+        refinement_px = 0.3
+
+        def refined_ecc(template, moving, warp, *args):
+            refined = warp.copy()
+            refined[0, 2] += np.float32(refinement_px)
+            return 0.97, refined
+
+        monkeypatch.setattr(cv2, "findTransformECC", refined_ecc)
+
+        dx, dy, metrics = _estimate_split_shift(reference, proxy)
+
+        assert metrics["mode"] == "phase-ecc"
+        assert dx == pytest.approx(refinement_px, abs=0.1)
+        assert dy == pytest.approx(0.0, abs=0.1)
+
+    def test_real_periodic_short_wide_capture_uses_cross_scale_global_consensus(self) -> None:
+        rng = np.random.default_rng(8156)
+        height, width, period = 256, 1024, 64
+        y, x = np.mgrid[:height, :width]
+        periodic = 26000.0 + 9000.0 * np.sin(2.0 * np.pi * x / period)
+        periodic += 4000.0 * np.sin(4.0 * np.pi * x / period)
+        sprockets = np.zeros((height, width), dtype=np.float32)
+        for left in range(0, width, period):
+            sprockets[10:55, left + 8 : left + 40] += 16000.0
+            sprockets[height - 55 : height - 10, left + 8 : left + 40] += 16000.0
+        unique_texture = cv2.GaussianBlur(
+            rng.normal(0.0, 2500.0, size=(height, width)).astype(np.float32),
+            (0, 0),
+            1.0,
+        )
+        plane = np.clip(periodic + sprockets + unique_texture, 1000.0, 64000.0)
+        reference = np.stack(
+            (
+                plane,
+                np.clip(plane * 0.97 + 700.0, 0.0, 65535.0),
+                np.clip(plane * 1.02 - 500.0, 0.0, 65535.0),
+            ),
+            axis=2,
+        ).astype(np.uint16)
+        expected_dx, expected_dy = 0.20, -0.10
+        proxy = cv2.warpAffine(
+            reference,
+            np.asarray([[1.0, 0.0, expected_dx], [0.0, 1.0, expected_dy]], dtype=np.float32),
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT,
+        )
+        proxy = np.clip(proxy.astype(np.float32) * 0.92 + 1200.0, 0.0, 65535.0).astype(np.uint16)
+
+        dx, dy, metrics = _estimate_split_shift(reference, proxy)
+
+        assert metrics["mode"] == "multiscale-global"
+        assert dx == pytest.approx(expected_dx, abs=0.10)
+        assert dy == pytest.approx(expected_dy, abs=0.10)
+        assert metrics["estimator_version"] == 2
+        assert metrics["multiscale_max_dimensions"] == (512, 1024)
+        assert len(metrics["multiscale_channel_shifts_px"]) == 2
+        assert len(metrics["multiscale_responses"]) == 2
+
+    def test_periodic_global_alias_requires_stable_tiled_consensus_at_two_scales(self, monkeypatch) -> None:
+        reference, _proxy, _ir = self._trio(h=256, w=1024, seed=8157)
+        proxy = np.clip(reference.astype(np.float32) * 0.92 + 1200.0, 0.0, 65535.0).astype(np.uint16)
+
+        def periodic_phase(image, _other, _window):
+            if image.shape == (128, 512):
+                return (-64.0, 0.0), 0.65
+            if image.shape == (256, 1024):
+                return (-128.0, 0.0), 0.70
+            if image.shape == (64, 128):
+                return (0.10, -0.05), 0.60
+            if image.shape == (128, 256):
+                return (0.20, -0.10), 0.62
+            raise AssertionError(f"unexpected phase-correlation shape {image.shape}")
+
+        monkeypatch.setattr(cv2, "phaseCorrelate", periodic_phase)
+        monkeypatch.setattr(
+            cv2,
+            "findTransformECC",
+            lambda *_args: pytest.fail("short-wide periodic aliases must not reach ECC"),
+        )
+
+        dx, dy, metrics = _estimate_split_shift(reference, proxy)
+
+        assert metrics["mode"] == "multiscale-tiled"
+        assert dx == pytest.approx(0.20, abs=0.01)
+        assert dy == pytest.approx(-0.10, abs=0.01)
+        assert metrics["multiscale_max_dimensions"] == (512, 1024)
+        assert metrics["multiscale_tile_support_counts"] == ((8, 8, 8), (8, 8, 8))
+        assert len(metrics["multiscale_global_alias_shifts_px"]) == 2
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="an exactly repeated texture translated by exactly one period is mathematically indistinguishable",
+    )
+    def test_exact_period_translation_is_an_explicit_unobservable_limit(self) -> None:
+        rng = np.random.default_rng(8158)
+        height, width, period = 256, 1024, 64
+        cell = cv2.GaussianBlur(
+            rng.normal(0.0, 1.0, size=(height, period)).astype(np.float32),
+            (0, 0),
+            1.0,
+        )
+        plane = np.tile(cell, (1, width // period))
+        plane = np.asarray(2000.0 + 60000.0 * (plane - plane.min()) / np.ptp(plane), dtype=np.uint16)
+        reference = np.repeat(plane[:, :, None], 3, axis=2)
+        proxy = np.roll(reference, period, axis=1)
+
+        with pytest.raises(RuntimeError, match="ambiguous periodic translation"):
+            _estimate_split_shift(reference, proxy)
+
+    def test_strong_near_zero_phase_can_reject_a_false_ecc_local_optimum(self, monkeypatch) -> None:
+        reference, _proxy, ir = self._trio(h=160, w=200, seed=8150)
+        # Preserve geometry while changing the capture's tone enough to defeat
+        # the byte-identical fast path, as RGB4x versus RGB1x does in hardware.
+        proxy = np.clip(reference.astype(np.float32) * 0.92 + 1200.0, 0, 65535).astype(np.uint16)
+
+        def divergent_ecc(_template, _input, warp, *_args):
+            wrong = warp.copy()
+            wrong[0, 2] = -2.1
+            wrong[1, 2] = 0.6
+            return 0.90, wrong
+
+        monkeypatch.setattr(cv2, "findTransformECC", divergent_ecc)
+
+        _rgb, _aligned, alignment = _align_split_ir(reference, proxy, ir)
+
+        assert alignment.mode == "phase-only"
+        assert max(abs(alignment.dx_px), abs(alignment.dy_px)) <= 2.0
+        assert min(alignment.phase_responses) >= 0.50
+        assert alignment.channel_spread_px is not None and alignment.channel_spread_px <= 0.10
+
+    def test_ecc_divergence_is_measured_in_native_output_pixels(self, monkeypatch) -> None:
+        reference, _proxy, ir = self._trio(h=2048, w=512, seed=8159)
+        proxy = np.clip(reference.astype(np.float32) * 0.92 + 1200.0, 0, 65535).astype(np.uint16)
+
+        monkeypatch.setattr(cv2, "phaseCorrelate", lambda *_args: ((0.0, 0.0), 0.55))
+
+        def false_ecc_local_optimum(_template, _input, warp, *_args):
+            wrong = warp.copy()
+            # This is only 1.5 px from phase at the 1024 px estimation scale,
+            # but 3 px on the native output where the alignment is applied.
+            wrong[0, 2] = -1.5
+            wrong[1, 2] = 0.25
+            return 0.90, wrong
+
+        monkeypatch.setattr(cv2, "findTransformECC", false_ecc_local_optimum)
+
+        _rgb, _aligned, alignment = _align_split_ir(reference, proxy, ir)
+
+        assert alignment.mode == "phase-only"
+        assert alignment.dx_px == 0.0
+        assert alignment.dy_px == 0.0
+
+    def test_phase_only_fallback_still_rejects_weak_phase_evidence(self, monkeypatch) -> None:
+        reference, _proxy, ir = self._trio(h=160, w=200, seed=8151)
+        proxy = np.clip(reference.astype(np.float32) * 0.92 + 1200.0, 0, 65535).astype(np.uint16)
+
+        monkeypatch.setattr(cv2, "phaseCorrelate", lambda *_args: ((0.0, 0.0), 0.49))
+
+        def divergent_ecc(_template, _input, warp, *_args):
+            wrong = warp.copy()
+            wrong[0, 2] = -2.1
+            return 0.90, wrong
+
+        monkeypatch.setattr(cv2, "findTransformECC", divergent_ecc)
+
+        with pytest.raises(RuntimeError, match="diverges from the phase estimate"):
+            _align_split_ir(reference, proxy, ir)
+
+    def test_multiscale_tiled_consensus_rejects_a_periodic_full_width_alias(self, monkeypatch) -> None:
+        reference, _proxy, ir = self._trio(h=96, w=512, seed=8152)
+        proxy = np.clip(reference.astype(np.float32) * 0.92 + 1200.0, 0, 65535).astype(np.uint16)
+
+        def phase(image, _other, _window):
+            if image.shape == (48, 256):
+                return (-37.5, 0.0), 0.35
+            if image.shape == (96, 512):
+                return (-75.0, 0.0), 0.45
+            if image.shape == (24, 64):
+                return (0.025, -0.015), 0.45
+            if image.shape == (48, 128):
+                return (0.05, -0.03), 0.45
+            raise AssertionError(f"unexpected phase-correlation shape {image.shape}")
+
+        monkeypatch.setattr(cv2, "phaseCorrelate", phase)
+        monkeypatch.setattr(
+            cv2,
+            "findTransformECC",
+            lambda *_args: pytest.fail("confident tiled phase must bypass periodic ECC"),
+        )
+
+        _rgb, _aligned, alignment = _align_split_ir(reference, proxy, ir)
+
+        assert alignment.mode == "multiscale-tiled"
+        assert alignment.estimator_version == 2
+        assert alignment.multiscale_max_dimensions == (256, 512)
+        assert len(alignment.multiscale_channel_shifts_px) == 2
+        assert alignment.multiscale_tile_support_counts == ((8, 8, 8), (8, 8, 8))
+        assert len(alignment.multiscale_global_alias_shifts_px) == 2
+        assert alignment.tile_support_counts == (8, 8, 8)
+        assert alignment.tile_shift_spread_px is not None and alignment.tile_shift_spread_px <= 0.35
+        assert max(abs(alignment.dx_px), abs(alignment.dy_px)) <= 2.0
 
 
 class TestFrameSelection:
