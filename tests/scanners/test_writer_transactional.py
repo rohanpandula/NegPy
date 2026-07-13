@@ -17,7 +17,7 @@ import tifffile
 
 from negpy.infrastructure.scanners.result import ScanResult
 from negpy.services.scanning import writer
-from negpy.services.scanning.writer import write_tiff_16bit
+from negpy.services.scanning.writer import write_full_negative_tiff, write_tiff_16bit
 
 
 def _result(with_ir: bool = True) -> ScanResult:
@@ -199,3 +199,97 @@ def test_dpi_metadata_written(tmp_path):
             xres = t.pages[0].tags["XResolution"].value
             assert xres[0] / xres[1] == 4000, f"{f}: XResolution {xres}"
             assert t.pages[0].tags["ResolutionUnit"].value == 2  # INCH
+
+
+def test_full_negative_evidence_failure_preserves_existing_triplet(monkeypatch, tmp_path) -> None:
+    rgb_path = tmp_path / "frame003.tif"
+    ir_path = tmp_path / "frame003_IR.tif"
+    valid_path = tmp_path / "frame003_IR_VALID.tif"
+    old_rgb = np.full((7, 5, 3), 1111, dtype=np.uint16)
+    old_ir = np.full((7, 5), 2222, dtype=np.uint16)
+    old_valid = np.full((7, 5), 255, dtype=np.uint8)
+    tifffile.imwrite(rgb_path, old_rgb, photometric="rgb")
+    tifffile.imwrite(ir_path, old_ir, photometric="minisblack")
+    tifffile.imwrite(valid_path, old_valid, photometric="minisblack")
+
+    real_inspect = writer.inspect_tiff_payload
+    calls = 0
+
+    def fail_third_inspection(path):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise OSError("simulated validity evidence failure")
+        return real_inspect(path)
+
+    monkeypatch.setattr(writer, "inspect_tiff_payload", fail_third_inspection)
+    new_rgb = np.full((7, 5, 3), 3333, dtype=np.uint16)
+    new_ir = np.full((7, 5), 4444, dtype=np.uint16)
+    result = ScanResult(rgb=new_rgb, ir=new_ir, dpi=4000, device_model="Nikon LS-5000")
+
+    with pytest.raises(OSError, match="validity evidence failure"):
+        write_full_negative_tiff(
+            result,
+            ir_valid_mask=np.ones((7, 5), dtype=bool),
+            path=rgb_path,
+        )
+
+    np.testing.assert_array_equal(tifffile.imread(rgb_path), old_rgb)
+    np.testing.assert_array_equal(tifffile.imread(ir_path), old_ir)
+    np.testing.assert_array_equal(tifffile.imread(valid_path), old_valid)
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "frame003.tif",
+        "frame003_IR.tif",
+        "frame003_IR_VALID.tif",
+    ]
+
+
+@pytest.mark.parametrize("failed_replace", range(1, 7))
+def test_full_negative_triplet_survives_each_commit_rename_failure(
+    monkeypatch,
+    tmp_path,
+    failed_replace: int,
+) -> None:
+    rgb_path = tmp_path / "frame003.tif"
+    ir_path = tmp_path / "frame003_IR.tif"
+    valid_path = tmp_path / "frame003_IR_VALID.tif"
+    old_rgb = np.full((7, 5, 3), 1111, dtype=np.uint16)
+    old_ir = np.full((7, 5), 2222, dtype=np.uint16)
+    old_valid = np.full((7, 5), 255, dtype=np.uint8)
+    tifffile.imwrite(rgb_path, old_rgb, photometric="rgb")
+    tifffile.imwrite(ir_path, old_ir, photometric="minisblack")
+    tifffile.imwrite(valid_path, old_valid, photometric="minisblack")
+
+    real_replace = writer.os.replace
+    calls = 0
+
+    def fail_selected_replace(src, dst) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == failed_replace:
+            raise OSError(f"simulated triplet commit rename {failed_replace} failure")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(writer.os, "replace", fail_selected_replace)
+    result = ScanResult(
+        rgb=np.full((7, 5, 3), 3333, dtype=np.uint16),
+        ir=np.full((7, 5), 4444, dtype=np.uint16),
+        dpi=4000,
+        device_model="Nikon LS-5000",
+    )
+
+    with pytest.raises(OSError, match=f"triplet commit rename {failed_replace} failure"):
+        write_full_negative_tiff(
+            result,
+            ir_valid_mask=np.ones((7, 5), dtype=bool),
+            path=rgb_path,
+        )
+
+    np.testing.assert_array_equal(tifffile.imread(rgb_path), old_rgb)
+    np.testing.assert_array_equal(tifffile.imread(ir_path), old_ir)
+    np.testing.assert_array_equal(tifffile.imread(valid_path), old_valid)
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "frame003.tif",
+        "frame003_IR.tif",
+        "frame003_IR_VALID.tif",
+    ]
