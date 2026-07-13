@@ -339,12 +339,38 @@ def learn_film_base(
     # across previews keep scene colours from winning.
     radius = config.cluster_radius
     best_anchor: np.ndarray | None = None
-    best_score = (-1, -1)
+    transmission_floor = np.percentile(all_colours, 1, axis=0)
+    transmission_span = np.maximum(
+        np.percentile(all_colours, 99, axis=0) - transmission_floor,
+        1.0,
+    )
+    best_score = (-1, -1, -1.0)
     for anchor in anchors:
-        counts = [int(np.count_nonzero(np.linalg.norm((rows - anchor) / channel_scale, axis=1) <= radius)) for rows in candidates]
+        counts: list[int] = []
+        for colours, variation in features:
+            uniform_cutoff = float(np.percentile(variation, config.uniform_candidate_percentile))
+            distance = np.linalg.norm((colours - anchor) / channel_scale, axis=1)
+            # A transport tail at EOF can also be bright and uniform.  It is
+            # not a target-side film-base gap because no image follows it, so
+            # exclude suffix-only runs from anchor support.
+            eligible_runs = [
+                (start, end)
+                for start, end in _runs(
+                    (variation <= uniform_cutoff) & (distance <= radius),
+                    config.minimum_run_rows,
+                )
+                if end < len(colours)
+            ]
+            counts.append(sum(end - start for start, end in eligible_runs))
+        # C-41 film base is the roll's recurring least-dense material.  When
+        # scene colours tie its cross-preview support, prefer the candidate
+        # whose weakest channel has the highest roll-normalised transmission;
+        # this uses film physics without assuming an orange-mask RGB value.
+        normalised_transmission = (anchor - transmission_floor) / transmission_span
         score = (
             sum(count >= config.minimum_run_rows for count in counts),
             sum(min(count, config.balanced_rows_per_preview) for count in counts),
+            float(np.min(normalised_transmission)),
         )
         if score > best_score:
             best_anchor = anchor
@@ -399,6 +425,7 @@ def measure_target_start(
     minimum_run_rows: int = 3,
     expected_row: float | None = None,
     maximum_prediction_error: float | None = None,
+    allow_short_prefix: bool = False,
 ) -> TargetEdge:
     """Find the target-side edge of the film-base gap in one wide preview.
 
@@ -415,9 +442,22 @@ def measure_target_start(
         raise ValueError("expected_row must be finite")
     if maximum_prediction_error is not None and maximum_prediction_error < 0:
         raise ValueError("maximum_prediction_error must be non-negative")
+    if type(allow_short_prefix) is not bool:
+        raise ValueError("allow_short_prefix must be a boolean")
+    if allow_short_prefix and expected_row is None:
+        raise ValueError("allow_short_prefix requires expected_row")
     mask, distance = _film_base_mask(preview, model)
     candidates = [(start, end) for start, end in _runs(mask, minimum_run_rows) if end < len(mask)]
     if not candidates:
+        prefix_end = 0
+        while prefix_end < len(mask) and bool(mask[prefix_end]):
+            prefix_end += 1
+        if allow_short_prefix and 0 < prefix_end < minimum_run_rows and prefix_end < len(mask):
+            # At the far transport boundary the nominal frame origin can clip
+            # almost the entire inter-frame gap.  A short run attached to row
+            # zero is still direct evidence; it remains medium-confidence and
+            # must pass a second, registered preview before approval.
+            return TargetEdge(row=prefix_end, confidence="medium")
         raise ValueError("preview contains no film-base run followed by image content")
     if expected_row is None:
         start, end = max(candidates, key=lambda run: (run[1] - run[0], -run[0]))

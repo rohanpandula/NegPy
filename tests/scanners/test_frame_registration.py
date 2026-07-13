@@ -60,6 +60,33 @@ def test_learns_roll_specific_film_base_without_a_fixed_rgb_value() -> None:
     np.testing.assert_allclose(model.rgb, base, atol=25)
 
 
+def test_film_base_tie_prefers_high_transmission_over_a_repeated_smooth_scene() -> None:
+    """C-41 base is the least-dense recurring run, not the first tied colour."""
+
+    rng = np.random.default_rng(20260712)
+    base = np.asarray((59000, 22800, 14500), dtype=np.float64)
+    false_scene = np.asarray((24000, 8500, 6500), dtype=np.float64)
+    previews = []
+    for index, edge in enumerate((90, 84, 100)):
+        image = np.empty((130, 32, 3), dtype=np.float64)
+        image[:40] = false_scene + rng.normal(0, 5, size=(40, 32, 3))
+        image[40 : edge - 20] = np.asarray((9000, 5000, 3000)) + rng.normal(
+            0,
+            500,
+            size=(edge - 60, 32, 3),
+        )
+        image[edge - 20 : edge] = base
+        y, x = np.mgrid[: 130 - edge, :32]
+        texture = 900 * np.sin(x / 2.3) + 600 * np.cos(y / 3.1)
+        image[edge:] = np.asarray((13000 + index * 5000, 7000, 4000)) + texture[..., None]
+        previews.append(np.clip(image, 0, 65535).astype(np.uint16))
+
+    model = learn_film_base(previews)
+
+    np.testing.assert_allclose(model.rgb, base, atol=40)
+    assert [measure_target_start(preview, model).row for preview in previews] == [90, 84, 100]
+
+
 def test_finds_the_gap_edge_for_both_bright_and_dark_frames() -> None:
     base = (41200, 17600, 9300)
     training = [
@@ -88,6 +115,27 @@ def test_edge_prior_disambiguates_a_long_smooth_patch_inside_the_scene() -> None
     edge = measure_target_start(preview, model, expected_row=15.0, maximum_prediction_error=6.0)
 
     assert edge.row == 16
+
+
+def test_edge_prior_can_recover_a_direct_short_prefix_at_the_transport_boundary() -> None:
+    base = (41200, 17600, 9300)
+    training = [
+        _preview(edge=10 + index, base_rgb=base, scene_rgb=scene, seed=index)
+        for index, scene in enumerate(((4000, 3000, 2000), (61000, 58000, 54000), (26000, 21000, 17000)))
+    ]
+    model = learn_film_base(training)
+    clipped = _preview(edge=1, base_rgb=base, scene_rgb=(7000, 5000, 3000), seed=11)
+
+    edge = measure_target_start(
+        clipped,
+        model,
+        expected_row=17.0,
+        maximum_prediction_error=12.0,
+        allow_short_prefix=True,
+    )
+
+    assert edge.row == 1
+    assert edge.confidence == "medium"
 
 
 def test_model_covers_normal_film_base_drift_across_a_roll() -> None:
