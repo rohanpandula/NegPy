@@ -267,6 +267,32 @@ class FakeRegistration:
         )
 
 
+class RolloverRegistration(FakeRegistration):
+    def calibrate(self, previews):
+        registrations = super().calibrate(previews)
+        frame = max(registrations)
+        registrations[frame] = FrameRegistration(
+            frame=frame,
+            target_start_row=1,
+            usable_tail_row=518.0,
+            confidence="medium",
+            geometry=RegisteredScanGeometry(
+                frame=frame - 1,
+                subframe_mm=37.82,
+                br_y_device_px=5187,
+            ),
+        )
+        return registrations
+
+    def verify(self, frame, preview, registration):
+        return AlignmentVerification(
+            leading_margin_rows=4,
+            target_margin_rows=4,
+            tolerance_rows=4,
+            confidence="high",
+        )
+
+
 class UnresolvedRegistration(FakeRegistration):
     def verify(self, frame, preview, registration):
         return AlignmentVerification(
@@ -305,6 +331,79 @@ def test_prepare_roll_acquires_wide_then_registered_previews_and_persists_review
     assert (tmp_path / "roll-scan.json").is_file()
     assert (tmp_path / "wide" / "frame002.tif").is_file()
     assert (tmp_path / "aligned" / "frame003.tif").is_file()
+
+
+def test_prepare_roll_uses_prior_wide_previews_as_calibration_context_without_rescanning_them(
+    tmp_path: Path,
+) -> None:
+    scanner = FakeScanner()
+    registration = FakeRegistration()
+    service = RollScanService(scanner=scanner, registration=registration)
+    context = {
+        2: np.full((12, 16, 3), 1002, dtype=np.uint16),
+        3: np.full((12, 16, 3), 1003, dtype=np.uint16),
+        4: np.full((12, 16, 3), 1004, dtype=np.uint16),
+    }
+
+    plan = service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(5, 6, 7),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False, autofocus=False),
+        stop=threading.Event(),
+        calibration_previews=context,
+    )
+
+    assert registration.calibrated_frames == (2, 3, 4, 5, 6, 7)
+    assert [(call.frame, call.registered_geometry is not None) for call in scanner.calls] == [
+        (5, False),
+        (6, False),
+        (7, False),
+        (5, True),
+        (6, True),
+        (7, True),
+    ]
+    assert [record.frame for record in plan.frames] == [5, 6, 7]
+
+
+def test_prepare_roll_rejects_calibration_context_that_overlaps_selected_frames(tmp_path: Path) -> None:
+    service = RollScanService(scanner=FakeScanner(), registration=FakeRegistration())
+
+    with pytest.raises(ValueError, match="overlaps"):
+        service.prepare_roll(
+            device_id="coolscan3:test",
+            frames=(5, 6, 7),
+            output_dir=tmp_path,
+            preview_params=ScanParams(dpi=400, depth=16, capture_ir=False, autofocus=False),
+            stop=threading.Event(),
+            calibration_previews={5: np.zeros((12, 16, 3), dtype=np.uint16)},
+        )
+
+
+def test_rollover_geometry_scans_the_previous_physical_frame_but_keeps_the_logical_record(
+    tmp_path: Path,
+) -> None:
+    scanner = FakeScanner()
+    service = RollScanService(scanner=scanner, registration=RolloverRegistration())
+    params = ScanParams(dpi=400, depth=16, capture_ir=False, autofocus=False)
+
+    plan = service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(37,),
+        output_dir=tmp_path,
+        preview_params=params,
+        stop=threading.Event(),
+    )
+
+    assert [(call.frame, call.registered_geometry) for call in scanner.calls] == [
+        (37, None),
+        (36, RegisteredScanGeometry(frame=36, subframe_mm=37.82, br_y_device_px=5187)),
+    ]
+    assert plan.frames[0].frame == 37
+    assert plan.frames[0].registration is not None
+    assert plan.frames[0].registration.geometry.frame == 36
+    approved = service.approve_roll(tmp_path / "roll-scan.json")
+    assert approved.approved
 
 
 def test_fine_scan_is_refused_until_aligned_previews_are_explicitly_approved(tmp_path: Path) -> None:
@@ -361,6 +460,24 @@ def test_approval_requires_every_aligned_preview_to_still_be_inspectable(
         stop=threading.Event(),
     )
     (tmp_path / "aligned" / "frame003.tif").unlink()
+
+    with pytest.raises(RuntimeError, match="aligned preview"):
+        service.approve_roll(tmp_path / "roll-scan.json")
+
+
+def test_approval_rejects_same_shape_aligned_preview_content_substitution(tmp_path: Path) -> None:
+    service = RollScanService(scanner=FakeScanner(), registration=FakeRegistration())
+    service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(3,),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False, autofocus=False),
+        stop=threading.Event(),
+    )
+    aligned = tmp_path / "aligned" / "frame003.tif"
+    replacement = tifffile.imread(aligned)
+    replacement[0, 0, 0] ^= np.uint16(1)
+    tifffile.imwrite(aligned, replacement, photometric="rgb", resolution=(400, 400), resolutionunit="INCH")
 
     with pytest.raises(RuntimeError, match="aligned preview"):
         service.approve_roll(tmp_path / "roll-scan.json")
@@ -577,6 +694,15 @@ def test_fine_scan_writes_a_fully_bound_qc_sidecar_after_fresh_probe(tmp_path: P
         "phase_responses": [],
         "channel_spread_px": None,
         "ecc_coefficient": None,
+        "tile_support_counts": [],
+        "tile_shift_spread_px": None,
+        "estimator_version": None,
+        "multiscale_max_dimensions": [],
+        "multiscale_channel_shifts_px": [],
+        "multiscale_responses": [],
+        "multiscale_tile_support_counts": [],
+        "multiscale_tile_shift_spreads_px": [],
+        "multiscale_global_alias_shifts_px": [],
     }
     assert sidecar["stopped_transport_smear"]["verdict"] == "clean"
     assert sidecar["clipping"]["warning"] is False
@@ -810,6 +936,15 @@ def test_fine_resume_rejects_tampered_qc_artifact_metadata(
                 "phase_responses": [],
                 "channel_spread_px": None,
                 "ecc_coefficient": None,
+                "tile_support_counts": [],
+                "tile_shift_spread_px": None,
+                "estimator_version": None,
+                "multiscale_max_dimensions": [],
+                "multiscale_channel_shifts_px": [],
+                "multiscale_responses": [],
+                "multiscale_tile_support_counts": [],
+                "multiscale_tile_shift_spreads_px": [],
+                "multiscale_global_alias_shifts_px": [],
             },
         ),
         ("stopped_transport_smear", {"verdict": "clean"}),
@@ -1837,6 +1972,28 @@ def test_too_few_frames_for_registration_are_rejected_before_scanner_movement(tm
     assert not (tmp_path / "roll-scan.json").exists()
 
 
+def test_validated_context_counts_toward_registration_minimum_for_a_final_chunk(tmp_path: Path) -> None:
+    scanner = FakeScanner()
+    registration = FakeRegistration(minimum_preview_count=3)
+    service = RollScanService(scanner=scanner, registration=registration)
+    context = {
+        2: np.full((12, 16, 3), 1002, dtype=np.uint16),
+        3: np.full((12, 16, 3), 1003, dtype=np.uint16),
+    }
+
+    plan = service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(4,),
+        output_dir=tmp_path,
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False, autofocus=False),
+        stop=threading.Event(),
+        calibration_previews=context,
+    )
+
+    assert registration.calibrated_frames == (2, 3, 4)
+    assert [record.frame for record in plan.frames] == [4]
+
+
 def test_non_integer_frame_selection_is_rejected_before_scanner_movement(tmp_path: Path) -> None:
     scanner = FakeScanner()
     service = RollScanService(scanner=scanner, registration=FakeRegistration())
@@ -1852,6 +2009,59 @@ def test_non_integer_frame_selection_is_rejected_before_scanner_movement(tmp_pat
 
     assert scanner.calls == []
     assert not (tmp_path / "roll-scan.json").exists()
+
+
+def test_scan_full_negative_uses_only_approved_registration_and_archival_recipe(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    scanner = FakeScanner()
+    service = RollScanService(scanner=scanner, registration=FakeRegistration())
+    prepared = service.prepare_roll(
+        device_id="coolscan3:test",
+        frames=(2, 3),
+        output_dir=tmp_path / "plan",
+        preview_params=ScanParams(dpi=400, depth=16, capture_ir=False, autofocus=False),
+        stop=threading.Event(),
+    )
+    service.approve_roll(tmp_path / "plan" / "roll-scan.json")
+    calls = []
+
+    class FakeWorkflow:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+
+        def capture_frame(self, **kwargs):
+            calls.append(("capture", kwargs))
+            manifest_path = tmp_path / "full" / "manifests" / "frame002.json"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text("{}", encoding="utf-8")
+            return type("Completed", (), {"manifest_path": manifest_path})()
+
+    import negpy.services.scanning.full_negative_workflow as workflow_module
+
+    monkeypatch.setattr(workflow_module, "FullNegativeWorkflow", FakeWorkflow)
+    identity = prepared.identity
+    result = service.scan_full_negative(
+        plan_path=tmp_path / "plan" / "roll-scan.json",
+        output_dir=tmp_path / "full",
+        identity=identity,
+        fine_params=ScanParams(
+            dpi=4000,
+            depth=16,
+            capture_ir=True,
+            autofocus=True,
+            samples_per_scan=4,
+            auto_exposure=True,
+        ),
+        stop=threading.Event(),
+        frames=(2,),
+    )
+
+    assert tuple(result) == (2,)
+    assert calls[0][0] == "init" and calls[0][1]["identity"] == identity
+    assert calls[1][0] == "capture"
+    assert calls[1][1]["registration"].frame == 2
 
 
 @pytest.mark.parametrize(

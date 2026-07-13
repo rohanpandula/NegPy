@@ -17,7 +17,8 @@ from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from math import ceil, isfinite
 from pathlib import Path, PureWindowsPath
-from typing import Callable, Mapping, Protocol, Sequence, cast
+from typing import TYPE_CHECKING, Callable, Mapping, Protocol, Sequence, cast
+from uuid import uuid4
 
 import numpy as np
 import tifffile
@@ -33,10 +34,14 @@ from negpy.services.scanning.quality import (
     split_alignment_metrics_confident,
 )
 from negpy.services.scanning.writer import write_tiff_16bit
+from negpy.services.scanning.provenance import PlanIdentity, canonical_semantic_sha256
+
+if TYPE_CHECKING:
+    from negpy.services.scanning.full_negative_workflow import FullNegativeWorkflowResult
 
 
 PLAN_FILENAME = "roll-scan.json"
-PLAN_VERSION = 2
+PLAN_VERSION = 3
 FINE_QC_VERSION = 1
 
 
@@ -149,10 +154,14 @@ class RollFrameRecord:
     wide_path: str | None = None
     wide_rgb_shape: tuple[int, ...] | None = None
     wide_dtype: str | None = None
+    wide_sha256: str | None = None
+    wide_dpi: int | None = None
     registration: FrameRegistration | None = None
     aligned_path: str | None = None
     aligned_rgb_shape: tuple[int, ...] | None = None
     aligned_dtype: str | None = None
+    aligned_sha256: str | None = None
+    aligned_dpi: int | None = None
     verification: AlignmentVerification | None = None
     fine_path: str | None = None
     fine_rgb_shape: tuple[int, ...] | None = None
@@ -164,7 +173,19 @@ class RollFrameRecord:
 
 
 @dataclass(frozen=True)
+class CalibrationPreviewRecord:
+    """Exact decoded preview pixels used only as roll-wide calibration context."""
+
+    frame: int
+    sha256: str
+    shape: tuple[int, ...]
+    dtype: str
+    dpi: int
+
+
+@dataclass(frozen=True)
 class RollScanPlan:
+    identity: PlanIdentity
     device_id: str
     stage: RollStage
     approved: bool
@@ -173,6 +194,7 @@ class RollScanPlan:
     preview_recipe: PreviewScanRecipe
     registration_signature: Mapping[str, object]
     visual_override_frames: tuple[int, ...]
+    calibration_context: tuple[CalibrationPreviewRecord, ...]
     frames: tuple[RollFrameRecord, ...]
     version: int = PLAN_VERSION
 
@@ -219,6 +241,11 @@ def _atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except Exception:
         try:
             os.unlink(temporary)
@@ -314,6 +341,29 @@ def _optional_dtype(value: object, field: str) -> str | None:
     return dtype
 
 
+def _optional_sha256(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    digest = _strict_string(value, field, nonempty=True)
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+    return digest
+
+
+def _array_content_sha256(array: np.ndarray) -> str:
+    contiguous = np.ascontiguousarray(array)
+    digest = sha256()
+    digest.update(
+        json.dumps(
+            {"shape": list(contiguous.shape), "dtype": contiguous.dtype.str},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    digest.update(memoryview(contiguous).cast("B"))
+    return digest.hexdigest()
+
+
 _RECIPE_KEYS = {
     "dpi",
     "depth",
@@ -380,6 +430,7 @@ def _read_plan(path: Path) -> RollScanPlan:
             payload,
             {
                 "version",
+                "identity",
                 "device_id",
                 "stage",
                 "approved",
@@ -388,6 +439,7 @@ def _read_plan(path: Path) -> RollScanPlan:
                 "preview_recipe",
                 "registration_signature",
                 "visual_override_frames",
+                "calibration_context",
                 "frames",
             },
             "plan",
@@ -405,16 +457,57 @@ def _read_plan(path: Path) -> RollScanPlan:
         if type(raw_frames) is not list or not raw_frames:
             raise ValueError("frames must be a nonempty array")
 
+        raw_context = root["calibration_context"]
+        if type(raw_context) is not list:
+            raise ValueError("calibration_context must be an array")
+        calibration_context: list[CalibrationPreviewRecord] = []
+        for index, raw_item in enumerate(raw_context):
+            item = _exact_keys(
+                raw_item,
+                {"frame", "sha256", "shape", "dtype", "dpi"},
+                f"calibration_context[{index}]",
+            )
+            context_dtype = _strict_string(item["dtype"], f"calibration_context[{index}].dtype", nonempty=True)
+            if context_dtype != "uint16":
+                raise ValueError(f"calibration_context[{index}].dtype must be uint16")
+            context_dpi = _strict_int(item["dpi"], f"calibration_context[{index}].dpi", minimum=1)
+            if context_dpi != preview_dpi:
+                raise ValueError(f"calibration_context[{index}].dpi disagrees with preview recipe")
+            context_sha256 = _optional_sha256(item["sha256"], f"calibration_context[{index}].sha256")
+            context_shape = _optional_shape(
+                item["shape"],
+                f"calibration_context[{index}].shape",
+                channels=3,
+            )
+            if context_sha256 is None or context_shape is None:
+                raise ValueError(f"calibration_context[{index}] hash/shape evidence is required")
+            calibration_context.append(
+                CalibrationPreviewRecord(
+                    frame=_strict_int(item["frame"], f"calibration_context[{index}].frame", minimum=1),
+                    sha256=context_sha256,
+                    shape=context_shape,
+                    dtype=context_dtype,
+                    dpi=context_dpi,
+                )
+            )
+        context_frames = tuple(item.frame for item in calibration_context)
+        if tuple(sorted(set(context_frames))) != context_frames:
+            raise ValueError("calibration_context frames must be unique and increasing")
+
         records: list[RollFrameRecord] = []
         record_keys = {
             "frame",
             "wide_path",
             "wide_rgb_shape",
             "wide_dtype",
+            "wide_sha256",
+            "wide_dpi",
             "registration",
             "aligned_path",
             "aligned_rgb_shape",
             "aligned_dtype",
+            "aligned_sha256",
+            "aligned_dpi",
             "verification",
             "fine_path",
             "fine_rgb_shape",
@@ -467,7 +560,7 @@ def _read_plan(path: Path) -> RollScanPlan:
                     f"frames[{index}].registration.geometry.frame",
                     minimum=1,
                 )
-                if registration_frame != frame or geometry_frame != frame:
+                if registration_frame != frame or geometry_frame not in {frame, frame - 1}:
                     raise ValueError(f"frames[{index}] registration/geometry frame mismatch")
                 if usable_tail_row <= target_start_row:
                     raise ValueError(f"frames[{index}] usable tail must follow the target start")
@@ -530,9 +623,15 @@ def _read_plan(path: Path) -> RollScanPlan:
             wide_path = _optional_path(item["wide_path"], f"frames[{index}].wide_path")
             wide_rgb_shape = _optional_shape(item["wide_rgb_shape"], f"frames[{index}].wide_rgb_shape", channels=3)
             wide_dtype = _optional_dtype(item["wide_dtype"], f"frames[{index}].wide_dtype")
+            wide_sha256 = _optional_sha256(item["wide_sha256"], f"frames[{index}].wide_sha256")
+            wide_dpi = None if item["wide_dpi"] is None else _strict_int(item["wide_dpi"], f"frames[{index}].wide_dpi", minimum=1)
             aligned_path = _optional_path(item["aligned_path"], f"frames[{index}].aligned_path")
             aligned_rgb_shape = _optional_shape(item["aligned_rgb_shape"], f"frames[{index}].aligned_rgb_shape", channels=3)
             aligned_dtype = _optional_dtype(item["aligned_dtype"], f"frames[{index}].aligned_dtype")
+            aligned_sha256 = _optional_sha256(item["aligned_sha256"], f"frames[{index}].aligned_sha256")
+            aligned_dpi = (
+                None if item["aligned_dpi"] is None else _strict_int(item["aligned_dpi"], f"frames[{index}].aligned_dpi", minimum=1)
+            )
             fine_path = _optional_path(item["fine_path"], f"frames[{index}].fine_path")
             fine_rgb_shape = _optional_shape(item["fine_rgb_shape"], f"frames[{index}].fine_rgb_shape", channels=3)
             fine_ir_shape = _optional_shape(item["fine_ir_shape"], f"frames[{index}].fine_ir_shape", channels=None)
@@ -543,6 +642,14 @@ def _read_plan(path: Path) -> RollScanPlan:
 
             _coherent_artifact(wide_path, wide_rgb_shape, wide_dtype, f"frames[{index}].wide")
             _coherent_artifact(aligned_path, aligned_rgb_shape, aligned_dtype, f"frames[{index}].aligned")
+            if (wide_path is None) != (wide_sha256 is None) or (wide_path is None) != (wide_dpi is None):
+                raise ValueError(f"frames[{index}] wide hash/DPI evidence is incomplete")
+            if (aligned_path is None) != (aligned_sha256 is None) or (aligned_path is None) != (aligned_dpi is None):
+                raise ValueError(f"frames[{index}] aligned hash/DPI evidence is incomplete")
+            if wide_dpi is not None and wide_dpi != preview_dpi:
+                raise ValueError(f"frames[{index}] wide DPI disagrees with the preview recipe")
+            if aligned_dpi is not None and aligned_dpi != preview_dpi:
+                raise ValueError(f"frames[{index}] aligned DPI disagrees with the preview recipe")
             _coherent_artifact(fine_path, fine_rgb_shape, fine_dtype, f"frames[{index}].fine")
             if registration is not None and wide_path is None:
                 raise ValueError(f"frames[{index}] registration requires a wide preview")
@@ -563,10 +670,14 @@ def _read_plan(path: Path) -> RollScanPlan:
                     wide_path=wide_path,
                     wide_rgb_shape=wide_rgb_shape,
                     wide_dtype=wide_dtype,
+                    wide_sha256=wide_sha256,
+                    wide_dpi=wide_dpi,
                     registration=registration,
                     aligned_path=aligned_path,
                     aligned_rgb_shape=aligned_rgb_shape,
                     aligned_dtype=aligned_dtype,
+                    aligned_sha256=aligned_sha256,
+                    aligned_dpi=aligned_dpi,
                     verification=verification,
                     fine_path=fine_path,
                     fine_rgb_shape=fine_rgb_shape,
@@ -619,6 +730,7 @@ def _read_plan(path: Path) -> RollScanPlan:
 
         return RollScanPlan(
             version=PLAN_VERSION,
+            identity=PlanIdentity.from_dict(root["identity"]),
             device_id=_strict_string(root["device_id"], "device_id", nonempty=True),
             stage=stage,
             approved=approved,
@@ -627,6 +739,7 @@ def _read_plan(path: Path) -> RollScanPlan:
             preview_recipe=preview_recipe,
             registration_signature=registration_signature,
             visual_override_frames=visual_override_frames,
+            calibration_context=tuple(calibration_context),
             frames=tuple(records),
         )
     except (KeyError, TypeError, ValueError) as error:
@@ -638,12 +751,26 @@ def _tiff_payload_matches(
     *,
     shape: tuple[int, ...] | None,
     dtype: str | None,
+    sha256_digest: str | None = None,
+    dpi: int | None = None,
 ) -> bool:
     """Check saved geometry and that every TIFF strip lies inside the file."""
 
     if shape is None or dtype is None or not path.is_file():
         return False
     try:
+        if sha256_digest is not None or dpi is not None:
+            if sha256_digest is None or dpi is None:
+                return False
+            inspection = inspect_tiff_payload(path)
+            expected_resolution = (dpi, 1)
+            if not (
+                inspection.sha256 == sha256_digest
+                and inspection.x_resolution == expected_resolution
+                and inspection.y_resolution == expected_resolution
+                and inspection.resolution_unit == "INCH"
+            ):
+                return False
         file_size = path.stat().st_size
         with tifffile.TiffFile(path) as document:
             if len(document.pages) != 1:
@@ -674,6 +801,19 @@ def _tiff_signature(path: Path) -> tuple[tuple[int, ...], str]:
             tuple(int(value) for value in page.shape),
             np.dtype(page.dtype).name,
         )
+
+
+def _preview_signature(path: Path, *, dpi: int) -> tuple[tuple[int, ...], str, str, int]:
+    shape, dtype = _tiff_signature(path)
+    inspection = inspect_tiff_payload(path)
+    expected_resolution = (dpi, 1)
+    if (
+        inspection.x_resolution != expected_resolution
+        or inspection.y_resolution != expected_resolution
+        or inspection.resolution_unit != "INCH"
+    ):
+        raise ValueError(f"preview TIFF {path} does not record {dpi} DPI")
+    return shape, dtype, inspection.sha256, dpi
 
 
 def _fine_record_valid(
@@ -957,18 +1097,36 @@ def _fine_qc_valid(
         alignment_payload = payload.get("split_alignment")
         alignment = None
         if alignment_payload is not None:
-            if type(alignment_payload) is not dict or set(alignment_payload) != {
+            required_alignment_fields = {
                 "mode",
                 "dx_px",
                 "dy_px",
                 "phase_responses",
                 "channel_spread_px",
                 "ecc_coefficient",
-            }:
+            }
+            optional_alignment_fields = {
+                "tile_support_counts",
+                "tile_shift_spread_px",
+                "estimator_version",
+                "multiscale_max_dimensions",
+                "multiscale_channel_shifts_px",
+                "multiscale_responses",
+                "multiscale_tile_support_counts",
+                "multiscale_tile_shift_spreads_px",
+                "multiscale_global_alias_shifts_px",
+            }
+            if type(alignment_payload) is not dict:
+                return False
+            alignment_payload = cast(dict[str, object], alignment_payload)
+            if not required_alignment_fields.issubset(alignment_payload) or not set(alignment_payload).issubset(
+                required_alignment_fields | optional_alignment_fields
+            ):
                 return False
             phase_responses = alignment_payload.get("phase_responses")
             if type(phase_responses) is not list:
                 return False
+            phase_responses = cast(list[float], phase_responses)
             alignment = SplitIrAlignment(
                 mode=cast(str, alignment_payload.get("mode")),
                 dx_px=float(cast(float, alignment_payload.get("dx_px"))),
@@ -983,6 +1141,55 @@ def _fine_qc_valid(
                     None
                     if alignment_payload.get("ecc_coefficient") is None
                     else float(cast(float, alignment_payload.get("ecc_coefficient")))
+                ),
+                tile_support_counts=tuple(int(value) for value in cast(list[int], alignment_payload.get("tile_support_counts", ()))),
+                tile_shift_spread_px=(
+                    None
+                    if alignment_payload.get("tile_shift_spread_px") is None
+                    else float(cast(float, alignment_payload.get("tile_shift_spread_px")))
+                ),
+                estimator_version=(
+                    None
+                    if alignment_payload.get("estimator_version") is None
+                    else int(cast(int, alignment_payload.get("estimator_version")))
+                ),
+                multiscale_max_dimensions=tuple(
+                    int(value) for value in cast(list[int], alignment_payload.get("multiscale_max_dimensions", ()))
+                ),
+                multiscale_channel_shifts_px=tuple(
+                    tuple((float(pair[0]), float(pair[1])) for pair in scale)
+                    for scale in cast(
+                        list[list[list[float]]],
+                        alignment_payload.get("multiscale_channel_shifts_px", ()),
+                    )
+                ),
+                multiscale_responses=tuple(
+                    tuple(float(value) for value in scale)
+                    for scale in cast(
+                        list[list[float]],
+                        alignment_payload.get("multiscale_responses", ()),
+                    )
+                ),
+                multiscale_tile_support_counts=tuple(
+                    tuple(int(value) for value in scale)
+                    for scale in cast(
+                        list[list[int]],
+                        alignment_payload.get("multiscale_tile_support_counts", ()),
+                    )
+                ),
+                multiscale_tile_shift_spreads_px=tuple(
+                    tuple(float(value) for value in scale)
+                    for scale in cast(
+                        list[list[float]],
+                        alignment_payload.get("multiscale_tile_shift_spreads_px", ()),
+                    )
+                ),
+                multiscale_global_alias_shifts_px=tuple(
+                    tuple((float(pair[0]), float(pair[1])) for pair in scale)
+                    for scale in cast(
+                        list[list[list[float]]],
+                        alignment_payload.get("multiscale_global_alias_shifts_px", ()),
+                    )
                 ),
             )
         split_capture = recipe.capture_ir and recipe.samples_per_scan > 1 and "coolscan" in device_id.lower()
@@ -1065,6 +1272,8 @@ def _aligned_record_valid(root: Path, record: RollFrameRecord) -> bool:
         path,
         shape=record.aligned_rgb_shape,
         dtype=record.aligned_dtype,
+        sha256_digest=record.aligned_sha256,
+        dpi=record.aligned_dpi,
     ):
         return False
     try:
@@ -1072,6 +1281,48 @@ def _aligned_record_valid(root: Path, record: RollFrameRecord) -> bool:
     except (OSError, ValueError, tifffile.TiffFileError):
         return False
     return tuple(int(value) for value in preview.shape) == record.aligned_rgb_shape and np.dtype(preview.dtype).name == record.aligned_dtype
+
+
+def approved_plan_binding_sha256(plan: RollScanPlan) -> str:
+    """Bind an approval to its exact roll, context pixels, previews and geometry."""
+
+    if not plan.approved:
+        raise ValueError("cannot bind an unapproved roll plan")
+    frames = []
+    for record in plan.frames:
+        if record.registration is None or record.verification is None:
+            raise ValueError(f"frame {record.frame} is missing approval evidence")
+        frames.append(
+            {
+                "frame": record.frame,
+                "wide": {
+                    "sha256": record.wide_sha256,
+                    "shape": list(record.wide_rgb_shape or ()),
+                    "dtype": record.wide_dtype,
+                    "dpi": record.wide_dpi,
+                },
+                "aligned": {
+                    "sha256": record.aligned_sha256,
+                    "shape": list(record.aligned_rgb_shape or ()),
+                    "dtype": record.aligned_dtype,
+                    "dpi": record.aligned_dpi,
+                },
+                "registration": asdict(record.registration),
+                "verification": asdict(record.verification),
+            }
+        )
+    return canonical_semantic_sha256(
+        {
+            "schema": 1,
+            "identity": plan.identity.to_dict(),
+            "device_id": plan.device_id,
+            "preview_recipe": asdict(plan.preview_recipe),
+            "registration_signature": dict(plan.registration_signature),
+            "visual_override_frames": list(plan.visual_override_frames),
+            "calibration_context": [asdict(item) for item in plan.calibration_context],
+            "frames": frames,
+        }
+    )
 
 
 class RollScanService:
@@ -1225,19 +1476,47 @@ class RollScanService:
         preview_params: ScanParams,
         stop: threading.Event,
         progress: ProgressCallback | None = None,
+        calibration_previews: Mapping[int, np.ndarray] | None = None,
+        identity: PlanIdentity | None = None,
     ) -> RollScanPlan:
         """Acquire wide and registered previews, then stop for visual review.
 
         ``frames`` is an explicit exposure list.  Scanner adapter capacity is
         only a transport limit and must never be treated as the exposure count.
+        ``calibration_previews`` supplies committed wide previews from earlier
+        transport-safe chunks of the same roll.  They improve the shared film-
+        base model but are never rescanned or added to this chunk's plan.
         """
 
         selected = self._validate_frames(frames)
+        context = dict(calibration_previews or {})
+        if any(type(frame) is not int or frame < 1 for frame in context):
+            raise ValueError("calibration preview frames must be positive integers")
+        overlap = sorted(set(context) & set(selected))
+        if overlap:
+            raise ValueError("calibration context overlaps selected frames: " + ", ".join(str(frame) for frame in overlap))
+        for frame, image in context.items():
+            preview = np.asarray(image)
+            if preview.ndim != 3 or preview.shape[2] < 3:
+                raise ValueError(f"calibration preview {frame} must contain RGB channels")
+            if preview.dtype != np.uint16:
+                raise ValueError(f"calibration preview {frame} must be a committed uint16 TIFF payload")
+        context_records = tuple(
+            CalibrationPreviewRecord(
+                frame=frame,
+                sha256=_array_content_sha256(np.asarray(context[frame])),
+                shape=tuple(int(value) for value in np.asarray(context[frame]).shape),
+                dtype=np.dtype(np.asarray(context[frame]).dtype).name,
+                dpi=preview_params.dpi,
+            )
+            for frame in sorted(context)
+        )
         minimum_preview_count = self._registration.minimum_preview_count
         if type(minimum_preview_count) is not int or minimum_preview_count < 1:
             raise ValueError("registration minimum_preview_count must be a positive integer")
-        if len(selected) < minimum_preview_count:
-            raise ValueError(f"registration requires at least {minimum_preview_count} preview frames; got {len(selected)}")
+        calibration_count = len(selected) + len(context)
+        if calibration_count < minimum_preview_count:
+            raise ValueError(f"registration requires at least {minimum_preview_count} preview frames; got {calibration_count}")
         if preview_params.area is not None:
             raise ValueError("roll registration requires area=None")
         if preview_params.dpi != self._registration.preview_dpi:
@@ -1251,6 +1530,10 @@ class RollScanService:
 
         if plan_path.exists():
             plan = _read_plan(plan_path)
+            if identity is not None and plan.identity != identity:
+                raise ValueError("roll identity differs from the saved roll plan")
+            if plan.calibration_context != context_records:
+                raise ValueError("calibration context differs from the saved roll plan")
             if plan.device_id != device_id:
                 raise ValueError(f"roll plan belongs to {plan.device_id!r}, not {device_id!r}")
             if tuple(record.frame for record in plan.frames) != selected:
@@ -1273,7 +1556,10 @@ class RollScanService:
                 )
                 _atomic_write_json(plan_path, plan.to_dict())
         else:
+            if identity is None:
+                identity = PlanIdentity(str(uuid4()), str(uuid4()), str(uuid4()))
             plan = RollScanPlan(
+                identity=identity,
                 device_id=device_id,
                 stage=RollStage.WIDE_PREVIEW,
                 approved=False,
@@ -1282,6 +1568,7 @@ class RollScanService:
                 preview_recipe=preview_recipe,
                 registration_signature=registration_signature,
                 visual_override_frames=(),
+                calibration_context=context_records,
                 frames=tuple(RollFrameRecord(frame=frame) for frame in selected),
             )
             _atomic_write_json(plan_path, plan.to_dict())
@@ -1295,6 +1582,8 @@ class RollScanService:
                 existing_wide,
                 shape=record.wide_rgb_shape,
                 dtype=record.wide_dtype,
+                sha256_digest=record.wide_sha256,
+                dpi=record.wide_dpi,
             ):
                 wide_arrays[frame] = tifffile.imread(existing_wide)
                 continue
@@ -1312,7 +1601,10 @@ class RollScanService:
                 transfer_cancel,
             )
             wide_path = self._write_preview(result, root / "wide" / f"frame{frame:03d}.tif")
-            wide_rgb_shape, wide_dtype = _tiff_signature(root / wide_path)
+            wide_rgb_shape, wide_dtype, wide_sha256, wide_dpi = _preview_signature(
+                root / wide_path,
+                dpi=preview_params.dpi,
+            )
             # Registration always consumes the committed TIFF representation.
             # The writer promotes 8-bit scans to uint16, so using result.rgb
             # here would mix uint8 and uint16 scales after a partial resume.
@@ -1322,6 +1614,8 @@ class RollScanService:
                 wide_path=wide_path,
                 wide_rgb_shape=wide_rgb_shape,
                 wide_dtype=wide_dtype,
+                wide_sha256=wide_sha256,
+                wide_dpi=wide_dpi,
             )
             plan = replace(
                 plan,
@@ -1332,17 +1626,19 @@ class RollScanService:
             if stop.is_set():
                 return plan
 
-        registrations = dict(self._registration.calibrate(wide_arrays))
-        if set(registrations) != set(selected):
-            raise RuntimeError("registration did not return exactly the requested frames")
+        calibration_arrays = {frame: np.asarray(context[frame]) for frame in sorted(context)}
+        calibration_arrays.update(wide_arrays)
+        registrations = dict(self._registration.calibrate(calibration_arrays))
+        if set(registrations) != set(calibration_arrays):
+            raise RuntimeError("registration did not return exactly the calibration frames")
 
         for index, frame in enumerate(selected):
             registration = registrations[frame]
             if registration.frame != frame:
                 raise RuntimeError(f"registration frame mismatch: expected {frame}, got {registration.frame}")
-            if registration.geometry.frame not in (None, frame):
+            if registration.geometry.frame not in (None, frame, frame - 1):
                 raise RuntimeError(f"geometry frame mismatch: expected {frame}, got {registration.geometry.frame}")
-            geometry = registration.geometry if registration.geometry.frame == frame else replace(registration.geometry, frame=frame)
+            geometry = replace(registration.geometry, frame=frame) if registration.geometry.frame is None else registration.geometry
             registration = replace(registration, geometry=geometry)
             record = records[index]
             if record.registration != registration:
@@ -1352,6 +1648,8 @@ class RollScanService:
                     aligned_path=None,
                     aligned_rgb_shape=None,
                     aligned_dtype=None,
+                    aligned_sha256=None,
+                    aligned_dpi=None,
                     verification=None,
                     fine_path=None,
                     fine_rgb_shape=None,
@@ -1384,6 +1682,8 @@ class RollScanService:
                     record.aligned_path,
                     record.aligned_rgb_shape,
                     record.aligned_dtype,
+                    record.aligned_sha256,
+                    record.aligned_dpi,
                     record.verification,
                 )
             ):
@@ -1392,6 +1692,8 @@ class RollScanService:
                     aligned_path=None,
                     aligned_rgb_shape=None,
                     aligned_dtype=None,
+                    aligned_sha256=None,
+                    aligned_dpi=None,
                     verification=None,
                 )
                 records[index] = record
@@ -1405,7 +1707,7 @@ class RollScanService:
                 return plan
             params = replace(
                 preview_params,
-                frame=frame,
+                frame=registration.geometry.frame or frame,
                 registered_geometry=registration.geometry,
             )
             result = self._scanner.run_scan(
@@ -1415,7 +1717,10 @@ class RollScanService:
                 transfer_cancel,
             )
             aligned_path = self._write_preview(result, root / "aligned" / f"frame{frame:03d}.tif")
-            aligned_rgb_shape, aligned_dtype = _tiff_signature(root / aligned_path)
+            aligned_rgb_shape, aligned_dtype, aligned_sha256, aligned_dpi = _preview_signature(
+                root / aligned_path,
+                dpi=preview_params.dpi,
+            )
             aligned_preview = tifffile.imread(root / aligned_path)
             verification = self._registration.verify(frame, aligned_preview, registration)
             records[index] = replace(
@@ -1423,6 +1728,8 @@ class RollScanService:
                 aligned_path=aligned_path,
                 aligned_rgb_shape=aligned_rgb_shape,
                 aligned_dtype=aligned_dtype,
+                aligned_sha256=aligned_sha256,
+                aligned_dpi=aligned_dpi,
                 verification=verification,
             )
             plan = replace(plan, frames=tuple(records))
@@ -1554,7 +1861,7 @@ class RollScanService:
                 raise RuntimeError(f"approved roll plan has no registration for frame {frame}")
             params = replace(
                 fine_params,
-                frame=frame,
+                frame=registration.geometry.frame or frame,
                 registered_geometry=registration.geometry,
             )
             result = self._scanner.run_scan(
@@ -1616,3 +1923,118 @@ class RollScanService:
         plan = replace(plan, stage=stage, frames=tuple(records))
         _atomic_write_json(path, plan.to_dict())
         return plan
+
+    def scan_full_negative(
+        self,
+        *,
+        plan_path: str | Path,
+        output_dir: str | Path,
+        identity: PlanIdentity,
+        fine_params: ScanParams,
+        stop: threading.Event,
+        frames: Sequence[int] | None = None,
+        progress: ProgressCallback | None = None,
+        pitch_rows: int = 5959,
+    ) -> Mapping[int, FullNegativeWorkflowResult]:
+        """Capture approved frames as full-field RGB4x + IR source pairs."""
+
+        from negpy.services.scanning.full_negative_workflow import FullNegativeWorkflow
+
+        path = Path(plan_path).expanduser().resolve()
+        plan = _read_plan(path)
+        if plan.registration_signature != self._current_registration_signature():
+            raise ValueError("registration policy differs from the saved roll plan")
+        if not plan.approved or plan.stage not in (RollStage.APPROVED, RollStage.COMPLETE):
+            raise RuntimeError("full-negative scan refused: approve the aligned previews first")
+        if identity != plan.identity:
+            raise RuntimeError("full-negative identity does not match the exact approved roll plan")
+        if not plan.device_id.startswith("coolscan3:"):
+            raise RuntimeError("full-negative capture currently requires a direct coolscan3 device")
+        invalid_previews = [record.frame for record in plan.frames if not _aligned_record_valid(path.parent, record)]
+        if invalid_previews:
+            joined = ", ".join(str(frame) for frame in invalid_previews)
+            raise RuntimeError(f"full-negative scan refused: aligned preview is missing or invalid for frame(s) {joined}")
+        if (
+            fine_params.dpi != 4000
+            or fine_params.depth != 16
+            or not fine_params.capture_ir
+            or fine_params.samples_per_scan != 4
+            or not fine_params.autofocus
+            or not fine_params.auto_exposure
+            or fine_params.area is not None
+        ):
+            raise ValueError("full-negative scan requires 4000 dpi, 16-bit, RGB4x+IR, autofocus, auto-exposure, and area=None")
+
+        available = tuple(record.frame for record in plan.frames)
+        selected = available if frames is None else self._validate_frames(frames)
+        unknown = sorted(set(selected) - set(available))
+        if unknown:
+            raise ValueError("full-negative frames are absent from the approved plan: " + ", ".join(str(frame) for frame in unknown))
+        records = {record.frame: record for record in plan.frames}
+        approval_binding = approved_plan_binding_sha256(plan)
+        output_root = Path(output_dir).expanduser().resolve()
+        checkpoint_path = output_root / "roll-full-negative.json"
+        if checkpoint_path.exists():
+            try:
+                checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"could not read full-negative roll checkpoint: {exc}") from exc
+            if (
+                type(checkpoint) is not dict
+                or checkpoint.get("version") != 1
+                or checkpoint.get("identity") != identity.to_dict()
+                or checkpoint.get("approved_plan_binding_sha256") != approval_binding
+                or checkpoint.get("approved_frames") != list(available)
+                or checkpoint.get("requested_frames") != list(selected)
+            ):
+                raise RuntimeError("full-negative roll checkpoint belongs to a different approved roll plan")
+        workflow = FullNegativeWorkflow(
+            scanner=self._scanner,
+            output_dir=output_dir,
+            identity=identity,
+            approved_plan_binding_sha256=approval_binding,
+            pitch_rows=pitch_rows,
+        )
+        completed: dict[int, FullNegativeWorkflowResult] = {}
+
+        def write_checkpoint() -> None:
+            manifest_hashes = {
+                str(frame): sha256(result.manifest_path.read_bytes()).hexdigest() for frame, result in sorted(completed.items())
+            }
+            completed_frames = sorted(completed)
+            _atomic_write_json(
+                checkpoint_path,
+                {
+                    "version": 1,
+                    "identity": identity.to_dict(),
+                    "approved_plan_binding_sha256": approval_binding,
+                    "approved_frames": list(available),
+                    "requested_frames": list(selected),
+                    "completed_frames": completed_frames,
+                    "complete": completed_frames == list(selected),
+                    "manifest_sha256": manifest_hashes,
+                },
+            )
+
+        write_checkpoint()
+        for frame in selected:
+            if stop.is_set():
+                break
+            registration = records[frame].registration
+            if registration is None:
+                raise RuntimeError(f"approved roll plan has no registration for frame {frame}")
+            completed[frame] = workflow.capture_frame(
+                device_id=plan.device_id,
+                registration=registration,
+                recipe=fine_params,
+                stop=stop,
+                progress=self._progress(progress, RollStage.FINE_SCANNING, frame),
+            )
+            write_checkpoint()
+        if tuple(completed) != selected:
+            missing = sorted(set(selected) - set(completed))
+            raise RuntimeError(
+                "full-negative roll is incomplete; live QC-valid manifests are missing for frame(s) "
+                + ", ".join(str(frame) for frame in missing)
+            )
+        return completed
