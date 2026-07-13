@@ -15,8 +15,26 @@ import tifffile
 from negpy.infrastructure.scanners.result import SplitIrAlignment
 from negpy.infrastructure.scanners.split_alignment_policy import (
     SPLIT_MAX_CHANNEL_SPREAD_PX,
+    SPLIT_MAX_HORIZONTAL_SHIFT_PX,
+    SPLIT_MAX_VERTICAL_SHIFT_PX,
     SPLIT_MIN_ECC,
     SPLIT_MIN_PHASE_RESPONSE,
+    SPLIT_MULTISCALE_HIGH_MIN_RESPONSE,
+    SPLIT_MULTISCALE_LOW_MIN_RESPONSE,
+    SPLIT_MULTISCALE_MAX_CHANNEL_SHIFT_PX,
+    SPLIT_MULTISCALE_MAX_CHANNEL_SPREAD_PX,
+    SPLIT_MULTISCALE_MAX_CROSS_SCALE_DELTA_PX,
+    SPLIT_MULTISCALE_PERIODIC_ALIAS_DOMINANCE,
+    SPLIT_MULTISCALE_PERIODIC_ALIAS_MIN_CHANNELS,
+    SPLIT_MULTISCALE_PERIODIC_ALIAS_MIN_HORIZONTAL_PX,
+    SPLIT_PHASE_ONLY_MAX_CHANNEL_SPREAD_PX,
+    SPLIT_PHASE_ONLY_MAX_SHIFT_PX,
+    SPLIT_PHASE_ONLY_MIN_RESPONSE,
+    SPLIT_TILED_PHASE_MAX_CHANNEL_SPREAD_PX,
+    SPLIT_TILED_PHASE_MAX_SHIFT_PX,
+    SPLIT_TILED_PHASE_MAX_TILE_SPREAD_PX,
+    SPLIT_TILED_PHASE_MIN_MEDIAN_RESPONSE,
+    SPLIT_TILED_PHASE_MIN_SUPPORT,
 )
 
 
@@ -197,6 +215,117 @@ def measure_focus_detail(rgb: np.ndarray) -> FocusDetailTelemetry:
     )
 
 
+def _multiscale_alignment_metrics_confident(alignment: SplitIrAlignment, *, tiled: bool) -> bool:
+    dimensions = alignment.multiscale_max_dimensions
+    shifts_by_scale = alignment.multiscale_channel_shifts_px
+    responses_by_scale = alignment.multiscale_responses
+    scale_count = len(dimensions)
+    if (
+        alignment.estimator_version != 2
+        or scale_count < 2
+        or tuple(sorted(set(dimensions))) != dimensions
+        or len(shifts_by_scale) != scale_count
+        or len(responses_by_scale) != scale_count
+    ):
+        return False
+
+    aggregates: list[tuple[float, float]] = []
+    spreads: list[float] = []
+    for index, (channel_shifts, responses) in enumerate(zip(shifts_by_scale, responses_by_scale, strict=True)):
+        minimum_response = (
+            SPLIT_TILED_PHASE_MIN_MEDIAN_RESPONSE
+            if tiled
+            else (SPLIT_MULTISCALE_LOW_MIN_RESPONSE if index == 0 else SPLIT_MULTISCALE_HIGH_MIN_RESPONSE)
+        )
+        if (
+            len(channel_shifts) != 3
+            or len(responses) != 3
+            or not all(math.isfinite(value) for shift in channel_shifts for value in shift)
+            or not all(math.isfinite(response) and response >= minimum_response for response in responses)
+            or any(max(abs(shift[0]), abs(shift[1])) > SPLIT_MULTISCALE_MAX_CHANNEL_SHIFT_PX for shift in channel_shifts)
+        ):
+            return False
+        spread = max(
+            max(shift[0] for shift in channel_shifts) - min(shift[0] for shift in channel_shifts),
+            max(shift[1] for shift in channel_shifts) - min(shift[1] for shift in channel_shifts),
+        )
+        if spread > SPLIT_MULTISCALE_MAX_CHANNEL_SPREAD_PX:
+            return False
+        spreads.append(spread)
+        aggregates.append(
+            (
+                sum(shift[0] for shift in channel_shifts) / 3.0,
+                sum(shift[1] for shift in channel_shifts) / 3.0,
+            )
+        )
+
+    measured_dx, measured_dy = aggregates[-1]
+    applied_dx = float(round(measured_dx)) if abs(measured_dx - round(measured_dx)) < 0.05 else measured_dx
+    applied_dy = float(round(measured_dy)) if abs(measured_dy - round(measured_dy)) < 0.05 else measured_dy
+    if (
+        max(shift[0] for shift in aggregates) - min(shift[0] for shift in aggregates) > SPLIT_MULTISCALE_MAX_CROSS_SCALE_DELTA_PX
+        or max(shift[1] for shift in aggregates) - min(shift[1] for shift in aggregates) > SPLIT_MULTISCALE_MAX_CROSS_SCALE_DELTA_PX
+        or not math.isclose(alignment.dx_px, applied_dx, abs_tol=1e-6)
+        or not math.isclose(alignment.dy_px, applied_dy, abs_tol=1e-6)
+        or tuple(alignment.phase_responses) != tuple(responses_by_scale[-1])
+        or alignment.channel_spread_px is None
+        or not math.isclose(alignment.channel_spread_px, spreads[-1], abs_tol=1e-6)
+        or alignment.ecc_coefficient is not None
+    ):
+        return False
+    if tiled:
+        support_by_scale = alignment.multiscale_tile_support_counts
+        tile_spreads_by_scale = alignment.multiscale_tile_shift_spreads_px
+        alias_by_scale = alignment.multiscale_global_alias_shifts_px
+        if len(support_by_scale) != scale_count or len(tile_spreads_by_scale) != scale_count or len(alias_by_scale) != scale_count:
+            return False
+        alias_signs: list[int] = []
+        for support, tile_spreads, alias_shifts in zip(
+            support_by_scale,
+            tile_spreads_by_scale,
+            alias_by_scale,
+            strict=True,
+        ):
+            if (
+                len(support) != 3
+                or not all(count >= SPLIT_TILED_PHASE_MIN_SUPPORT for count in support)
+                or len(tile_spreads) != 3
+                or not all(math.isfinite(spread) and spread <= SPLIT_TILED_PHASE_MAX_TILE_SPREAD_PX for spread in tile_spreads)
+                or len(alias_shifts) != 3
+                or not all(math.isfinite(value) for shift in alias_shifts for value in shift)
+            ):
+                return False
+            qualifying_aliases = [
+                dx
+                for dx, dy in alias_shifts
+                if abs(dx) >= SPLIT_MULTISCALE_PERIODIC_ALIAS_MIN_HORIZONTAL_PX
+                and abs(dx) >= SPLIT_MULTISCALE_PERIODIC_ALIAS_DOMINANCE * max(abs(dy), 1.0)
+            ]
+            if len(qualifying_aliases) < SPLIT_MULTISCALE_PERIODIC_ALIAS_MIN_CHANNELS:
+                return False
+            signs = {1 if dx > 0.0 else -1 for dx in qualifying_aliases}
+            if len(signs) != 1:
+                return False
+            alias_signs.append(signs.pop())
+        return (
+            len(set(alias_signs)) == 1
+            and tuple(alignment.tile_support_counts) == tuple(support_by_scale[-1])
+            and alignment.tile_shift_spread_px is not None
+            and math.isclose(
+                alignment.tile_shift_spread_px,
+                max(tile_spreads_by_scale[-1]),
+                abs_tol=1e-6,
+            )
+        )
+    return (
+        not alignment.tile_support_counts
+        and alignment.tile_shift_spread_px is None
+        and not alignment.multiscale_tile_support_counts
+        and not alignment.multiscale_tile_shift_spreads_px
+        and not alignment.multiscale_global_alias_shifts_px
+    )
+
+
 def split_alignment_metrics_confident(
     alignment: SplitIrAlignment | None,
     *,
@@ -206,24 +335,52 @@ def split_alignment_metrics_confident(
 
     Production already rejected insufficient texture and overlap, plus ECC
     divergence from the phase estimate, before producing this telemetry. Those
-    inputs are not persisted and therefore cannot be revalidated here. When
-    ``image_width`` is supplied, the production same-reservation displacement
-    bound is revalidated as well; omitting it retains metrics-only semantics.
+    inputs are not persisted and therefore cannot be revalidated here.
+    Same-reservation displacement caps are unconditional; ``image_width`` is
+    retained for call-site compatibility with older acceptance code.
     """
 
     if alignment is None or not all(math.isfinite(value) for value in (alignment.dx_px, alignment.dy_px)):
         return False
-    if image_width is not None:
-        max_shift = max(16.0, image_width * 0.05)
-        if max(abs(alignment.dx_px), abs(alignment.dy_px)) > max_shift:
-            return False
+    if abs(alignment.dx_px) > SPLIT_MAX_HORIZONTAL_SHIFT_PX or abs(alignment.dy_px) > SPLIT_MAX_VERTICAL_SHIFT_PX:
+        return False
     if alignment.mode == "identity":
         return alignment.dx_px == 0.0 and alignment.dy_px == 0.0
-    if alignment.mode != "phase-ecc":
-        return False
     phase_responses = tuple(alignment.phase_responses)
     channel_spread = alignment.channel_spread_px
     ecc = alignment.ecc_coefficient
+    if alignment.mode == "multiscale-global":
+        return _multiscale_alignment_metrics_confident(alignment, tiled=False)
+    if alignment.mode == "multiscale-tiled":
+        return _multiscale_alignment_metrics_confident(alignment, tiled=True)
+    if alignment.mode == "phase-only":
+        return (
+            len(phase_responses) == 3
+            and all(math.isfinite(response) and response >= SPLIT_PHASE_ONLY_MIN_RESPONSE for response in phase_responses)
+            and channel_spread is not None
+            and math.isfinite(channel_spread)
+            and channel_spread <= SPLIT_PHASE_ONLY_MAX_CHANNEL_SPREAD_PX
+            and ecc is not None
+            and math.isfinite(ecc)
+            and ecc >= SPLIT_MIN_ECC
+            and max(abs(alignment.dx_px), abs(alignment.dy_px)) <= SPLIT_PHASE_ONLY_MAX_SHIFT_PX
+        )
+    if alignment.mode == "tiled-phase":
+        return (
+            len(phase_responses) == 3
+            and all(math.isfinite(response) and response >= SPLIT_TILED_PHASE_MIN_MEDIAN_RESPONSE for response in phase_responses)
+            and channel_spread is not None
+            and math.isfinite(channel_spread)
+            and channel_spread <= SPLIT_TILED_PHASE_MAX_CHANNEL_SPREAD_PX
+            and len(alignment.tile_support_counts) == 3
+            and all(count >= SPLIT_TILED_PHASE_MIN_SUPPORT for count in alignment.tile_support_counts)
+            and alignment.tile_shift_spread_px is not None
+            and math.isfinite(alignment.tile_shift_spread_px)
+            and alignment.tile_shift_spread_px <= SPLIT_TILED_PHASE_MAX_TILE_SPREAD_PX
+            and max(abs(alignment.dx_px), abs(alignment.dy_px)) <= SPLIT_TILED_PHASE_MAX_SHIFT_PX
+        )
+    if alignment.mode != "phase-ecc":
+        return False
     return (
         len(phase_responses) == 3
         and all(math.isfinite(response) and response >= SPLIT_MIN_PHASE_RESPONSE for response in phase_responses)

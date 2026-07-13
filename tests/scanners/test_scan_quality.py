@@ -1,5 +1,7 @@
 """Public scanner-quality contracts shared by acceptance and roll workflows."""
 
+from dataclasses import replace
+
 import cv2
 import numpy as np
 import tifffile
@@ -199,7 +201,132 @@ def test_split_alignment_metric_confidence_matches_the_recorded_capture_metrics(
     assert split_alignment_metrics_confident(SplitIrAlignment(mode="identity", dx_px=0.01, dy_px=0.0)) is False
 
 
-def test_split_alignment_metric_confidence_without_width_is_metrics_only() -> None:
+def test_split_alignment_metric_confidence_accepts_only_strict_near_zero_phase_only_evidence() -> None:
+    accepted = SplitIrAlignment(
+        mode="phase-only",
+        dx_px=0.2,
+        dy_px=-0.1,
+        phase_responses=(0.52, 0.54, 0.55),
+        channel_spread_px=0.03,
+        ecc_coefficient=0.90,
+    )
+
+    assert split_alignment_metrics_confident(accepted, image_width=3946) is True
+    assert split_alignment_metrics_confident(replace(accepted, phase_responses=(0.49, 0.54, 0.55)), image_width=3946) is False
+    assert split_alignment_metrics_confident(replace(accepted, channel_spread_px=0.101), image_width=3946) is False
+    assert split_alignment_metrics_confident(replace(accepted, dx_px=2.01), image_width=3946) is False
+
+
+def test_split_alignment_metric_confidence_accepts_only_supported_tiled_phase_consensus() -> None:
+    accepted = SplitIrAlignment(
+        mode="tiled-phase",
+        dx_px=-0.2,
+        dy_px=0.1,
+        phase_responses=(0.45, 0.46, 0.44),
+        channel_spread_px=0.10,
+        tile_support_counts=(8, 6, 8),
+        tile_shift_spread_px=0.25,
+    )
+
+    assert split_alignment_metrics_confident(accepted, image_width=3946) is True
+    assert split_alignment_metrics_confident(replace(accepted, tile_support_counts=(8, 5, 8)), image_width=3946) is False
+    assert split_alignment_metrics_confident(replace(accepted, tile_shift_spread_px=0.351), image_width=3946) is False
+    assert split_alignment_metrics_confident(replace(accepted, phase_responses=(0.39, 0.46, 0.44)), image_width=3946) is False
+
+
+def test_split_alignment_metric_confidence_revalidates_multiscale_global_evidence() -> None:
+    accepted = SplitIrAlignment(
+        mode="multiscale-global",
+        dx_px=0.10,
+        dy_px=0.0,
+        phase_responses=(0.45, 0.46, 0.44),
+        channel_spread_px=0.02,
+        estimator_version=2,
+        multiscale_max_dimensions=(1024, 2048),
+        multiscale_channel_shifts_px=(
+            ((0.18, -0.06), (0.16, -0.04), (0.17, -0.05)),
+            ((0.10, -0.05), (0.11, -0.04), (0.09, -0.06)),
+        ),
+        multiscale_responses=((0.35, 0.36, 0.34), (0.45, 0.46, 0.44)),
+    )
+
+    assert split_alignment_metrics_confident(accepted, image_width=3946) is True
+    assert (
+        split_alignment_metrics_confident(
+            replace(accepted, multiscale_responses=((0.29, 0.36, 0.34), (0.45, 0.46, 0.44))),
+            image_width=3946,
+        )
+        is False
+    )
+
+
+def test_split_alignment_metric_confidence_revalidates_multiscale_tiled_and_alias_evidence() -> None:
+    accepted = SplitIrAlignment(
+        mode="multiscale-tiled",
+        dx_px=0.10,
+        dy_px=0.0,
+        phase_responses=(0.45, 0.46, 0.44),
+        channel_spread_px=0.02,
+        tile_support_counts=(8, 6, 7),
+        tile_shift_spread_px=0.30,
+        estimator_version=2,
+        multiscale_max_dimensions=(1024, 2048),
+        multiscale_channel_shifts_px=(
+            ((0.18, -0.06), (0.16, -0.04), (0.17, -0.05)),
+            ((0.10, -0.05), (0.11, -0.04), (0.09, -0.06)),
+        ),
+        multiscale_responses=((0.45, 0.46, 0.44), (0.45, 0.46, 0.44)),
+        multiscale_tile_support_counts=((8, 7, 8), (8, 6, 7)),
+        multiscale_tile_shift_spreads_px=((0.25, 0.30, 0.28), (0.20, 0.30, 0.25)),
+        multiscale_global_alias_shifts_px=(
+            ((-582.0, 0.1), (-581.5, -0.1), (0.1, 0.0)),
+            ((-582.1, 0.0), (-581.7, -0.1), (0.0, 0.0)),
+        ),
+    )
+
+    assert split_alignment_metrics_confident(accepted, image_width=3946) is True
+    assert (
+        split_alignment_metrics_confident(
+            replace(accepted, multiscale_tile_support_counts=((8, 5, 8), (8, 6, 7))),
+            image_width=3946,
+        )
+        is False
+    )
+    assert (
+        split_alignment_metrics_confident(
+            replace(accepted, multiscale_global_alias_shifts_px=()),
+            image_width=3946,
+        )
+        is False
+    )
+    assert (
+        split_alignment_metrics_confident(
+            replace(
+                accepted,
+                multiscale_channel_shifts_px=(
+                    ((0.40, -0.06), (0.39, -0.04), (0.41, -0.05)),
+                    ((0.10, -0.05), (0.11, -0.04), (0.09, -0.06)),
+                ),
+            ),
+            image_width=3946,
+        )
+        is False
+    )
+    numerically_snapped = replace(
+        accepted,
+        dx_px=0.0,
+        dy_px=0.0,
+        phase_responses=(0.45, 0.46, 0.44),
+        channel_spread_px=0.02,
+        multiscale_channel_shifts_px=(
+            ((0.13, 0.00), (0.11, 0.01), (0.12, -0.01)),
+            ((0.03, 0.00), (0.04, 0.01), (0.02, -0.01)),
+        ),
+    )
+    assert split_alignment_metrics_confident(numerically_snapped, image_width=3946) is True
+
+
+def test_split_alignment_metric_confidence_enforces_same_reservation_caps_without_width() -> None:
     alignment = SplitIrAlignment(
         mode="phase-ecc",
         dx_px=1_000_000.0,
@@ -209,20 +336,22 @@ def test_split_alignment_metric_confidence_without_width_is_metrics_only() -> No
         ecc_coefficient=0.9,
     )
 
-    assert split_alignment_metrics_confident(alignment) is True
+    assert split_alignment_metrics_confident(alignment) is False
 
 
 def test_split_alignment_metric_confidence_with_width_enforces_production_shift_bound() -> None:
-    def _alignment(dx_px: float) -> SplitIrAlignment:
+    def _alignment(dx_px: float, dy_px: float = 0.0) -> SplitIrAlignment:
         return SplitIrAlignment(
             mode="phase-ecc",
             dx_px=dx_px,
-            dy_px=0.0,
+            dy_px=dy_px,
             phase_responses=(0.20, 0.25, 0.30),
             channel_spread_px=0.5,
             ecc_coefficient=0.9,
         )
 
-    assert split_alignment_metrics_confident(_alignment(50.0), image_width=1000) is True
-    assert split_alignment_metrics_confident(_alignment(50.01), image_width=1000) is False
+    assert split_alignment_metrics_confident(_alignment(2.0), image_width=1000) is True
+    assert split_alignment_metrics_confident(_alignment(2.01), image_width=1000) is False
+    assert split_alignment_metrics_confident(_alignment(0.0, 8.0), image_width=1000) is True
+    assert split_alignment_metrics_confident(_alignment(0.0, 8.01), image_width=1000) is False
     assert split_alignment_metrics_confident(_alignment(1_000_000.0), image_width=1000) is False
