@@ -5,7 +5,7 @@ from typing import List, NamedTuple, Optional, Tuple
 import cv2
 import numpy as np
 
-from negpy.domain.models import AspectRatio, FILM_FORMAT_RATIOS
+from negpy.domain.models import AspectRatio
 from negpy.domain.types import ROI, ImageBuffer
 from negpy.features.geometry.models import FINE_ROTATION_LIMIT, AutocropMode, GeometryConfig
 from negpy.kernel.image.logic import get_luminance
@@ -368,11 +368,8 @@ def _odd_kernel_size(value: float, lower: int, upper: int) -> int:
 
 
 def _outer_ring_values(lum: np.ndarray) -> np.ndarray:
-    # 2% not 5%: a tightly framed scan leaves only 1-3% of bed around the film, so a
-    # wider ring reads mostly film, fails the ring_delta gate in
-    # _oriented_boundary_evidence, and abstains on an otherwise perfect box.
     h, w = lum.shape[:2]
-    ring_width = max(2, round(0.02 * min(h, w)))
+    ring_width = max(2, round(0.05 * min(h, w)))
     ring_width = min(ring_width, max(1, min(h, w) // 2))
     parts = [lum[:ring_width, :].reshape(-1), lum[-ring_width:, :].reshape(-1)]
     if h > 2 * ring_width:
@@ -933,103 +930,6 @@ def _detection_luma(img: np.ndarray) -> np.ndarray:
     return np.clip(lum / max(anchor, 1e-6), 0.0, 2.0)
 
 
-BORDER_SIDES: Tuple[str, ...] = ("top", "bottom", "left", "right")
-
-# Walk cap per side, as a fraction of that side. Real rebate plus bed slop runs under
-# ~3%; reaching the cap means the profile never came back down, i.e. bright picture
-# content touches that edge. Those sides report NaN so pooling can ignore them.
-_BORDER_WALK_CAP = 0.06
-_BORDER_MIN_SEPARATION = 0.15
-
-
-def measure_film_border(lum: np.ndarray, film_roi: ROI) -> dict[str, float]:
-    """
-    Per-side thickness of the bright border (rebate + bed slop) just inside a film box,
-    as a fraction of that side's length.
-
-    Measurement only, no keep/cut decision: a single frame cannot tell a rebate from a
-    bright sky reaching the frame edge. Callers pool these across a roll and take the
-    median. A side with no clean border->image transition reports NaN.
-    """
-    y1, y2, x1, x2 = film_roi
-    box = lum[y1:y2, x1:x2]
-    bh, bw = box.shape[:2]
-    if bh < 16 or bw < 16:
-        return {name: float("nan") for name in BORDER_SIDES}
-
-    image_level = float(np.percentile(box, 40))
-    row_profile = box.mean(axis=1)
-    col_profile = box.mean(axis=0)
-
-    result: dict[str, float] = {}
-    for name in BORDER_SIDES:
-        profile, length = (row_profile, bh) if name in ("top", "bottom") else (col_profile, bw)
-        walk = profile[::-1] if name in ("bottom", "right") else profile
-        # A 1-2 px border is too few samples for a median; use a high percentile.
-        outer = walk[: max(2, round(0.03 * length))]
-        base = float(np.percentile(outer, 90))
-        if base - image_level < _BORDER_MIN_SEPARATION:
-            result[name] = 0.0  # no bright border on this side (full-bleed edge)
-            continue
-        threshold = 0.5 * (base + image_level)
-        cap = max(3, int(_BORDER_WALK_CAP * length))
-        head = walk[:cap]
-        # From the brightest sample, not index 0: the box edge usually carries a sliver
-        # of bed that ramps up into the rebate, and a walk starting there is already
-        # under the threshold and reports zero on a side that has a border.
-        peak = int(np.argmax(head))
-        if head[peak] <= threshold:
-            result[name] = 0.0  # no bright border on this side (full-bleed edge)
-            continue
-        below = np.flatnonzero(head[peak:] <= threshold)
-        result[name] = float("nan") if below.size == 0 else float(peak + int(below[0])) / length
-    return result
-
-
-_OPPOSITE_SIDE = {"top": "bottom", "bottom": "top", "left": "right", "right": "left"}
-
-
-def _roi_from_measured_border(lum: np.ndarray, film_roi: ROI) -> ROI | None:
-    """
-    Inset a film box by its own measured border, for frames the tier path cannot read.
-
-    Requires an opposite pair to agree before trimming, like _find_rebate_level: a lone
-    bright side is usually a uniform scene region, and trusting it carves the picture
-    down to a dark subject.
-    """
-    measured = measure_film_border(lum, film_roi)
-    y1, y2, x1, x2 = film_roi
-    height, width = y2 - y1, x2 - x1
-
-    # Cap against the opposite side: one over-long walk must not cut deep on the strength
-    # of a much smaller reading across the same gate.
-    insets: dict[str, float] = {}
-    for name in BORDER_SIDES:
-        own, opposite = measured[name], measured[_OPPOSITE_SIDE[name]]
-        if not np.isfinite(own):
-            own = opposite
-        if not np.isfinite(own):
-            insets[name] = 0.0
-            continue
-        if own > 0.0 and np.isfinite(opposite) and opposite > 0.0:
-            own = min(own, 2.0 * opposite)
-        insets[name] = float(own)
-
-    paired = any(insets[first] > 0.0 and insets[second] > 0.0 for first, second in (("top", "bottom"), ("left", "right")))
-    if not paired:
-        return None
-
-    roi = (
-        y1 + round(insets["top"] * height),
-        y2 - round(insets["bottom"] * height),
-        x1 + round(insets["left"] * width),
-        x2 - round(insets["right"] * width),
-    )
-    if roi[1] <= roi[0] or roi[3] <= roi[2]:
-        return None
-    return roi
-
-
 def _find_rebate_level(lum: np.ndarray, film_roi: ROI) -> Optional[Tuple[float, float]]:
     """
     Searches the four border strips inside the film box for a rebate plateau:
@@ -1146,16 +1046,9 @@ def _snap_edge_to_gradient(
     window = grad[lo:hi]
     if window.size == 0:
         return idx
-    peak = float(np.max(window))
-    if peak >= min_dominance * float(np.median(window)) + 1e-6:
-        # Box smoothing turns a sharp step into a nearly flat gradient plateau.
-        # Picking the first raw maximum makes sub-ULP OpenCV/SIMD differences move
-        # the snapped edge by several pixels across resolutions and platforms.
-        # Treat numerically equivalent maxima as one peak and keep the transition
-        # nearest the coarse contour edge instead.
-        near_peak = np.flatnonzero(np.isclose(window, peak, rtol=1e-5, atol=1e-7))
-        transitions = lo + near_peak + 1
-        return int(transitions[np.argmin(np.abs(transitions - idx))])
+    m = int(np.argmax(window))
+    if window[m] >= min_dominance * float(np.median(window)) + 1e-6:
+        return lo + m + 1
     return idx
 
 
@@ -1229,17 +1122,13 @@ def _refine_film_roi_by_tiers(lum: np.ndarray, film_roi: ROI) -> Optional[Tuple[
 def _refine_roi_to_image(img: ImageBuffer, film_roi: ROI) -> Tuple[ROI, Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Refines a film-extent ROI inward to the exposed image area (rebate excluded).
-    Tier-based refinement first, then the per-side border measurement, then Sobel.
+    Tier-based refinement first; Sobel gradient refinement as fallback.
     Returns (roi, row_occupancy | None, col_occupancy | None).
     """
     lum = _detection_luma(img)
     refined = _refine_film_roi_by_tiers(lum, film_roi)
     if refined is not None:
         return refined
-
-    measured = _roi_from_measured_border(lum, film_roi)
-    if measured is not None:
-        return measured, None, None
 
     if _find_rebate_level(lum, film_roi) is None:
         # No uniform rebate plateau on any side = image content runs to the film
@@ -1472,28 +1361,6 @@ def apply_margin_to_roi(
     return int(max(0, ny1)), int(min(h, ny2)), int(max(0, nx1)), int(min(w, nx2))
 
 
-def scale_roi_inset(film_roi: ROI, roi: ROI, factor: float) -> ROI:
-    """
-    Scales how far a refined ROI sits inside its film box; 1.0 leaves it untouched.
-
-    Applied to the result of every refinement route so Rebate Trim means one thing.
-    Inert when the two boxes are equal (Film mode, and detections never refined).
-    """
-    if factor == 1.0:
-        return roi
-    fy1, fy2, fx1, fx2 = film_roi
-    y1, y2, x1, x2 = roi
-    scaled = (
-        fy1 + round((y1 - fy1) * factor),
-        fy2 - round((fy2 - y2) * factor),
-        fx1 + round((x1 - fx1) * factor),
-        fx2 - round((fx2 - x2) * factor),
-    )
-    if scaled[1] <= scaled[0] or scaled[3] <= scaled[2]:
-        return roi
-    return scaled
-
-
 def _resolve_ratio_dims(cw: int, ch: int, target_ratio_str: str) -> Tuple[float, float]:
     """
     Returns (target_w, target_h) <= (cw, ch) for the orientation-corrected ratio.
@@ -1664,14 +1531,12 @@ def get_autocrop_coords(
     assist_point: Optional[Tuple[float, float]] = None,
     assist_luma: Optional[float] = None,
     mode: str = AutocropMode.IMAGE,
-    rebate_trim: float = 1.0,
 ) -> ROI:
     """
     Detects film border via density thresholding.
 
     mode="film" crops to the film extent (rebate/sprockets kept);
-    mode="image" refines inward to the exposed image area, by rebate_trim of the way
-    (1.0 = the detected image edge).
+    mode="image" refines inward to the exposed image area.
     """
     h, w = img.shape[:2]
     det, det_scale = _normalize_detection_input(img, detect_res)
@@ -1690,7 +1555,6 @@ def get_autocrop_coords(
     else:
         roi, row_occ, col_occ = _refine_roi_to_image(det, film_roi)
 
-    roi = scale_roi_inset(film_roi, roi, rebate_trim)
     roi = _scale_roi(roi, det_scale, h, w)
 
     ratio_str = target_ratio_str
@@ -1930,12 +1794,10 @@ def _closest_standard_ratio(roi: ROI, img_shape: Tuple[int, int], fallback: str 
     detected = cw / ch
     is_landscape = cw >= ch
 
-    # FILM_FORMAT_RATIOS, not the full AspectRatio enum: the crop-ratio picker's
-    # print/screen sizes (7:5, 16:9, 16:10, 8.5:11) aren't formats a camera/scanner
-    # produces, and sit close enough to 3:2/5:4 in log-ratio space that including
-    # them here made ordinary detection noise on a real 3:2 frame misclassify it.
     candidates: list[tuple[AspectRatio, float]] = []
-    for ratio in FILM_FORMAT_RATIOS:
+    for ratio in AspectRatio:
+        if ratio in (AspectRatio.FREE, AspectRatio.ORIGINAL):
+            continue
         try:
             w_r, h_r = map(float, ratio.value.split(":"))
         except ValueError:

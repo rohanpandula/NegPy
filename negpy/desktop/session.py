@@ -3,17 +3,13 @@ import re
 import threading
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 from PyQt6.QtCore import QAbstractListModel, QModelIndex, QObject, Qt, pyqtSignal
 
-from negpy.desktop.settings_catalog import apply_selected_fields
 from negpy.desktop.view.canvas.crop_guides import CropGuide
 from negpy.domain.models import ExportPreset, WorkspaceConfig
-from negpy.features.exposure.models import apply_targets
 from negpy.features.rgbscan.models import RgbScanConfig
-from negpy.features.stitch.models import StitchConfig
-from negpy.infrastructure.display.color_spaces import WORKING_COLOR_SPACE
 from negpy.infrastructure.storage.repository import StorageRepository
 from negpy.kernel.system.config import APP_CONFIG
 from negpy.services.assets.sidecar import load_or_promote
@@ -40,7 +36,7 @@ class AppState:
     current_file_hash: Optional[str] = None
     source_cs: str = ""
     config: WorkspaceConfig = field(default_factory=WorkspaceConfig)
-    workspace_color_space: str = WORKING_COLOR_SPACE
+    workspace_color_space: str = "Adobe RGB"
     is_processing: bool = False
     active_tool: ToolMode = ToolMode.NONE
     # Colour page region (0 Global, 1 Shadows, 2 Highlights): scopes the WB
@@ -48,9 +44,6 @@ class AppState:
     wb_pick_region: int = 0
     uploaded_files: List[Dict[str, Any]] = field(default_factory=list)
     thumbnails: Dict[str, Any] = field(default_factory=dict)  # filename -> QIcon/QPixmap
-    # Names whose thumbnail came from a canvas render (correct, inverted); the batch
-    # generator must not overwrite these with its cheaper source-decode placeholder.
-    rendered_thumbnails: Set[str] = field(default_factory=set)
     source_exif: Dict[str, Any] = field(default_factory=dict)  # file_hash -> piexif dict
     selected_file_idx: int = -1
     selected_indices: List[int] = field(default_factory=list)
@@ -60,7 +53,6 @@ class AppState:
     preview_raw: Optional[Any] = None
     preview_ir: Optional[Any] = None  # downsampled IR float32 [0,1] (H,W); None if source has no IR
     has_ir: bool = False
-    ir_degenerate: bool = False  # IR plane carries image content (B&W/Kodachrome) → IR restore disabled
     original_res: tuple[int, int] = (0, 0)
     clipboard: Optional[WorkspaceConfig] = None
 
@@ -95,41 +87,13 @@ class AppState:
     crop_guide: str = "thirds"
     crop_guide_orientation: int = 0
 
-    # Dust-detection overlay mode ("off"|"spots"|"marked"|"ir"); display-only,
-    # session-only diagnostic — never persisted.
-    dust_overlay_mode: str = "off"
-
-    # Adams-zone box overlay on the canvas; display-only, session-only — never persisted.
-    zones_overlay: bool = False
-
-    # Grain focuser: 1:1-ish loupe following the cursor; display-only, session-only.
-    grain_focuser: bool = False
-
-    # Density x grade test strip: session-only proof, dropped by any real render. The
-    # mosaic is the assembled patches at preview resolution, content_rect its picture area.
-    # `mosaics` is one per quarter-turn, `mosaic` the one on screen; rotating swaps between them.
-    test_strip: bool = False
-    test_strip_pending: bool = False
-    test_strip_mosaic: Optional[Any] = None
-    test_strip_mosaics: Optional[tuple] = None
-    test_strip_content_rect: Optional[tuple] = None
-    # Which proof owns the canvas: "tone" (density × grade) or "colour" (M/Y ring-around).
-    # One slot, so every path that drops a proof drops both kinds.
-    test_strip_kind: str = "tone"
-    # Quarter-turns CCW the ladder is turned by. Shared by both kinds and kept across clear and
-    # reprint, so a chosen orientation sticks for the session.
-    test_strip_rotation: int = 0
-
     # Reverse scroll-wheel zoom direction on the image viewer (scroll up = zoom out).
     invert_zoom_scroll: bool = False
 
     # Local adjustments UI state (not persisted in workspace config)
     local_selected_mask: int = -1
-    # Per-file sets of mask indices whose outline is hidden on the canvas (keyed by
-    # content hash; empty/absent = all shown). Persisted as the "hidden_masks_by_hash"
-    # global setting (written through on every toggle) and reloaded on launch. Read the
-    # current file's set via the local_hidden_masks property below.
-    local_hidden_masks_by_hash: dict = field(default_factory=dict)
+    # Indices of masks whose outline is hidden on the canvas; empty = all shown.
+    local_hidden_masks: set = field(default_factory=set)
 
     # History tracking
     undo_index: int = 0
@@ -150,29 +114,9 @@ class AppState:
     # Flat "for editing elsewhere" master output (digital intermediate).
     # When on, export and the optional preview-peek use the flat render intent.
     flat_output: bool = False
+    flat_format: str = "TIFF"  # "TIFF" (16-bit) or "DNG" (linear)
     # Transient: preview is currently peeking the flat render (not persisted).
     flat_peek: bool = False
-
-    @property
-    def local_hidden_masks(self) -> set:
-        """The current file's hidden-mask indices (empty = all shown). Returns a fresh,
-        clamped copy: indices outside the current mask list are dropped, so a config swap
-        that shrinks the mask count (undo/redo/jump-to-step) can't leave stale entries
-        pointing past the end. Assign a set to update the current file's stored entry."""
-        stored = self.local_hidden_masks_by_hash.get(self.current_file_hash, ())
-        n = len(self.config.local.masks)
-        return {i for i in stored if 0 <= i < n}
-
-    @local_hidden_masks.setter
-    def local_hidden_masks(self, value: set) -> None:
-        h = self.current_file_hash
-        if h is None:
-            return
-        # Keep the store free of empty sets so "all shown" is a missing key, not {}.
-        if value:
-            self.local_hidden_masks_by_hash[h] = set(value)
-        else:
-            self.local_hidden_masks_by_hash.pop(h, None)
 
 
 class AssetListModel(QAbstractListModel):
@@ -188,7 +132,6 @@ class AssetListModel(QAbstractListModel):
         self._filter_text: str = ""
         self._filter_regex: bool = False
         self._filter_pattern: Optional[re.Pattern] = None
-        self._sheet_filter: str = "all"  # "all" | "keepers" | "unrejected"
         self._sorted_indices: list[int] = []
         self._rebuild_indices()
 
@@ -215,23 +158,7 @@ class AssetListModel(QAbstractListModel):
                 needle = self._filter_text
                 indices = [i for i in indices if needle in files[i]["name"].lower()]
 
-        if self._sheet_filter == "keepers":
-            indices = [i for i in indices if files[i].get("keeper")]
-        elif self._sheet_filter == "unrejected":
-            indices = [i for i in indices if not files[i].get("excluded")]
-
         self._sorted_indices = indices
-
-    def set_sheet_filter(self, mode: str) -> None:
-        if mode not in ("all", "keepers", "unrejected"):
-            mode = "all"
-        self._sheet_filter = mode
-        self._rebuild_indices()
-        self.layoutChanged.emit()
-
-    @property
-    def sheet_filter(self) -> str:
-        return self._sheet_filter
 
     def set_sort_order(self, order: str) -> None:
         self._sort_order = order
@@ -304,19 +231,27 @@ class AssetListModel(QAbstractListModel):
             return self._state.thumbnails.get(file_info["name"])
 
         if role == Qt.ItemDataRole.ToolTipRole:
-            failed = file_info.get("decode_failed")
-            if failed:
-                return f"{file_info['path']}\nFailed to load: {failed}\nClick to retry."
             return file_info["path"]
-
-        if role == Qt.ItemDataRole.UserRole:
-            return file_info
 
         return None
 
     def refresh(self) -> None:
         self._rebuild_indices()
         self.layoutChanged.emit()
+
+
+_ASPECT_LABELS = {
+    "process": "Process",
+    "crop": "Crop",
+    "rotation": "Rotation",
+    "exposure": "Exposure",
+    "color": "Color",
+    "finish": "Finish",
+    "bounds_luma": "Tonal span",
+    "bounds_colour": "Colour balance",
+}
+
+_VALID_ASPECTS = frozenset(_ASPECT_LABELS)
 
 
 def _source_effective_bounds(process) -> Optional[tuple]:
@@ -332,6 +267,95 @@ def _source_effective_bounds(process) -> Optional[tuple]:
     return None
 
 
+def build_synced_config(
+    source: WorkspaceConfig,
+    target: WorkspaceConfig,
+    aspects: frozenset,
+    src_bounds: Optional[tuple],
+) -> WorkspaceConfig:
+    """Pure per-target merge for a bulk "Apply to selected" action.
+
+    `aspects` is a subset of _VALID_ASPECTS, checked independently in the Sync
+    Settings dialog. `src_bounds` is (floors, ceils) from _source_effective_bounds,
+    needed when bounds_luma/bounds_colour is checked. Builds the result by starting
+    from `target` and overlaying only the checked aspects, so anything not covered
+    by an aspect (flatfield, rgbscan, metadata, export, dust spots, per-frame local
+    bounds) always stays the target's own.
+    """
+    out = target
+
+    if "process" in aspects:
+        out = replace(
+            out,
+            process=replace(
+                source.process,
+                local_floors=out.process.local_floors,
+                local_ceils=out.process.local_ceils,
+                locked_floors=out.process.locked_floors,
+                locked_ceils=out.process.locked_ceils,
+                use_luma_average=out.process.use_luma_average,
+                use_colour_average=out.process.use_colour_average,
+            ),
+        )
+
+    if "crop" in aspects:
+        sg = source.geometry
+        out = replace(
+            out,
+            geometry=replace(
+                out.geometry,
+                auto_crop_enabled=sg.auto_crop_enabled,
+                autocrop_offset=sg.autocrop_offset,
+                autocrop_ratio=sg.autocrop_ratio,
+                autocrop_mode=sg.autocrop_mode,
+                manual_crop_rect=sg.manual_crop_rect,
+            ),
+        )
+
+    if "rotation" in aspects:
+        sg = source.geometry
+        out = replace(
+            out,
+            geometry=replace(
+                out.geometry,
+                rotation=sg.rotation,
+                fine_rotation=sg.fine_rotation,
+                flip_horizontal=sg.flip_horizontal,
+                flip_vertical=sg.flip_vertical,
+            ),
+        )
+
+    if "exposure" in aspects:
+        out = replace(out, exposure=source.exposure)
+
+    if "color" in aspects:
+        out = replace(out, lab=source.lab, toning=source.toning)
+
+    if "finish" in aspects:
+        # Heals are frame-specific: keep the target's spots AND strokes.
+        out = replace(
+            out,
+            retouch=replace(
+                source.retouch,
+                manual_dust_spots=out.retouch.manual_dust_spots,
+                manual_heal_strokes=out.retouch.manual_heal_strokes,
+            ),
+            finish=source.finish,
+        )
+
+    if aspects & {"bounds_luma", "bounds_colour"}:
+        floors, ceils = src_bounds
+        # locked_* is a shared pair, so always write it; toggle only the selected axis.
+        changes: dict = {"locked_floors": floors, "locked_ceils": ceils}
+        if "bounds_luma" in aspects:
+            changes["use_luma_average"] = True
+        if "bounds_colour" in aspects:
+            changes["use_colour_average"] = True
+        out = replace(out, process=replace(out.process, **changes))
+
+    return out
+
+
 def resolve_asset_rgbscan(params: WorkspaceConfig, asset: dict) -> WorkspaceConfig:
     """Overlay a frame's own RGB-scan triplet paths (from the asset dict) onto its export
     params — the authoritative source select_file uses. A non-triplet frame gets rgbscan
@@ -341,27 +365,6 @@ def resolve_asset_rgbscan(params: WorkspaceConfig, asset: dict) -> WorkspaceConf
         align = bool(asset.get("align", params.rgbscan.align))
         return replace(params, rgbscan=RgbScanConfig(enabled=True, green_path=green, blue_path=blue, align=align))
     return replace(params, rgbscan=RgbScanConfig())
-
-
-def resolve_asset_stitch(params: WorkspaceConfig, asset: dict) -> WorkspaceConfig:
-    """Overlay a composite's stored registration (from the asset dict — the authoritative
-    source) onto its params. A non-stitch asset gets stitch reset so a plain frame never
-    inherits a leaked composite config. Session/JSON round-trips lists — coerce to tuples
-    so the frozen config stays hashable."""
-    paths = asset.get("stitch_paths")
-    if paths:
-        canvas = asset.get("stitch_canvas") or (0, 0)
-        return replace(
-            params,
-            stitch=StitchConfig(
-                stitch_enabled=True,
-                stitch_paths=tuple(paths),
-                stitch_transforms=tuple(tuple(float(v) for v in t) for t in asset.get("stitch_transforms") or ()),
-                stitch_canvas=(int(canvas[0]), int(canvas[1])),
-                stitch_sizes=tuple((int(s[0]), int(s[1])) for s in asset.get("stitch_sizes") or ()),
-            ),
-        )
-    return replace(params, stitch=StitchConfig())
 
 
 class DesktopSessionManager(QObject):
@@ -421,21 +424,9 @@ class DesktopSessionManager(QObject):
         if saved_guide_orient is not None:
             self.state.crop_guide_orientation = int(saved_guide_orient) % 8
 
-        # User-tuned Auto Density / Auto Grade targets (app-global, Set Targets dialog).
-        saved_targets = self.repo.get_global_setting("exposure_targets")
-        if isinstance(saved_targets, dict):
-            apply_targets(saved_targets)
-
         saved_invert_zoom = self.repo.get_global_setting("invert_zoom_scroll")
         if saved_invert_zoom is not None:
             self.state.invert_zoom_scroll = bool(saved_invert_zoom)
-
-        # Per-file mask hide-state (hash -> hidden indices); JSON stores sets as lists.
-        saved_hidden = self.repo.get_global_setting("hidden_masks_by_hash")
-        if isinstance(saved_hidden, dict):
-            self.state.local_hidden_masks_by_hash = {
-                h: {int(i) for i in idxs} for h, idxs in saved_hidden.items() if isinstance(idxs, list) and idxs
-            }
 
         saved_icc_in = self.repo.get_global_setting("icc_input_path")
         if saved_icc_in and os.path.exists(saved_icc_in):
@@ -453,6 +444,9 @@ class DesktopSessionManager(QObject):
         saved_flat_output = self.repo.get_global_setting("flat_output")
         if saved_flat_output is not None:
             self.state.flat_output = bool(saved_flat_output)
+        saved_flat_format = self.repo.get_global_setting("flat_format")
+        if saved_flat_format in ("TIFF", "DNG"):
+            self.state.flat_format = saved_flat_format
 
         self.state.export_presets = self.repo.load_export_presets()
 
@@ -509,6 +503,7 @@ class DesktopSessionManager(QObject):
     def save_flat_output_prefs(self) -> None:
         """Persists the flat ('for editing elsewhere') output preferences."""
         self.repo.save_global_setting("flat_output", self.state.flat_output)
+        self.repo.save_global_setting("flat_format", self.state.flat_format)
 
     def _apply_sticky_settings(self, config: WorkspaceConfig, only_global: bool = False) -> WorkspaceConfig:
         """
@@ -573,8 +568,6 @@ class DesktopSessionManager(QObject):
         sticky_crosstalk_strength = self.repo.get_global_setting("last_crosstalk_strength")
         sticky_crosstalk_matrix = self.repo.get_global_setting("last_crosstalk_matrix")
         sticky_crosstalk_profile = self.repo.get_global_setting("last_crosstalk_profile")
-        sticky_sensor_matrix = self.repo.get_global_setting("last_sensor_matrix")
-        sticky_sensor_profile = self.repo.get_global_setting("last_sensor_profile")
 
         new_process = config.process
         if sticky_mode:
@@ -591,16 +584,11 @@ class DesktopSessionManager(QObject):
             new_process = replace(new_process, crosstalk_matrix=tuple(sticky_crosstalk_matrix))
         if sticky_crosstalk_profile:
             new_process = replace(new_process, crosstalk_profile=str(sticky_crosstalk_profile))
-        if sticky_sensor_matrix:
-            new_process = replace(new_process, sensor_matrix=tuple(sticky_sensor_matrix))
-        if sticky_sensor_profile:
-            new_process = replace(new_process, sensor_profile=str(sticky_sensor_profile))
         config = replace(config, process=new_process)
 
         sticky_ratio = self.repo.get_global_setting("last_aspect_ratio")
         sticky_autocrop_mode = self.repo.get_global_setting("last_autocrop_mode")
         sticky_offset = self.repo.get_global_setting("last_autocrop_offset")
-        sticky_rebate_trim = self.repo.get_global_setting("last_autocrop_rebate_trim")
         sticky_flip_h = self.repo.get_global_setting("last_flip_horizontal")
         sticky_flip_v = self.repo.get_global_setting("last_flip_vertical")
         new_geo = config.geometry
@@ -610,8 +598,6 @@ class DesktopSessionManager(QObject):
             new_geo = replace(new_geo, autocrop_mode=str(sticky_autocrop_mode))
         if sticky_offset is not None:
             new_geo = replace(new_geo, autocrop_offset=int(sticky_offset))
-        if sticky_rebate_trim is not None:
-            new_geo = replace(new_geo, autocrop_rebate_trim=float(sticky_rebate_trim))
         if sticky_flip_h is not None:
             new_geo = replace(new_geo, flip_horizontal=bool(sticky_flip_h))
         if sticky_flip_v is not None:
@@ -631,31 +617,19 @@ class DesktopSessionManager(QObject):
         sticky_linear_raw = self.repo.get_global_setting("last_linear_raw")
         if sticky_linear_raw is not None:
             config = replace(config, process=replace(config.process, linear_raw=bool(sticky_linear_raw)))
-        sticky_narrowband = self.repo.get_global_setting("last_narrowband_scan")
-        if sticky_narrowband is not None:
-            config = replace(config, process=replace(config.process, narrowband_scan=bool(sticky_narrowband)))
 
         # Processing toggles (Auto Density / Auto Grade / Shadow Neutral / Paper
-        # White / Paper Black / Cast Removal) are workflow preferences, not
-        # per-image looks: carry them to fresh files unless explicitly changed per file.
+        # White) are workflow preferences, not per-image looks: carry them to
+        # fresh files unless explicitly changed per file.
         new_exp = config.exposure
         for key, attr in (
             ("last_auto_exposure", "auto_exposure"),
             ("last_auto_normalize_contrast", "auto_normalize_contrast"),
             ("last_paper_dmin", "paper_dmin"),
-            ("last_paper_black", "paper_black"),
         ):
             val = self.repo.get_global_setting(key)
             if val is not None:
                 new_exp = replace(new_exp, **{attr: bool(val)})
-        # True Black renamed to Paper Black (inverted); honour a legacy sticky pref.
-        if self.repo.get_global_setting("last_paper_black") is None:
-            legacy_bpc = self.repo.get_global_setting("last_true_black")
-            if legacy_bpc is not None:
-                new_exp = replace(new_exp, paper_black=not bool(legacy_bpc))
-        sticky_cast_removal = self.repo.get_global_setting("last_cast_removal_strength")
-        if sticky_cast_removal is not None:
-            new_exp = replace(new_exp, cast_removal_strength=float(sticky_cast_removal))
         config = replace(config, exposure=new_exp)
 
         # Paper stock is roll-wide; render guards cross-mode leak.
@@ -685,20 +659,15 @@ class DesktopSessionManager(QObject):
                 "last_crosstalk_strength": config.process.crosstalk_strength,
                 "last_crosstalk_matrix": config.process.crosstalk_matrix,
                 "last_crosstalk_profile": config.process.crosstalk_profile,
-                "last_sensor_matrix": config.process.sensor_matrix,
-                "last_sensor_profile": config.process.sensor_profile,
                 "last_density": config.exposure.density,
                 "last_grade": config.exposure.grade,
                 "last_wb_cyan": config.exposure.wb_cyan,
                 "last_wb_magenta": config.exposure.wb_magenta,
                 "last_wb_yellow": config.exposure.wb_yellow,
                 "last_linear_raw": config.process.linear_raw,
-                "last_narrowband_scan": config.process.narrowband_scan,
                 "last_auto_exposure": config.exposure.auto_exposure,
                 "last_auto_normalize_contrast": config.exposure.auto_normalize_contrast,
                 "last_paper_dmin": config.exposure.paper_dmin,
-                "last_paper_black": config.exposure.paper_black,
-                "last_cast_removal_strength": config.exposure.cast_removal_strength,
                 "last_paper_profile": config.exposure.paper_profile,
                 "last_toe": config.exposure.toe,
                 "last_toe_width": config.exposure.toe_width,
@@ -707,7 +676,6 @@ class DesktopSessionManager(QObject):
                 "last_aspect_ratio": config.geometry.autocrop_ratio,
                 "last_autocrop_mode": config.geometry.autocrop_mode,
                 "last_autocrop_offset": config.geometry.autocrop_offset,
-                "last_autocrop_rebate_trim": config.geometry.autocrop_rebate_trim,
                 "last_flip_horizontal": config.geometry.flip_horizontal,
                 "last_flip_vertical": config.geometry.flip_vertical,
                 "last_export_config": asdict(config.export),
@@ -721,13 +689,13 @@ class DesktopSessionManager(QObject):
 
     def _hydrate_asset_config(self, asset: dict) -> tuple[WorkspaceConfig, bool]:
         """Build an asset's effective config and report whether it had saved edits."""
-        saved_config = load_or_promote(self.repo, asset["hash"], asset["path"], half=int(asset.get("half") or 0))
+        saved_config = load_or_promote(self.repo, asset["hash"], asset["path"])
         is_new = saved_config is None
         if saved_config is not None:
             config = self._apply_sticky_settings(saved_config, only_global=True)
         else:
             config = self._apply_sticky_settings(WorkspaceConfig(), only_global=False)
-        return resolve_asset_stitch(resolve_asset_rgbscan(config, asset), asset), is_new
+        return resolve_asset_rgbscan(config, asset), is_new
 
     def config_for_asset(self, asset: dict) -> WorkspaceConfig:
         """Return an asset's hydrated config without changing the active session state.
@@ -772,6 +740,9 @@ class DesktopSessionManager(QObject):
 
             self.state.config, self.state.current_file_is_new = self._hydrate_asset_config(file_info)
 
+            # Mask hide-state is keyed by index into this file's masks; the swap invalidates it.
+            self.state.local_hidden_masks = set()
+
             self.file_selected.emit(file_info["path"])
             self.state_changed.emit()
             self._persist_session()
@@ -781,46 +752,23 @@ class DesktopSessionManager(QObject):
         self.state.selected_indices = indices
         self.state_changed.emit()
 
-    def toggle_mark(self, mark: str) -> None:
-        """Triage marks: 'keeper' or 'excluded' (reject), mutually exclusive per
-        frame. Targets the multi-selection (else the active frame); a block clears
-        only when every target already has the mark. Kept out of WorkspaceConfig so
-        Ctrl+Z never unmarks a frame."""
-        if mark not in ("keeper", "excluded"):
-            return
-        state = self.state
-        targets = [i for i in (state.selected_indices or [state.selected_file_idx]) if 0 <= i < len(state.uploaded_files)]
-        if not targets:
-            return
-        other = "excluded" if mark == "keeper" else "keeper"
-        set_all = not all(state.uploaded_files[i].get(mark) for i in targets)
-        for i in targets:
-            f = state.uploaded_files[i]
-            f[mark] = set_all
-            if set_all:
-                f[other] = False
-            self.repo.save_file_mark(f["hash"], mark if set_all else None)
-        self.asset_model.refresh()
-        self.files_changed.emit()
-
-    def sync_selected_settings(self, rows, bounds_flags: tuple[bool, bool] = (False, False), scope: str = "selection") -> int:
+    def sync_selected_settings(self, aspects: frozenset, scope: str = "selection") -> int:
         """
-        Apply the active frame's chosen settings to other frames. Returns the count changed.
+        Apply the active frame's settings to other frames. Returns the count changed.
 
-        rows:         SettingRows (from the granular picker) to copy from the source.
-        bounds_flags: (luma, colour) roll-baseline axes to broadcast; these need the
-                      source's rendered bounds, not a config field.
-        scope:        "selection" (the multi-selected frames) or "roll" (all loaded frames).
+        aspects: subset of _VALID_ASPECTS (process/crop/rotation/exposure/color/
+                 finish/bounds_luma/bounds_colour), checked independently.
+        scope:   "selection" (the multi-selected frames) or "roll" (all loaded frames).
         """
-        rows = list(rows)
-        luma, colour = bounds_flags
-        if self.state.selected_file_idx == -1 or not (rows or luma or colour):
+        aspects = frozenset(aspects) & _VALID_ASPECTS
+        if self.state.selected_file_idx == -1 or not aspects:
             return 0
 
         source_config = self.state.config
 
         src_bounds = None
-        if luma or colour:
+        needs_bounds = bool(aspects & {"bounds_luma", "bounds_colour"})
+        if needs_bounds:
             src_bounds = _source_effective_bounds(source_config.process)
             if src_bounds is None:
                 self.settings_synced.emit("Render the source frame before syncing bounds")
@@ -835,64 +783,18 @@ class DesktopSessionManager(QObject):
             target_hash = self.state.uploaded_files[idx]["hash"]
             target_config = self.repo.load_file_settings(target_hash) or WorkspaceConfig()
             target_path = self.state.uploaded_files[idx]["path"]
-            synced = apply_selected_fields(source_config, target_config, rows)
-            if src_bounds is not None:
-                floors, ceils = src_bounds
-                changes: dict = {"locked_floors": floors, "locked_ceils": ceils}
-                if luma:
-                    changes["use_luma_average"] = True
-                if colour:
-                    changes["use_colour_average"] = True
-                synced = replace(synced, process=replace(synced.process, **changes))
-            self.push_external_history(target_hash, target_config, synced)
-            self.repo.save_file_settings(target_hash, synced, file_path=target_path)
+            self.repo.save_file_settings(
+                target_hash, build_synced_config(source_config, target_config, aspects, src_bounds), file_path=target_path
+            )
             count += 1
 
         if count:
-            n = len(rows) + int(luma) + int(colour)
-            noun = "setting" if n == 1 else "settings"
+            label = ", ".join(_ASPECT_LABELS[a] for a in _ASPECT_LABELS if a in aspects)
             if scope == "roll":
-                msg = f"{n} {noun} synced to whole roll ({count} frames)"
+                msg = f"{label} synced to whole roll ({count} frames)"
             else:
-                msg = f"{n} {noun} synced to {count} frame{'s' if count != 1 else ''}"
+                msg = f"{label} synced to {count} frame{'s' if count != 1 else ''}"
             self.settings_synced.emit(msg)
-            self.settings_saved.emit()
-        return count
-
-    def apply_preset_fields(self, source: WorkspaceConfig, rows, scope: str = "current") -> int:
-        """Overlay a preset's chosen rows onto the current frame, the selection, or
-        the whole (visible) roll. Unlike sync_selected_settings the source is the
-        preset itself, so the active frame is a target too. Returns frames changed."""
-        rows = list(rows)
-        if not rows or self.state.selected_file_idx == -1:
-            return 0
-
-        if scope == "roll":
-            target_indices = self.asset_model.visible_actual_indices_ordered()
-        elif scope == "selection":
-            target_indices = self.state.selected_indices
-        else:
-            target_indices = [self.state.selected_file_idx]
-
-        count = 0
-        for idx in target_indices:
-            if not (0 <= idx < len(self.state.uploaded_files)):
-                continue
-            if idx == self.state.selected_file_idx:
-                self.update_config(apply_selected_fields(source, self.state.config, rows), persist=True, render=False)
-                count += 1
-                continue
-            target_hash = self.state.uploaded_files[idx]["hash"]
-            target_config = self.repo.load_file_settings(target_hash) or WorkspaceConfig()
-            synced = apply_selected_fields(source, target_config, rows)
-            self.push_external_history(target_hash, target_config, synced)
-            self.repo.save_file_settings(target_hash, synced, file_path=self.state.uploaded_files[idx]["path"])
-            count += 1
-
-        if count:
-            n = len(rows)
-            noun = "setting" if n == 1 else "settings"
-            self.settings_synced.emit(f"Preset applied: {n} {noun} to {count} frame{'s' if count != 1 else ''}")
             self.settings_saved.emit()
         return count
 
@@ -940,11 +842,11 @@ class DesktopSessionManager(QObject):
             self.state_changed.emit()
 
     def persist_active_batch_config(self, config: WorkspaceConfig) -> None:
-        """Persist Auto Crop All before exposing it as active in-memory state.
+        """Persist a batch result before exposing it as the active in-memory state.
 
-        Non-active Auto Crop All results are written directly. This companion path
-        preserves that behavior while ensuring a storage error cannot leave an
-        unrendered crop live in memory.
+        Roll operations update non-active files directly and are not undo-history
+        steps. This companion path gives the active file the same behavior while
+        ensuring a storage error cannot leave an unrendered crop live in memory.
         """
         if not self.state.current_file_hash:
             raise RuntimeError("Cannot persist batch settings without an active file")
@@ -956,20 +858,6 @@ class DesktopSessionManager(QObject):
         self.state.config = config
         self._config_dirty = True
         self.settings_saved.emit()
-
-    def push_external_history(self, file_hash: str, old_config: WorkspaceConfig, new_config: WorkspaceConfig) -> None:
-        """Record a bulk apply (roll bake, apply-to-roll…) in a NON-ACTIVE file's
-        history so plain Ctrl+Z recovers it after switching to that frame. Two steps
-        are written (pre-apply, then post-apply) because undo() overwrites the top
-        step with the live config when undo_index == max — a single appended step
-        would be clobbered by the first Ctrl+Z."""
-        base = self.repo.get_max_history_index(file_hash)
-        if base == 0 and self.repo.load_history_step(file_hash, 0) is None:
-            first = 0
-        else:
-            first = base + 1
-        self.repo.save_history_step(file_hash, first, old_config)
-        self.repo.save_history_step(file_hash, first + 1, new_config)
 
     def undo(self) -> None:
         if self.state.undo_index > 0 and self.state.current_file_hash:
@@ -1016,10 +904,17 @@ class DesktopSessionManager(QObject):
 
     def reset_settings(self) -> None:
         """
-        Reverts current file to default configuration. Recorded as an ordinary
-        history step, so a reset is undoable like any other edit.
+        Reverts current file to default configuration and clears history.
         """
-        self.update_config(WorkspaceConfig(), persist=True)
+        if self.state.current_file_hash:
+            self.repo.clear_history(self.state.current_file_hash)
+            self.state.undo_index = 0
+            self.state.max_history_index = 0
+            self.history_changed.emit()
+
+        self._config_dirty = False
+        self.update_config(WorkspaceConfig())
+        self.state_changed.emit()
 
     def reset_section(self, section: str) -> None:
         """Reset a single feature section to its default config."""
@@ -1070,23 +965,12 @@ class DesktopSessionManager(QObject):
     def copy_settings_with_bounds(self) -> None:
         self.copy_settings(include_bounds=True)
 
-    def apply_pasted_fields(self, rows) -> None:
-        """Overlay the picked clipboard settings onto the active frame."""
-        rows = list(rows)
-        if not rows or self.state.clipboard is None or not self.state.current_file_hash:
-            return
-        merged = apply_selected_fields(self.state.clipboard, self.state.config, rows)
-        self.update_config(merged, persist=True)
-        self.settings_pasted.emit()
+    def paste_settings(self) -> None:
+        if self.state.clipboard and self.state.current_file_hash:
+            import copy
 
-    def persist_hidden_masks(self) -> None:
-        """Writes the per-file mask hide-state through to settings so it survives restarts.
-        Call after any change to local_hidden_masks_by_hash (the AppState setter keeps it
-        free of empty sets; the `if s` filter here is just defensive)."""
-        self.repo.save_global_setting(
-            "hidden_masks_by_hash",
-            {h: sorted(s) for h, s in self.state.local_hidden_masks_by_hash.items() if s},
-        )
+            self.update_config(copy.deepcopy(self.state.clipboard), persist=True)
+            self.settings_pasted.emit()
 
     def _persist_session(self) -> None:
         """Saves the open-file manifest (paths + active) for restore on next launch."""
@@ -1101,20 +985,6 @@ class DesktopSessionManager(QObject):
             if f.get("green_path") and f.get("blue_path")
         }
         self.repo.save_global_setting("session_triplets", triplets)
-        # Stitch composites keep their parts + registration here so restore can rebuild
-        # the merged asset without re-running SIFT (re-discovery sees only the primary).
-        stitches = {
-            f["path"]: {
-                "paths": list(f["stitch_paths"]),
-                "transforms": [list(t) for t in f["stitch_transforms"]],
-                "canvas": list(f["stitch_canvas"]),
-                "sizes": [list(s) for s in f["stitch_sizes"]],
-                "hash": f["hash"],
-            }
-            for f in self.state.uploaded_files
-            if f.get("stitch_paths")
-        }
-        self.repo.save_global_setting("session_stitches", stitches)
 
     def add_files(self, file_paths: List[str], validated_info: Optional[List[Dict]] = None) -> None:
         """
@@ -1127,18 +997,12 @@ class DesktopSessionManager(QObject):
         if validated_info:
             for info in validated_info:
                 same_path_idx = next(
-                    (
-                        i
-                        for i, existing in enumerate(self.state.uploaded_files)
-                        # half-frame assets share a path — match per half
-                        if existing["path"] == info["path"] and existing.get("half") == info.get("half")
-                    ),
+                    (i for i, existing in enumerate(self.state.uploaded_files) if existing["path"] == info["path"]),
                     None,
                 )
                 if same_path_idx is not None:
                     old = self.state.uploaded_files[same_path_idx]
                     self.state.thumbnails.pop(old["name"], None)
-                    self.state.rendered_thumbnails.discard(old["name"])
                     self.state.uploaded_files[same_path_idx] = info
                     continue
                 if any(f["hash"] == info["hash"] for f in self.state.uploaded_files):
@@ -1160,38 +1024,9 @@ class DesktopSessionManager(QObject):
 
                     get_logger(__name__).error(f"Failed to add {path}: {e}")
 
-        # Marks: DB is the source of truth; toggles write through, so the
-        # unconditional overlay can't lose one.
-        marks = self.repo.load_file_marks()
-        for f in self.state.uploaded_files:
-            m = marks.get(f["hash"])
-            f["keeper"] = m == "keeper"
-            f["excluded"] = m == "excluded"
-
         self.asset_model.refresh()
         self.files_changed.emit()
         self._persist_session()
-
-    def apply_stitch(self, indices: List[int], composite: dict) -> None:
-        """Replace the part assets with their stitched composite (inserted at the first
-        part's position), then open it. Part edits stay in the DB under their content
-        hashes, so an unstitch restores them intact."""
-        valid = sorted({i for i in indices if 0 <= i < len(self.state.uploaded_files)})
-        if not valid:
-            return
-        pos = valid[0]
-        for i in reversed(valid):
-            removed = self.state.uploaded_files.pop(i)
-            self.state.thumbnails.pop(removed["name"], None)
-            self.state.rendered_thumbnails.discard(removed["name"])
-        marks = self.repo.load_file_marks()
-        m = marks.get(composite["hash"])
-        composite = {**composite, "keeper": m == "keeper", "excluded": m == "excluded"}
-        self.state.uploaded_files.insert(pos, composite)
-        self.asset_model.refresh()
-        self.files_changed.emit()
-        self._persist_session()
-        self.select_file(pos)
 
     def set_triplet(self, index: int, red_path: str, green_path: str, blue_path: str, align: bool = True) -> None:
         """Reassign the R/G/B exposures of an RGB-scan asset, then reload it."""
@@ -1237,7 +1072,6 @@ class DesktopSessionManager(QObject):
         """
         self.state.uploaded_files.clear()
         self.state.thumbnails.clear()
-        self.state.rendered_thumbnails.clear()
         self._reset_active_image_state()
 
         self.asset_model.refresh()
@@ -1252,7 +1086,6 @@ class DesktopSessionManager(QObject):
         if 0 <= idx < len(self.state.uploaded_files):
             file_info = self.state.uploaded_files.pop(idx)
             self.state.thumbnails.pop(file_info["name"], None)
-            self.state.rendered_thumbnails.discard(file_info["name"])
 
             if not self.state.uploaded_files:
                 self._reset_active_image_state()
@@ -1276,7 +1109,6 @@ class DesktopSessionManager(QObject):
             if 0 <= idx < len(self.state.uploaded_files):
                 file_info = self.state.uploaded_files.pop(idx)
                 self.state.thumbnails.pop(file_info["name"], None)
-                self.state.rendered_thumbnails.discard(file_info["name"])
 
         if not self.state.uploaded_files:
             self._reset_active_image_state()

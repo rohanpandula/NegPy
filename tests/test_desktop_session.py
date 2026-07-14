@@ -3,17 +3,10 @@ from unittest.mock import MagicMock, patch
 from dataclasses import replace
 
 from negpy.desktop.session import AppState, AssetListModel, DesktopSessionManager
-from negpy.desktop.settings_catalog import all_rows
 from negpy.domain.models import WorkspaceConfig, GeometryConfig, RetouchConfig, ProcessConfig
 from negpy.features.rgbscan.models import RgbScanConfig
 from negpy.infrastructure.storage.repository import StorageRepository
 from negpy.kernel.system.config import APP_CONFIG
-
-_ROWS = {r.label: r for r in all_rows()}
-
-
-def _row(label: str):
-    return _ROWS[label]
 
 
 class TestDesktopSessionSync(unittest.TestCase):
@@ -84,7 +77,7 @@ class TestDesktopSessionSync(unittest.TestCase):
         with patch("negpy.desktop.session.load_or_promote", return_value=saved) as hydrate:
             config = self.session.config_for_asset(asset)
 
-        hydrate.assert_called_once_with(self.mock_repo, "saved-hash", "/roll/saved.dng", half=0)
+        hydrate.assert_called_once_with(self.mock_repo, "saved-hash", "/roll/saved.dng")
         self.assertEqual(config.exposure.density, 1.7)
         self.assertEqual(config.process.process_mode, "E-6")
         self.assertEqual(config.geometry.autocrop_ratio, "4:3")
@@ -106,7 +99,6 @@ class TestDesktopSessionSync(unittest.TestCase):
             "last_aspect_ratio": "1:1",
             "last_autocrop_offset": 7,
             "last_auto_exposure": True,
-            "last_narrowband_scan": True,
         }
         self.mock_repo.get_global_setting.side_effect = lambda key, default=None: sticky.get(key, default)
         asset = {"name": "fresh.dng", "path": "/roll/fresh.dng", "hash": "fresh-hash"}
@@ -117,7 +109,6 @@ class TestDesktopSessionSync(unittest.TestCase):
         self.assertEqual(config.exposure.density, defaults.exposure.density)
         self.assertEqual(config.lab.saturation, defaults.lab.saturation)
         self.assertTrue(config.exposure.auto_exposure)
-        self.assertTrue(config.process.narrowband_scan)
         self.assertEqual(config.process.process_mode, "E-6")
         self.assertEqual(config.geometry.autocrop_ratio, "1:1")
         self.assertEqual(config.geometry.autocrop_offset, 7)
@@ -173,10 +164,7 @@ class TestDesktopSessionSync(unittest.TestCase):
         self.assertIn("last_process_mode", saved)
         self.assertIn("last_export_config", saved)
         self.assertIn("last_dust_remove", saved)
-        self.assertIn("last_paper_black", saved)
-        self.assertIn("last_narrowband_scan", saved)
         self.assertIn("last_protect_original_metadata", saved)
-        self.assertIn("last_cast_removal_strength", saved)
 
     def test_persist_active_batch_config_saves_before_exposing_state(self):
         original = self.session.state.config
@@ -232,40 +220,14 @@ class TestDesktopSessionSync(unittest.TestCase):
             "last_auto_exposure": True,
             "last_auto_normalize_contrast": True,
             "last_paper_dmin": True,
-            "last_paper_black": True,
             "last_paper_profile": "ilford_mg_rc",
-            "last_cast_removal_strength": 0.8,
         }
         self.mock_repo.get_global_setting.side_effect = lambda key, default=None: sticky.get(key, default)
         config = self.session._apply_sticky_settings(WorkspaceConfig(), only_global=False)
         self.assertTrue(config.exposure.auto_exposure)
         self.assertTrue(config.exposure.auto_normalize_contrast)
         self.assertTrue(config.exposure.paper_dmin)
-        self.assertTrue(config.exposure.paper_black)
         self.assertEqual(config.exposure.paper_profile, "ilford_mg_rc")
-        self.assertEqual(config.exposure.cast_removal_strength, 0.8)
-
-    def test_cast_removal_zero_carries_to_new_files(self):
-        """Sticky must carry an explicit zero, not just non-zero — default is 0.5."""
-        sticky = {"last_export_config": {}, "last_cast_removal_strength": 0.0}
-        self.mock_repo.get_global_setting.side_effect = lambda key, default=None: sticky.get(key, default)
-        config = self.session._apply_sticky_settings(WorkspaceConfig(), only_global=False)
-        self.assertEqual(config.exposure.cast_removal_strength, 0.0)
-
-    def test_paper_black_carries_to_new_files(self):
-        """Sticky must carry an explicit value over the file's base."""
-        sticky = {"last_export_config": {}, "last_paper_black": False}
-        self.mock_repo.get_global_setting.side_effect = lambda key, default=None: sticky.get(key, default)
-        base = WorkspaceConfig(exposure=replace(WorkspaceConfig().exposure, paper_black=True))
-        config = self.session._apply_sticky_settings(base, only_global=False)
-        self.assertFalse(config.exposure.paper_black)
-
-    def test_legacy_true_black_sticky_migrates_inverted(self):
-        """A pre-rename sticky (last_true_black) maps to paper_black inverted."""
-        sticky = {"last_export_config": {}, "last_true_black": False}
-        self.mock_repo.get_global_setting.side_effect = lambda key, default=None: sticky.get(key, default)
-        config = self.session._apply_sticky_settings(WorkspaceConfig(), only_global=False)
-        self.assertTrue(config.exposure.paper_black)
 
     def test_roll_average_not_seeded_onto_fresh_files(self):
         # A roll baseline must not leak onto a fresh (sidecar-less) file.
@@ -392,7 +354,7 @@ class TestDesktopSessionSync(unittest.TestCase):
         self.mock_repo.load_file_settings.return_value = target_config
 
         self.session.update_selection([0, 1])
-        self.session.sync_selected_settings([_row("Print Density"), _row("Mode"), _row("Dust Removal")])
+        self.session.sync_selected_settings(frozenset({"process", "exposure", "color", "finish"}))
 
         args, _ = self.mock_repo.save_file_settings.call_args
         self.assertEqual(args[0], "hash2")
@@ -400,12 +362,13 @@ class TestDesktopSessionSync(unittest.TestCase):
 
         self.assertEqual(saved_config.exposure.density, 1.5)
         self.assertEqual(saved_config.process.process_mode, "E-6")
+        self.assertTrue(saved_config.process.e6_normalize)
 
-        # Geometry not selected → entirely preserved from target
+        # Geometry entirely preserved from target
         self.assertEqual(saved_config.geometry.rotation, 0)
         self.assertEqual(saved_config.geometry.fine_rotation, 0.0)
         self.assertIsNone(saved_config.geometry.manual_crop_rect)
-        # Per-file retouch fields preserved from target even though Dust Removal was synced
+        # Per-file retouch fields preserved from target
         self.assertEqual(saved_config.retouch.manual_dust_spots, [])
         self.assertTrue(saved_config.retouch.dust_remove)
 
@@ -429,7 +392,7 @@ class TestDesktopSessionSync(unittest.TestCase):
         self.mock_repo.load_file_settings.return_value = target_config
 
         self.session.update_selection([0, 1])
-        self.session.sync_selected_settings([_row("Print Density"), _row("Fine Rotation"), _row("Rotation"), _row("Manual Crop")])
+        self.session.sync_selected_settings(frozenset({"process", "exposure", "color", "finish", "crop", "rotation"}))
 
         args, _ = self.mock_repo.save_file_settings.call_args
         saved_config = args[1]
@@ -459,7 +422,7 @@ class TestDesktopSessionSync(unittest.TestCase):
         self.mock_repo.load_file_settings.return_value = target_config
 
         self.session.update_selection([0, 1])
-        self.session.sync_selected_settings([_row("Rotation"), _row("Fine Rotation"), _row("Manual Crop")])
+        self.session.sync_selected_settings(frozenset({"crop", "rotation"}))
 
         args, _ = self.mock_repo.save_file_settings.call_args
         saved_config = args[1]
@@ -471,49 +434,12 @@ class TestDesktopSessionSync(unittest.TestCase):
         # Other config preserved from target
         self.assertEqual(saved_config.exposure.density, 0.7)
 
-    def test_sync_selected_settings_resets_crop_offset_to_default(self):
-        # #656: pushing the source's default value (offset 0) must clear the target's.
-        self.session.state.selected_file_idx = 0
-        self.session.state.current_file_hash = "hash1"
-        self.session.state.config = WorkspaceConfig(geometry=GeometryConfig(autocrop_offset=0))
-        self.mock_repo.load_file_settings.return_value = WorkspaceConfig(geometry=GeometryConfig(autocrop_offset=3))
-
-        self.session.update_selection([0, 1])
-        self.session.sync_selected_settings([_row("Crop Offset")])
-
-        args, _ = self.mock_repo.save_file_settings.call_args
-        self.assertEqual(args[1].geometry.autocrop_offset, 0)
-
-    def test_sync_selected_settings_empty_is_noop(self):
+    def test_sync_selected_settings_invalid_aspect_is_noop(self):
         self.session.state.selected_file_idx = 0
         self.session.state.current_file_hash = "hash1"
         self.session.update_selection([0, 1])
-        self.session.sync_selected_settings([])
+        self.session.sync_selected_settings(frozenset({"bogus"}))
         self.mock_repo.save_file_settings.assert_not_called()
-
-    def test_apply_pasted_fields_applies_subset_and_renders(self):
-        self.session.state.current_file_hash = "hash1"
-        self.session.state.config = replace(WorkspaceConfig(), lab=replace(WorkspaceConfig().lab, saturation=1.9))
-        self.session.state.clipboard = replace(
-            WorkspaceConfig(),
-            exposure=replace(WorkspaceConfig().exposure, density=2.2),
-            lab=replace(WorkspaceConfig().lab, saturation=0.3),
-        )
-        rendered = []
-        self.session.state_changed.connect(lambda: rendered.append(True))
-
-        self.session.apply_pasted_fields([_row("Print Density")])
-
-        self.assertEqual(self.session.state.config.exposure.density, 2.2)  # pasted
-        self.assertEqual(self.session.state.config.lab.saturation, 1.9)  # not selected → kept
-        self.assertTrue(rendered)
-
-    def test_apply_pasted_fields_noop_when_clipboard_empty(self):
-        self.session.state.current_file_hash = "hash1"
-        self.session.state.clipboard = None
-        before = self.session.state.config
-        self.session.apply_pasted_fields([_row("Print Density")])
-        self.assertIs(self.session.state.config, before)
 
     def _seed_roll(self):
         self.session.state.uploaded_files = [
@@ -531,7 +457,7 @@ class TestDesktopSessionSync(unittest.TestCase):
         self._seed_roll()
         self.session.asset_model.set_filter(".arw", regex=False)  # hides c.jpg
 
-        count = self.session.sync_selected_settings([_row("Print Density")], scope="roll")
+        count = self.session.sync_selected_settings(frozenset({"exposure"}), scope="roll")
 
         saved = {c.args[0] for c in self.mock_repo.save_file_settings.call_args_list}
         self.assertEqual(count, 1)
@@ -541,7 +467,7 @@ class TestDesktopSessionSync(unittest.TestCase):
         self._seed_roll()
         self.session.asset_model.refresh()  # no filter → every frame visible
 
-        count = self.session.sync_selected_settings([_row("Print Density")], scope="roll")
+        count = self.session.sync_selected_settings(frozenset({"exposure"}), scope="roll")
 
         saved = {c.args[0] for c in self.mock_repo.save_file_settings.call_args_list}
         self.assertEqual(count, 2)
@@ -617,33 +543,16 @@ class TestDesktopSessionSync(unittest.TestCase):
         self.assertFalse(self.session.state.config.process.is_local_initialized)
         self.assertFalse(self.session.state.config.process.is_locked_initialized)
 
-    def test_reset_settings_is_recorded_not_wiping(self):
+    def test_reset_settings_clears_history(self):
         self.session.select_file(0)
-        edited = replace(self.session.state.config, exposure=replace(self.session.state.config.exposure, density=1.8))
-        self.session.update_config(edited, persist=True)
+        self.session.state.undo_index = 3
+        self.session.state.max_history_index = 3
 
         self.session.reset_settings()
 
-        self.mock_repo.clear_history.assert_not_called()
-        self.assertEqual(self.session.state.config, WorkspaceConfig())
-        # Reset pushed the pre-reset config as a history step — it is undoable.
-        self.mock_repo.save_history_step.assert_called_with("hash1", 1, edited)
-        self.assertEqual(self.session.state.undo_index, 2)
-
-    def test_sync_to_roll_records_target_history(self):
-        self.mock_repo.get_max_history_index.return_value = 0
-        self.mock_repo.load_history_step.return_value = None
-        self.session.select_file(0)
-        self.session.state.uploaded_files.append({"name": "file3.dng", "path": "path3", "hash": "hash3"})
-        self.session.asset_model.refresh()
-        self.mock_repo.save_history_step.reset_mock()
-
-        count = self.session.sync_selected_settings([_row("Print Density")], scope="roll")
-
-        self.assertEqual(count, 2)
-        # Each target got a two-step write: pre-apply at 0, post-apply at 1.
-        steps = [(c.args[0], c.args[1]) for c in self.mock_repo.save_history_step.call_args_list]
-        self.assertEqual(steps, [("hash2", 0), ("hash2", 1), ("hash3", 0), ("hash3", 1)])
+        self.mock_repo.clear_history.assert_called_once_with("hash1")
+        self.assertEqual(self.session.state.undo_index, 0)
+        self.assertEqual(self.session.state.max_history_index, 0)
 
     def _last_session_manifest(self):
         """Returns (paths, active_path) from the most recent _persist_session calls."""
@@ -860,144 +769,6 @@ class TestSessionEmptied(unittest.TestCase):
         self.assertEqual(self.emptied_count, 0)
         self.assertEqual(len(self.session.state.uploaded_files), 1)
         self.assertEqual(self.session.state.selected_file_idx, 0)
-
-
-class TestTriageMarks(unittest.TestCase):
-    def setUp(self):
-        self.mock_repo = MagicMock(spec=StorageRepository)
-        self.mock_repo.load_file_settings.return_value = None
-        self.mock_repo.load_file_settings_by_path.return_value = None
-        self.mock_repo.get_global_setting.side_effect = lambda key, default=None: {} if key == "last_export_config" else default
-        self.mock_repo.get_max_history_index.return_value = 0
-        self.mock_repo.load_file_marks.return_value = {}
-        self.session = DesktopSessionManager(self.mock_repo)
-        self.session.state.uploaded_files = [
-            {"name": "f1.dng", "path": "p1", "hash": "hash1"},
-            {"name": "f2.dng", "path": "p2", "hash": "hash2"},
-            {"name": "f3.dng", "path": "p3", "hash": "hash3"},
-        ]
-        self.session.state.selected_file_idx = 0
-        self.session.asset_model.refresh()
-
-    def test_reject_toggles_and_persists(self):
-        self.session.toggle_mark("excluded")
-        self.assertTrue(self.session.state.uploaded_files[0]["excluded"])
-        self.mock_repo.save_file_mark.assert_called_with("hash1", "excluded")
-
-        self.session.toggle_mark("excluded")
-        self.assertFalse(self.session.state.uploaded_files[0]["excluded"])
-        self.mock_repo.save_file_mark.assert_called_with("hash1", None)
-
-    def test_marks_are_mutually_exclusive(self):
-        self.session.toggle_mark("keeper")
-        self.session.toggle_mark("excluded")
-        f = self.session.state.uploaded_files[0]
-        self.assertTrue(f["excluded"])
-        self.assertFalse(f["keeper"])
-
-    def test_multi_selection_toggles_as_block(self):
-        self.session.state.uploaded_files[0]["keeper"] = True
-        self.session.state.selected_indices = [0, 1]
-
-        # Mixed block: mark all (not clear the one already marked)
-        self.session.toggle_mark("keeper")
-        self.assertTrue(all(self.session.state.uploaded_files[i].get("keeper") for i in (0, 1)))
-
-        # Uniform block: clear all
-        self.session.toggle_mark("keeper")
-        self.assertFalse(any(self.session.state.uploaded_files[i].get("keeper") for i in (0, 1)))
-
-    def test_invalid_mark_is_noop(self):
-        self.session.toggle_mark("starred")
-        self.mock_repo.save_file_mark.assert_not_called()
-
-    def test_sheet_filter_unrejected_hides_rejected(self):
-        self.session.state.uploaded_files[1]["excluded"] = True
-        self.session.asset_model.set_sheet_filter("unrejected")
-        self.assertEqual(self.session.asset_model.visible_actual_indices(), {0, 2})
-
-    def test_sheet_filter_keepers_only(self):
-        self.session.state.uploaded_files[2]["keeper"] = True
-        self.session.asset_model.set_sheet_filter("keepers")
-        self.assertEqual(self.session.asset_model.visible_actual_indices(), {2})
-
-    def test_sheet_filter_all_shows_rejected(self):
-        self.session.state.uploaded_files[1]["excluded"] = True
-        self.session.asset_model.set_sheet_filter("all")
-        self.assertEqual(self.session.asset_model.visible_actual_indices(), {0, 1, 2})
-
-    def test_add_files_restores_marks_from_repo(self):
-        self.mock_repo.load_file_marks.return_value = {"hash9": "keeper", "hash2": "excluded"}
-        self.session.add_files([], validated_info=[{"name": "f9.dng", "path": "p9", "hash": "hash9"}])
-        files = self.session.state.uploaded_files
-        self.assertTrue(files[3]["keeper"])
-        self.assertTrue(files[1]["excluded"])
-        self.assertFalse(files[0]["keeper"] or files[0]["excluded"])
-
-
-class TestRollActionRecoveryRoundTrip(unittest.TestCase):
-    """End-to-end with a real repository: a roll-wide sync is recoverable on each
-    target frame with plain undo after switching to it."""
-
-    def setUp(self):
-        import tempfile
-
-        self.tmp = tempfile.TemporaryDirectory()
-        self.repo = StorageRepository(f"{self.tmp.name}/edits.db", f"{self.tmp.name}/settings.db")
-        self.repo.initialize()
-        self.session = DesktopSessionManager(self.repo)
-        self.session.state.uploaded_files = [
-            {"name": "f1.dng", "path": f"{self.tmp.name}/f1.dng", "hash": "hash1"},
-            {"name": "f2.dng", "path": f"{self.tmp.name}/f2.dng", "hash": "hash2"},
-        ]
-        self.session.asset_model.refresh()
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_hidden_masks_survive_restart(self):
-        from negpy.features.local.models import LocalAdjustmentsConfig, PolygonMask
-
-        # hash1 has two masks on disk; index 1 is hidden. The property clamps against the
-        # hydrated mask list, so persistence only "counts" if that config reloads too.
-        verts = ((0.1, 0.1), (0.9, 0.1), (0.5, 0.9))
-        two_masks = (PolygonMask(vertices=verts), PolygonMask(vertices=verts, strength=-0.3))
-        cfg = replace(WorkspaceConfig(), local=LocalAdjustmentsConfig(masks=two_masks))
-        self.repo.save_file_settings("hash1", cfg, file_path=self.session.state.uploaded_files[0]["path"])
-
-        self.session.state.local_hidden_masks_by_hash = {"hash1": {1}, "hash2": set()}
-        self.session.persist_hidden_masks()
-
-        # A fresh manager on the same repo simulates an app restart.
-        restarted = DesktopSessionManager(self.repo)
-        self.assertEqual(restarted.state.local_hidden_masks_by_hash, {"hash1": {1}})
-
-        restarted.state.uploaded_files = self.session.state.uploaded_files
-        restarted.select_file(0)
-        self.assertEqual(restarted.state.local_hidden_masks, {1})
-        restarted.select_file(1)
-        self.assertEqual(restarted.state.local_hidden_masks, set())
-
-    def test_sync_then_undo_restores_target(self):
-        target_before = replace(WorkspaceConfig(), exposure=replace(WorkspaceConfig().exposure, density=2.0))
-        self.repo.save_file_settings("hash2", target_before, file_path=self.session.state.uploaded_files[1]["path"])
-
-        self.session.select_file(0)
-        source = replace(self.session.state.config, exposure=replace(self.session.state.config.exposure, density=1.5))
-        self.session.update_config(source, persist=True)
-
-        count = self.session.sync_selected_settings([_row("Print Density")], scope="roll")
-        self.assertEqual(count, 1)
-        self.assertEqual(self.repo.load_file_settings("hash2").exposure.density, 1.5)
-
-        self.session.select_file(1)
-        self.assertEqual(self.session.state.config.exposure.density, 1.5)
-
-        self.session.undo()
-        self.assertEqual(self.session.state.config.exposure.density, 2.0)
-
-        self.session.redo()
-        self.assertEqual(self.session.state.config.exposure.density, 1.5)
 
 
 if __name__ == "__main__":

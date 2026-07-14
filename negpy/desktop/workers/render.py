@@ -8,13 +8,10 @@ from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from negpy.domain.interfaces import PipelineContext
 from negpy.domain.models import WorkspaceConfig
-from negpy.features.exposure.analysis import output_histogram, proof_grid, rotate_grid, strip_mosaic
+from negpy.features.exposure.analysis import output_histogram
 from negpy.features.flatfield.logic import apply_flatfield
 from negpy.features.geometry.batch_autocrop import detect_crop_candidate, resolve_roll_crops
-from negpy.features.process.sensor import apply_sensor_correction, effective_sensor_matrix
-from negpy.features.rgbscan.models import is_rgb_triplet
 from negpy.features.geometry.processor import GeometryProcessor
-from negpy.infrastructure.display.color_spaces import WORKING_COLOR_SPACE
 from negpy.infrastructure.gpu.resources import GPUTexture
 from negpy.kernel.system.config import APP_CONFIG, DEFAULT_WORKSPACE_CONFIG
 from negpy.kernel.system.logging import get_logger
@@ -45,32 +42,6 @@ class RenderTask:
     crop_preview_full: bool = False
     # Display-only first paint (embedded-JPEG splash): its analysis must not persist.
     ephemeral: bool = False
-    # Identity of everything that shaped these pixels; non-empty makes the result
-    # eligible for the navigate-back render memo (echoed in metrics).
-    memo_key: str = ""
-    # These pixels are the before/after baseline, not the edit. Echoed in metrics so
-    # the BEFORE badge tracks what is painted, not the pending toggle.
-    compare: bool = False
-
-
-@dataclass(frozen=True)
-class TestStripTask:
-    """Request to print a proof mosaic off one frame: the density × grade strip or the colour
-    ring-around. `overrides` is one ExposureConfig field-override dict per patch, row-major
-    over `grid`, unrotated — the worker assembles all four orientations."""
-
-    buffer: np.ndarray
-    config: WorkspaceConfig
-    source_hash: str
-    preview_size: float
-    overrides: tuple
-    grid: tuple
-    icc_input_path: Optional[str] = None
-    icc_output_path: Optional[str] = None
-    color_space: str = "Adobe RGB"
-    gpu_enabled: bool = True
-    ir_buffer: Optional[np.ndarray] = None
-    monitor_icc_bytes: Optional[bytes] = None
 
 
 @dataclass(frozen=True)
@@ -80,10 +51,7 @@ class ThumbnailUpdateTask:
     filename: str
     file_hash: str
     buffer: np.ndarray
-    # Display-transform inputs, from AppController.display_transform_params — must be
-    # the same pair the canvas used for this buffer or the thumbnail's colour drifts.
-    color_space: str = WORKING_COLOR_SPACE
-    monitor_icc_bytes: Optional[bytes] = None
+    color_space: str = "sRGB"
     persist: bool = True  # False = in-memory filmstrip only, skip the disk JPEG encode.
 
 
@@ -142,8 +110,6 @@ class AssetDiscoveryTask:
     supported_extensions: tuple[str, ...]
     rgb_scan: bool = False  # Group discovered files into R/G/B triplets (one asset per frame).
     restore_triplets: dict | None = None  # {red_path: [green, blue]} — rebuild known triplets (session restore).
-    half_frame: bool = False  # Expand each file into two half-frame assets (left/right).
-    restore_stitches: dict | None = None  # {primary_path: {paths, transforms, canvas, sizes, hash}} (session restore).
 
 
 @dataclass(frozen=True)
@@ -161,11 +127,6 @@ class PreviewLoadTask:
     green_path: str = ""  # RGB-scan triplet: green/blue exposures merged with file_path (red).
     blue_path: str = ""
     align: bool = True  # sub-pixel registration of the triplet
-    stitch_paths: tuple[str, ...] = ()  # stitch composite: non-primary parts + stored registration
-    stitch_transforms: tuple[tuple[float, ...], ...] = ()
-    stitch_canvas: tuple[int, int] = (0, 0)
-    stitch_sizes: tuple[tuple[int, int], ...] = ()
-    flatfield_path: str = ""  # per-part flat-field for stitch previews
 
 
 class RenderWorker(QObject):
@@ -176,8 +137,6 @@ class RenderWorker(QObject):
 
     finished = pyqtSignal(object, dict)  # (ndarray|GPUTexture, metrics)
     metrics_updated = pyqtSignal(dict)  # Late-arriving metrics (histogram, etc.)
-    strip_finished = pyqtSignal(object, object)  # (one mosaic ndarray per quarter-turn, content_rect|None)
-    strip_progress = pyqtSignal(int, int)  # (patches printed, total)
     error = pyqtSignal(str)
 
     def __init__(self) -> None:
@@ -226,92 +185,28 @@ class RenderWorker(QObject):
                 result = result.readback()
 
             if soft_proof and isinstance(result, np.ndarray):
-                result = self._soft_proof(
-                    result, task.config, task.color_space, task.icc_input_path, task.icc_output_path, task.monitor_icc_bytes
+                pil_img = self._processor.buffer_to_pil(result, task.config)
+                pil_proof = self._processor.soft_proof_preview(
+                    pil_img,
+                    task.color_space,
+                    task.icc_input_path,
+                    task.icc_output_path,
+                    task.monitor_icc_bytes,
                 )
+                arr = np.array(pil_proof)
+                result = arr.astype(np.float32) / (65535.0 if arr.dtype == np.uint16 else 255.0)
 
             # Ensure ground truth is stored in metrics for view consumption
             metrics["base_positive"] = result
             # Render identity, so the controller can reject stale/ephemeral bounds writeback.
             metrics["source_hash"] = task.source_hash
             metrics["ephemeral"] = task.ephemeral
-            metrics["memo_key"] = task.memo_key
-            metrics["compare"] = task.compare
 
             self.finished.emit(result, metrics)
             self.metrics_updated.emit(metrics)
 
         except Exception as e:
             logger.exception("Render pipeline failed")
-            self.error.emit(str(e))
-
-    def _soft_proof(
-        self,
-        result: np.ndarray,
-        config: WorkspaceConfig,
-        color_space: str,
-        icc_input_path: Optional[str],
-        icc_output_path: Optional[str],
-        monitor_icc_bytes: Optional[bytes],
-    ) -> np.ndarray:
-        """Bake source→output→monitor into the buffer; the display transform is then a
-        no-op (see AppController.display_transform_params)."""
-        pil_proof = self._processor.soft_proof_preview(
-            self._processor.buffer_to_pil(result, config),
-            color_space,
-            icc_input_path,
-            icc_output_path,
-            monitor_icc_bytes,
-        )
-        arr = np.array(pil_proof)
-        return arr.astype(np.float32) / (65535.0 if arr.dtype == np.uint16 else 255.0)
-
-    @pyqtSlot(TestStripTask)
-    def build_strip(self, task: TestStripTask) -> None:
-        """Render the frame once per patch and keep only that patch.
-
-        Runs on the render thread with the canvas's own ImageProcessor, so the patches are the
-        pixels the canvas would show. Every field a proof overrides (density/grade, or the
-        colour head's magenta/yellow) is absent from the analysis cache key, so the per-frame
-        metering is reused and only the exposure stage onward re-dispatches. Metrics are
-        dropped: a proof must not disturb the writeback the real render owns.
-        """
-        try:
-            tiles = []
-            content_rect = None
-            for override in task.overrides:
-                config = replace(task.config, exposure=replace(task.config.exposure, **override))
-                result, metrics = self._processor.run_pipeline(
-                    task.buffer,
-                    config,
-                    task.source_hash,
-                    render_size_ref=task.preview_size,
-                    prefer_gpu=task.gpu_enabled,
-                    readback_metrics=False,
-                    ir_buffer=task.ir_buffer,
-                    wants_uv_grid=False,
-                )
-                if isinstance(result, GPUTexture):
-                    result = result.readback()
-                tiles.append(result)
-                if content_rect is None:
-                    content_rect = metrics.get("content_rect")
-                self.strip_progress.emit(len(tiles), len(task.overrides))
-
-            # One mosaic per quarter-turn while the tiles are still in hand: a rotated ladder needs
-            # a different slice of each render. Peak memory is unchanged, the tiles dominate.
-            mosaics = tuple(strip_mosaic(rotate_grid(tiles, task.grid, k), proof_grid(task.grid, k)) for k in range(4))
-            # Proof the assembled mosaics, not each tile: the transform is per-pixel, so one pass
-            # per frame is identical and far cheaper than one per patch.
-            if task.icc_input_path or task.icc_output_path:
-                mosaics = tuple(
-                    self._soft_proof(m, task.config, task.color_space, task.icc_input_path, task.icc_output_path, task.monitor_icc_bytes)
-                    for m in mosaics
-                )
-            self.strip_finished.emit(mosaics, content_rect)
-
-        except Exception as e:
-            logger.exception("Test strip render failed")
             self.error.emit(str(e))
 
 
@@ -322,9 +217,6 @@ class ThumbnailWorker(QObject):
 
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(dict)
-    # Rendered positives use their own signal so the batch's bulk overwrite can't
-    # clobber a frame that already rendered on the canvas.
-    rendered_finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
     def __init__(self, asset_store) -> None:
@@ -368,15 +260,9 @@ class ThumbnailWorker(QObject):
         try:
             buf = task.buffer.copy()
             store = self._store if task.persist else None
-            thumb = get_rendered_thumbnail(
-                buf,
-                task.file_hash,
-                store,
-                color_space=task.color_space,
-                monitor_icc_bytes=task.monitor_icc_bytes,
-            )
+            thumb = get_rendered_thumbnail(buf, task.file_hash, store, color_space=task.color_space)
             if thumb:
-                self.rendered_finished.emit({task.filename: thumb})
+                self.finished.emit({task.filename: thumb})
         except Exception as e:
             logger.error(f"Thumbnail update failure: {e}")
 
@@ -397,7 +283,6 @@ class AssetDiscoveryWorker(QObject):
         """
         import os
 
-        from negpy.infrastructure.loaders.constants import is_ir_sidecar_path
         from negpy.kernel.image.logic import calculate_file_hash
 
         discovered_paths = []
@@ -412,10 +297,6 @@ class AssetDiscoveryWorker(QObject):
                         discovered_paths.append(path)
             except Exception as e:
                 logger.error(f"Discovery error for {path}: {e}")
-        # Half-frame re-discovery passes both halves' (identical) paths — hash once.
-        discovered_paths = list(dict.fromkeys(discovered_paths))
-        # IR companions ride along with their main TIFF; they are never assets of their own.
-        discovered_paths = [p for p in discovered_paths if not is_ir_sidecar_path(p)]
 
         total = len(discovered_paths)
         valid_assets = []
@@ -436,29 +317,7 @@ class AssetDiscoveryWorker(QObject):
         elif task.rgb_scan and valid_assets:
             valid_assets = self._group_rgb_triplets(valid_assets)
 
-        if task.restore_stitches and valid_assets:
-            valid_assets = self._attach_restored_stitches(valid_assets, task.restore_stitches)
-
-        if task.half_frame and valid_assets:
-            valid_assets = self._expand_half_frames(valid_assets)
-
         self.finished.emit(valid_assets)
-
-    def _expand_half_frames(self, assets: list) -> list:
-        """Expand each file into two half-frame assets sharing the path, with
-        per-half hash/name identities. Triplet assets stay whole (unsupported combo)."""
-        from negpy.services.assets.half_frame import detect_split_x_for_file, half_hash, half_name
-
-        out = []
-        for i, a in enumerate(assets):
-            if a.get("green_path") or a.get("stitch_paths"):
-                out.append(a)
-                continue
-            self.progress.emit(i + 1, len(assets), f"Split {a['name']}")
-            split_x = detect_split_x_for_file(a["path"])
-            for half in (1, 2):
-                out.append({**a, "name": half_name(a["name"], half), "hash": half_hash(a["hash"], half), "half": half, "split_x": split_x})
-        return out
 
     def _attach_restored_triplets(self, assets: list, triplets: dict) -> list:
         """Re-attach saved green/blue exposures to restored red assets (no reclassification)."""
@@ -471,32 +330,6 @@ class AssetDiscoveryWorker(QObject):
                 base = os.path.splitext(a["name"])[0]
                 align = bool(gb[2]) if len(gb) > 2 else True
                 out.append({**a, "name": f"{base} (RGB)", "green_path": gb[0], "blue_path": gb[1], "align": align})
-            else:
-                out.append(a)
-        return out
-
-    def _attach_restored_stitches(self, assets: list, stitches: dict) -> list:
-        """Re-attach saved stitch registrations to restored primary assets (no re-registration).
-        A composite whose parts vanished from disk restores as a plain asset."""
-        import os
-
-        from negpy.features.stitch.models import stitch_name
-
-        out = []
-        for a in assets:
-            entry = stitches.get(a["path"])
-            if entry and entry.get("paths") and all(os.path.exists(p) for p in entry["paths"]):
-                out.append(
-                    {
-                        **a,
-                        "name": stitch_name([a["path"], *entry["paths"]]),
-                        "hash": entry["hash"],
-                        "stitch_paths": tuple(entry["paths"]),
-                        "stitch_transforms": tuple(tuple(float(v) for v in t) for t in entry["transforms"]),
-                        "stitch_canvas": (int(entry["canvas"][0]), int(entry["canvas"][1])),
-                        "stitch_sizes": tuple((int(s[0]), int(s[1])) for s in entry["sizes"]),
-                    }
-                )
             else:
                 out.append(a)
         return out
@@ -543,8 +376,6 @@ class PreviewLoadWorker(QObject):
     finished = pyqtSignal(str, object, object, str, object, str)
     splash = pyqtSignal(str, object, object)  # (file_path, buffer, dims) — first paint
     error = pyqtSignal(str)
-    # (file_path, message) — error carries no path, so badge attribution needs this
-    load_failed = pyqtSignal(str, str)
 
     def __init__(self, preview_service) -> None:
         super().__init__()
@@ -566,37 +397,6 @@ class PreviewLoadWorker(QObject):
             return
         t0 = time.perf_counter()
         try:
-            if task.stitch_paths:
-                # Stitch composite: replay the stored registration at preview scale.
-                # No splash — the primary's embedded JPEG would flash a half frame.
-                from negpy.features.stitch.models import StitchConfig
-
-                stitch_cfg = StitchConfig(
-                    stitch_enabled=True,
-                    stitch_paths=task.stitch_paths,
-                    stitch_transforms=task.stitch_transforms,
-                    stitch_canvas=task.stitch_canvas,
-                    stitch_sizes=task.stitch_sizes,
-                )
-                raw, dims, metadata = self._preview_service.load_linear_preview_stitch(
-                    task.file_path,
-                    stitch_cfg,
-                    task.workspace_color_space,
-                    use_camera_wb=task.use_camera_wb,
-                    full_resolution=task.full_resolution,
-                    file_hash=task.file_hash,
-                    flatfield_path=task.flatfield_path,
-                )
-                source_cs = metadata.get("color_space") or WORKING_COLOR_SPACE
-                ir_preview = metadata.get("ir_preview")
-                detected_mode = self._detect_mode(task, raw) if task.detect_mode else ""
-                logger.info(
-                    "load-timing preview_worker_total %.0fms (stitch load->buffer) %s",
-                    (time.perf_counter() - t0) * 1000,
-                    task.file_path,
-                )
-                self.finished.emit(task.file_path, raw, dims, source_cs, ir_preview, detected_mode)
-                return
             if task.green_path and task.blue_path:
                 # RGB-scan triplet: assemble the frame from the three exposures.
                 # No splash — the red embedded JPEG would flash a red-cast preview.
@@ -610,7 +410,7 @@ class PreviewLoadWorker(QObject):
                     file_hash=task.file_hash,
                     align=task.align,
                 )
-                source_cs = metadata.get("color_space") or WORKING_COLOR_SPACE
+                source_cs = metadata.get("color_space", "")
                 ir_preview = metadata.get("ir_preview")
                 detected_mode = self._detect_mode(task, raw) if task.detect_mode else ""
                 logger.info(
@@ -642,7 +442,7 @@ class PreviewLoadWorker(QObject):
                     file_hash=task.file_hash,
                     log_timings=True,
                 )
-            source_cs = metadata.get("color_space") or WORKING_COLOR_SPACE
+            source_cs = metadata.get("color_space", "")
             ir_preview = metadata.get("ir_preview")
             detected_mode = self._detect_mode(task, raw) if task.detect_mode else ""
             logger.info(
@@ -654,7 +454,6 @@ class PreviewLoadWorker(QObject):
         except Exception as e:
             logger.exception(f"Asset load failed: {task.file_path}")
             self.error.emit(str(e))
-            self.load_failed.emit(task.file_path, str(e))
 
     def _detect_mode(self, task: PreviewLoadTask, raw) -> str:
         """Classify film process mode; re-decode no-WB since the C41 mask is hidden by camera WB."""
@@ -729,15 +528,13 @@ class BatchAutoCropWorker(QObject):
             self.cancelled.emit()
 
     def _decode(self, frame: BatchAutoCropInput, workspace_color_space: str) -> np.ndarray:
-        from negpy.services.assets.half_frame import base_hash, slice_for_asset
-
         file_info = frame.file_info
         config = frame.config
         rgbscan = config.rgbscan
         common = {
             "use_camera_wb": not config.process.linear_raw,
             "full_resolution": False,
-            "file_hash": base_hash(file_info.get("hash")),  # halves share one decode
+            "file_hash": file_info.get("hash"),
         }
         if rgbscan.enabled and rgbscan.green_path and rgbscan.blue_path:
             raw, _, _ = self._preview_service.load_linear_preview_rgb(
@@ -754,7 +551,7 @@ class BatchAutoCropWorker(QObject):
                 workspace_color_space,
                 **common,
             )
-        return slice_for_asset(raw, file_info)
+        return raw
 
     @pyqtSlot(BatchAutoCropTask)
     def process(self, task: BatchAutoCropTask) -> None:
@@ -806,7 +603,6 @@ class BatchAutoCropWorker(QObject):
                         key,
                         transformed,
                         target_ratio=config.geometry.autocrop_ratio,
-                        rebate_trim=config.geometry.autocrop_rebate_trim,
                     )
                     if self._emit_cancelled_if_requested(generation):
                         return
@@ -887,7 +683,6 @@ class NormalizationWorker(QObject):
         from negpy.domain.interfaces import PipelineContext
         from negpy.features.exposure.normalization import analyze_log_exposure_bounds, resolve_crosstalk_matrix
         from negpy.features.geometry.processor import GeometryProcessor
-        from negpy.services.assets.half_frame import base_hash, slice_for_asset
 
         self._cancel.clear()
         total = len(task.files)
@@ -924,14 +719,8 @@ class NormalizationWorker(QObject):
                         task.workspace_color_space,
                         not linear_raw,  # use_camera_wb
                         False,  # full_resolution
-                        base_hash(f_info.get("hash")),  # halves share one decode
+                        f_info.get("hash"),
                     )
-                    raw = slice_for_asset(raw, f_info)
-                    # Bounds must be measured on the same channel mix the render path
-                    # normalizes (triplet composites are never sensor-corrected there).
-                    sensor_matrix = effective_sensor_matrix(params.process) if params is not None else None
-                    if sensor_matrix is not None and not is_rgb_triplet(params.rgbscan):
-                        raw = await asyncio.to_thread(apply_sensor_correction, raw, sensor_matrix)
 
                     ctx = PipelineContext(
                         original_size=(raw.shape[1], raw.shape[0]),

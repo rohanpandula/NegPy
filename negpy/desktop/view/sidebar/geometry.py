@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
 )
 
 from negpy.desktop.session import ToolMode
@@ -15,7 +16,7 @@ from negpy.desktop.view.sidebar.base import BaseSidebar
 from negpy.desktop.view.styles.templates import EditedDot, default_button_height, field_label, section_subheader
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.sliders import CompactSlider
-from negpy.domain.models import CROP_RATIO_CHOICES, canonical_crop_ratio
+from negpy.domain.models import AspectRatio
 from negpy.features.geometry.models import FINE_ROTATION_LIMIT, AutocropMode
 from negpy.features.process.models import invalidate_local_bounds
 
@@ -51,11 +52,10 @@ class GeometrySidebar(BaseSidebar):
         ratio_row = QHBoxLayout()
         ratio_row.addWidget(self._field_label("Ratio"))
         self.ratio_combo = QComboBox()
-        # One entry per shape (see CROP_RATIO_CHOICES) — the crop tool auto-orients
-        # to match the current drag, so a separate portrait entry for every ratio
-        # would just duplicate the same shape twice.
-        self.ratio_combo.addItems([r.value for r in CROP_RATIO_CHOICES])
-        self.ratio_combo.setCurrentText(canonical_crop_ratio(conf.autocrop_ratio))
+        # Filter out 'Original' as it's not a crop ratio (usually 'Free' is used for no constraint)
+        ratios = [r.value for r in AspectRatio if r != AspectRatio.ORIGINAL]
+        self.ratio_combo.addItems(ratios)
+        self.ratio_combo.setCurrentText(conf.autocrop_ratio)
         self.ratio_combo.setPlaceholderText("Select Ratio...")
         ratio_row.addWidget(self.ratio_combo, 1)
 
@@ -68,6 +68,7 @@ class GeometrySidebar(BaseSidebar):
         self.manual_crop_btn = CropToolButton(" Crop")
         self.manual_crop_btn.setCheckable(True)
         self.manual_crop_btn.setIcon(qta.icon("fa5s.crop-alt", color=THEME.text_primary, color_on="#FFFFFF"))
+        self.manual_crop_btn.setToolTip(tooltip_with_shortcut("Crop: drag corners to resize, drag inside to move", "manual_crop"))
 
         self.clear_crop_btn = QPushButton(" Reset")
         self.clear_crop_btn.setIcon(qta.icon("fa5s.undo", color=THEME.text_primary))
@@ -96,15 +97,34 @@ class GeometrySidebar(BaseSidebar):
 
         self.layout.addWidget(section_subheader("AUTO CROP"))
 
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(self._field_label("Mode"))
+        # Auto crop toggle + mode: crop to exposed image, or keep full film incl. rebate
+        auto_row = QHBoxLayout()
+        self.reset_crop_btn = CropToolButton(" Auto")
+        self.reset_crop_btn.setCheckable(True)
+        self.reset_crop_btn.setIcon(qta.icon("fa5s.magic", color=THEME.text_primary, color_on="#FFFFFF", color_disabled=THEME.text_muted))
+        self.reset_crop_btn.setFixedHeight(default_button_height())
+        self.reset_crop_btn.setToolTip(tooltip_with_shortcut("Apply automatic crop using the current ratio and offset", "auto_crop"))
+
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Image only", AutocropMode.IMAGE.value)
         self.mode_combo.addItem("Film edge", AutocropMode.FILM.value)
         self.mode_combo.setCurrentIndex(self.mode_combo.findData(conf.autocrop_mode))
         self.mode_combo.setToolTip("Auto crop target: exposed image only, or full film including rebate/sprockets")
-        mode_row.addWidget(self.mode_combo, 1)
-        self.layout.addLayout(mode_row)
+        self.reset_crop_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.mode_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        auto_row.addWidget(self.reset_crop_btn, 1)
+        auto_row.addWidget(self.mode_combo, 1)
+        self.layout.addLayout(auto_row)
+
+        self.auto_crop_all_btn = QPushButton(" Auto Crop All")
+        self.auto_crop_all_btn.setIcon(qta.icon("fa5s.layer-group", color=THEME.text_primary, color_disabled=THEME.text_muted))
+        self.auto_crop_all_btn.setFixedHeight(default_button_height())
+        self.auto_crop_all_btn.setToolTip(
+            "Analyze all visible landscape frames as one roll. Confident frames calibrate weak ones; "
+            "manual and ambiguous crops are preserved. Runs before Batch Analysis."
+        )
+        self.auto_crop_all_btn.setEnabled(conf.autocrop_mode == AutocropMode.IMAGE)
+        self.layout.addWidget(self.auto_crop_all_btn)
 
         self.offset_slider = CompactSlider(
             "Crop Offset",
@@ -115,49 +135,22 @@ class GeometrySidebar(BaseSidebar):
             precision=1,
             unit=" px",
         )
-        self.rebate_trim_slider = CompactSlider(
-            "Rebate Trim",
-            0.0,
-            150.0,
-            conf.autocrop_rebate_trim * 100.0,
-            step=5.0,
-            precision=1,
-            unit=" %",
-        )
-        self.rebate_trim_slider.setToolTip(
-            "How far into the detected rebate auto crop cuts: 0% stops at the film edge, "
-            "100% lands on the image edge, above 100% bites in to clear a white border"
-        )
-        self.rebate_trim_slider.setEnabled(conf.autocrop_mode == AutocropMode.IMAGE)
-
-        trim_row = QHBoxLayout()
-        trim_row.addWidget(self.offset_slider, 1)
-        trim_row.addWidget(self.rebate_trim_slider, 1)
-        self.layout.addLayout(trim_row)
-
-        # Auto crop actions: apply to this frame, or to the whole roll.
-        auto_row = QHBoxLayout()
-        self.reset_crop_btn = CropToolButton(" Auto")
-        self.reset_crop_btn.setCheckable(True)
-        self.reset_crop_btn.setIcon(qta.icon("fa5s.magic", color=THEME.text_primary, color_on="#FFFFFF", color_disabled=THEME.text_muted))
-        self.reset_crop_btn.setFixedHeight(default_button_height())
-
-        self.auto_crop_all_btn = QPushButton(" Batch Autocrop")
-        self.auto_crop_all_btn.setIcon(qta.icon("fa5s.layer-group", color=THEME.text_primary, color_disabled=THEME.text_muted))
-        self.auto_crop_all_btn.setFixedHeight(default_button_height())
-        self.auto_crop_all_btn.setToolTip(
-            "Analyze all visible landscape frames as one roll. Confident frames calibrate weak ones; "
-            "manual and ambiguous crops are preserved. Runs before Batch Analysis."
-        )
-        self.auto_crop_all_btn.setEnabled(conf.autocrop_mode == AutocropMode.IMAGE)
-        auto_row.addWidget(self.reset_crop_btn, 1)
-        auto_row.addWidget(self.auto_crop_all_btn, 1)
-        self.layout.addLayout(auto_row)
+        self.offset_slider.setToolTip(tooltip_with_shortcut("Insets the crop border from the auto-detected film edge (px)", "offset_inc"))
+        self.layout.addWidget(self.offset_slider)
 
         self.layout.addWidget(section_subheader("ALIGNMENT"))
 
         align_row = QHBoxLayout()
-        self.straighten_btn = self._tool_toggle("fa5s.ruler", "", "")
+        self.straighten_btn = self._tool_toggle(
+            "fa5s.ruler",
+            "",
+            tooltip_with_shortcut(
+                "Straighten with a reference line — draw along the horizon or a vertical edge "
+                "(a building, a door frame) and the image rotates to make it level or plumb. "
+                "Applies once per line; Esc cancels an in-progress line",
+                "straighten",
+            ),
+        )
         self.straighten_btn.setFixedWidth(36)
 
         # Slider shows the photographer's convention — positive = clockwise on screen.
@@ -165,6 +158,10 @@ class GeometrySidebar(BaseSidebar):
         # counter-clockwise, flip-independent because flips apply before fine rotation),
         # so saved edits keep their meaning: display = -stored at this boundary.
         self.fine_rot_slider = CompactSlider("Fine Rotation", -FINE_ROTATION_LIMIT, FINE_ROTATION_LIMIT, -conf.fine_rotation, unit="°")
+        self.fine_rot_slider.setToolTip(
+            "Fine-tunes rotation to correct tilt (degrees): positive turns clockwise, negative counter-clockwise. "
+            "For quick rotation, drag the round handles outside the crop box in the Crop tool."
+        )
         align_row.addWidget(self.fine_rot_slider, 1)
         align_row.addWidget(self.straighten_btn, 0)
         self.layout.addLayout(align_row)
@@ -193,13 +190,6 @@ class GeometrySidebar(BaseSidebar):
         )
         self.offset_slider.valueCommitted.connect(self._on_offset_committed)
 
-        self.rebate_trim_slider.valueChanged.connect(
-            lambda v: self.update_config_section(
-                "geometry", render=True, persist=False, readback_metrics=False, autocrop_rebate_trim=v / 100.0
-            )
-        )
-        self.rebate_trim_slider.valueCommitted.connect(self._on_rebate_trim_committed)
-
         self.straighten_btn.toggled.connect(self._on_straighten_toggled)
 
         # Display convention is CW-positive; negate crossing into the stored convention.
@@ -212,11 +202,16 @@ class GeometrySidebar(BaseSidebar):
         )
 
     def _on_ratio_changed(self, ratio: str) -> None:
-        self.controller.set_crop_ratio(ratio)
+        new_config = replace(
+            self.state.config,
+            geometry=replace(self.state.config.geometry, autocrop_ratio=ratio),
+            process=replace(self.state.config.process, **invalidate_local_bounds(self.state.config.process)),
+        )
+        self.controller.session.update_config(new_config, persist=True)
+        self.controller.request_render()
 
     def _on_mode_changed(self, idx: int) -> None:
         self.auto_crop_all_btn.setEnabled(self.mode_combo.itemData(idx) == AutocropMode.IMAGE)
-        self.rebate_trim_slider.setEnabled(self.mode_combo.itemData(idx) == AutocropMode.IMAGE)
         new_config = replace(
             self.state.config,
             geometry=replace(self.state.config.geometry, autocrop_mode=self.mode_combo.itemData(idx)),
@@ -229,15 +224,6 @@ class GeometrySidebar(BaseSidebar):
         new_config = replace(
             self.state.config,
             geometry=replace(self.state.config.geometry, autocrop_offset=int(v)),
-            process=replace(self.state.config.process, **invalidate_local_bounds(self.state.config.process)),
-        )
-        self.controller.session.update_config(new_config, persist=True)
-        self.controller.request_render()
-
-    def _on_rebate_trim_committed(self, v: float) -> None:
-        new_config = replace(
-            self.state.config,
-            geometry=replace(self.state.config.geometry, autocrop_rebate_trim=v / 100.0),
             process=replace(self.state.config.process, **invalidate_local_bounds(self.state.config.process)),
         )
         self.controller.session.update_config(new_config, persist=True)
@@ -262,11 +248,10 @@ class GeometrySidebar(BaseSidebar):
         try:
             self.guide_combo.setCurrentIndex(self.guide_combo.findData(self.state.crop_guide))
             self._sync_guide_orient_btn()
-            self.ratio_combo.setCurrentText(canonical_crop_ratio(conf.autocrop_ratio))
+            self.ratio_combo.setCurrentText(conf.autocrop_ratio)
             self.mode_combo.setCurrentIndex(self.mode_combo.findData(conf.autocrop_mode))
 
             self.offset_slider.setValue(float(conf.autocrop_offset))
-            self.rebate_trim_slider.setValue(conf.autocrop_rebate_trim * 100.0)
             self.fine_rot_slider.setValue(-conf.fine_rotation)
 
             self.manual_crop_btn.setChecked(self.state.active_tool == ToolMode.CROP_MANUAL)
@@ -275,7 +260,6 @@ class GeometrySidebar(BaseSidebar):
             self.manual_crop_btn.set_crop_active(conf.manual_crop_rect is not None)
             self.reset_crop_btn.set_crop_active(conf.auto_crop_enabled)
             self.auto_crop_all_btn.setEnabled(conf.autocrop_mode == AutocropMode.IMAGE)
-            self.rebate_trim_slider.setEnabled(conf.autocrop_mode == AutocropMode.IMAGE)
         finally:
             self.block_signals(False)
 
@@ -286,7 +270,6 @@ class GeometrySidebar(BaseSidebar):
         self.mode_combo.blockSignals(blocked)
         self.detect_ratio_btn.blockSignals(blocked)
         self.offset_slider.blockSignals(blocked)
-        self.rebate_trim_slider.blockSignals(blocked)
         self.fine_rot_slider.blockSignals(blocked)
         self.manual_crop_btn.blockSignals(blocked)
         self.straighten_btn.blockSignals(blocked)
