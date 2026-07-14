@@ -73,6 +73,12 @@ _IR_OPTION_NAMES = ("ir", "preview_ir")
 # with different semantics, so it must stay backend-scoped.
 _COOLSCAN3_IR_OPTION_NAME = "infrared"
 
+# Vendor eject/unload action option (SANE_TYPE_BUTTON on the coolscan3
+# backend; confirmed reachable via `scanimage --eject` on the LS-5000).
+# Presence-only, like _find_ir_option — a device without it simply has no
+# eject capability to gate on.
+_EJECT_OPTION_NAMES = ("eject",)
+
 _PIEUSB_PREFIX = "pieusb:"
 _COOLSCAN3_PREFIX = "coolscan3:"
 _SPLIT_DIAGNOSTICS_ENV = "NEGPY_SPLIT_DIAGNOSTICS_DIR"
@@ -244,6 +250,14 @@ def _find_ir_option(opt) -> str | None:
     """Return a legacy dedicated-IR option, preserving presence-only behavior."""
     for key in opt:
         if str(key).lower().replace("-", "_").strip("_") in _IR_OPTION_NAMES:
+            return str(key)
+    return None
+
+
+def _find_eject_option(opt) -> str | None:
+    """Return the device's vendor eject/unload action option, if any."""
+    for key in opt:
+        if str(key).lower().replace("-", "_").strip("_") in _EJECT_OPTION_NAMES:
             return str(key)
     return None
 
@@ -1802,6 +1816,52 @@ class SaneBackend:
                 dev.close()
             except Exception:
                 pass
+
+    def eject(self, device_id: str) -> bool:
+        """Trigger the device's vendor eject action, if it exposes one.
+
+        Mirrors Nikon Scan's own behavior of ejecting film at batch
+        completion instead of leaving it parked (the LS-5000 feeder
+        auto-parks a few minutes after any session closes; a parked feeder
+        needs a power-cycle to recover mid-roll). Capability-gated: returns
+        False as a clean no-op when the device has no active, settable
+        'eject' option — e.g. a backend other than coolscan3. Raises when
+        the option is present but triggering it, or the surrounding
+        open/close, fails; callers that must not fail an otherwise-complete
+        run over a transport hiccup are responsible for catching and
+        logging.
+        """
+
+        try:
+            self._ensure_initialized()
+        except Exception as exc:
+            raise RuntimeError(f"Failed to initialize SANE before eject: {exc}") from exc
+
+        try:
+            dev = self._sane.open(device_id)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to open scanner {device_id} to eject: {exc}") from exc
+
+        try:
+            option_map = dev.opt if hasattr(dev, "opt") else {}
+            eject_option = _find_eject_option(option_map)
+            if eject_option is None or not _option_is_usable(option_map[eject_option]):
+                triggered = False
+            else:
+                setattr(dev, eject_option, True)
+                triggered = True
+        except Exception as exc:
+            try:
+                dev.close()
+            except Exception:
+                pass
+            raise RuntimeError(f"Could not trigger eject on {device_id!r}: {exc}") from exc
+
+        try:
+            dev.close()
+        except Exception as exc:
+            raise RuntimeError(f"Could not close scanner device {device_id!r} after eject: {exc}") from exc
+        return triggered
 
     def _set_pieusb_flags(self, dev, capture_ir) -> None:
         """Apply hardware-specific optimizations for pieusb scanners."""

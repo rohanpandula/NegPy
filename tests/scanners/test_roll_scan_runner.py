@@ -408,6 +408,30 @@ class FakeForwardOperations:
         return hashlib.sha256(manifest_path.read_bytes()).hexdigest()
 
 
+@dataclass
+class FakeForwardOperationsWithEject(FakeForwardOperations):
+    """A FakeForwardOperations that also exposes the optional eject hook."""
+
+    eject_calls: int = 0
+    eject_error: Exception | None = None
+    eject_result: bool = True
+
+    def eject(self) -> bool:
+        self.eject_calls += 1
+        if self.eject_error is not None:
+            raise self.eject_error
+        return self.eject_result
+
+
+@dataclass
+class FailingCaptureForwardOperations(FakeForwardOperationsWithEject):
+    """Aborts mid-chunk so the run never reaches successful completion."""
+
+    def capture_chunk(self, *, plan_path, archive_dir, identity, frames, stop, progress):
+        self.calls.append(("capture", tuple(frames)))
+        raise RuntimeError("synthetic capture failure")
+
+
 def test_forward_roll_cli_requires_confirmation_and_runs_sequential_chunks(monkeypatch, tmp_path, capsys) -> None:
     operations = FakeForwardOperations()
     monkeypatch.setenv(runner.LIVE_ENV, "YES")
@@ -497,3 +521,144 @@ def test_forward_roll_cli_requires_confirmation_and_runs_sequential_chunks(monke
     summary = json.loads(capsys.readouterr().out)
     assert summary["complete"] is True
     assert summary["completed_frames"] == [1, 2, 3, 4, 5]
+
+
+def _forward_roll_argv(output, *, frames: str = "1-3", extra: list[str] | None = None) -> list[str]:
+    return [
+        "forward-roll",
+        "--live",
+        "--yes",
+        "--frames",
+        frames,
+        "--chunk-size",
+        "3",
+        "--output",
+        str(output),
+        "--device",
+        "coolscan3:usb:test",
+        *(extra or []),
+    ]
+
+
+def test_forward_roll_ejects_after_full_completion_by_default(monkeypatch, tmp_path, capsys) -> None:
+    """(a) eject fires exactly once when the declared roll fully completes."""
+    operations = FakeForwardOperationsWithEject()
+    monkeypatch.setenv(runner.LIVE_ENV, "YES")
+
+    code = runner.main(
+        _forward_roll_argv(tmp_path / "roll"),
+        forward_operations_factory=lambda _service, _device: operations,
+    )
+
+    assert code == 0
+    assert operations.eject_calls == 1
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["complete"] is True
+    assert summary["ejected"] is True
+
+
+def test_forward_roll_does_not_eject_when_a_max_chunks_pause_leaves_it_incomplete(monkeypatch, tmp_path, capsys) -> None:
+    """(b) a deliberate --max-chunks review pause must not eject mid-roll."""
+    operations = FakeForwardOperationsWithEject()
+    monkeypatch.setenv(runner.LIVE_ENV, "YES")
+
+    # Two chunks (1-3, 4-6) so --max-chunks 1 genuinely truncates the run
+    # instead of coinciding with the roll's only/last chunk.
+    code = runner.main(
+        _forward_roll_argv(tmp_path / "roll", extra=["--max-chunks", "1"], frames="1-6"),
+        forward_operations_factory=lambda _service, _device: operations,
+    )
+
+    assert code == 0
+    assert operations.eject_calls == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["complete"] is False
+    assert summary["ejected"] is False
+
+
+def test_forward_roll_does_not_eject_when_the_run_aborts(monkeypatch, tmp_path) -> None:
+    """(b) a hard failure mid-chunk must not eject; the run never reaches completion."""
+    operations = FailingCaptureForwardOperations()
+    monkeypatch.setenv(runner.LIVE_ENV, "YES")
+
+    code = runner.main(
+        _forward_roll_argv(tmp_path / "roll"),
+        forward_operations_factory=lambda _service, _device: operations,
+    )
+
+    assert code == 2
+    assert operations.eject_calls == 0
+
+
+def test_forward_roll_swallows_an_eject_failure_and_still_reports_success(monkeypatch, tmp_path, capsys) -> None:
+    """(c) a mocked eject failure must not fail an otherwise-complete run."""
+    operations = FakeForwardOperationsWithEject(eject_error=RuntimeError("transport busy"))
+    monkeypatch.setenv(runner.LIVE_ENV, "YES")
+
+    code = runner.main(
+        _forward_roll_argv(tmp_path / "roll"),
+        forward_operations_factory=lambda _service, _device: operations,
+    )
+
+    assert code == 0
+    assert operations.eject_calls == 1
+    captured = capsys.readouterr()
+    summary = json.loads(captured.out)
+    assert summary["complete"] is True
+    assert summary["ejected"] is False
+    assert "transport busy" in captured.err
+
+
+def test_forward_roll_skips_eject_cleanly_when_operations_exposes_no_eject_capability(monkeypatch, tmp_path, capsys) -> None:
+    """(d) capability-gating: an operations boundary without eject() is a clean no-op."""
+    operations = FakeForwardOperations()  # the plain fake predates the eject hook entirely
+    monkeypatch.setenv(runner.LIVE_ENV, "YES")
+
+    code = runner.main(
+        _forward_roll_argv(tmp_path / "roll"),
+        forward_operations_factory=lambda _service, _device: operations,
+    )
+
+    assert code == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["complete"] is True
+    assert summary["ejected"] is False
+
+
+def test_forward_roll_no_eject_flag_suppresses_eject_on_full_completion(monkeypatch, tmp_path, capsys) -> None:
+    """--no-eject opts out even when the roll completes cleanly."""
+    operations = FakeForwardOperationsWithEject()
+    monkeypatch.setenv(runner.LIVE_ENV, "YES")
+
+    code = runner.main(
+        _forward_roll_argv(tmp_path / "roll", extra=["--no-eject"]),
+        forward_operations_factory=lambda _service, _device: operations,
+    )
+
+    assert code == 0
+    assert operations.eject_calls == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["complete"] is True
+    assert summary["ejected"] is False
+
+
+def test_runner_forward_operations_eject_delegates_to_the_roll_scan_service() -> None:
+    """The production adapter's eject() is a thin passthrough to the service."""
+
+    class RecordingService:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def eject(self, device_id: str) -> bool:
+            self.calls.append(device_id)
+            return True
+
+    service = RecordingService()
+    operations = runner._RunnerForwardOperations(
+        cast(RollScanService, service),
+        device_id="coolscan3:usb:test",
+        registration_signature={"algorithm": "test", "version": 1},
+    )
+
+    assert operations.eject() is True
+    assert service.calls == ["coolscan3:usb:test"]

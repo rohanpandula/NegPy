@@ -2038,3 +2038,12 @@ class RollScanService:
                 + ", ".join(str(frame) for frame in missing)
             )
         return completed
+
+    def eject(self, device_id: str) -> bool:
+        """Trigger a capability-gated film eject; False when unsupported.
+
+        Thin passthrough to the wrapped ScannerService so callers that only
+        hold a RollScanService (e.g. the roll-scan CLI) do not need direct
+        access to the private scanner boundary.
+        """
+        return self._scanner.eject(device_id)

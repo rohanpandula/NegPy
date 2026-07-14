@@ -64,6 +64,18 @@ class ScannerService:
         backend = self._get_backend()
         return backend.scan(device_id, params, progress, cancel)
 
+    def eject(self, device_id: str) -> bool:
+        """Trigger a capability-gated film eject; False when unsupported.
+
+        Mirrors the optional-method pattern in refresh_devices/probe_device
+        above — only SaneBackend implements this today.
+        """
+        backend = self._get_backend()
+        eject = getattr(backend, "eject", None)
+        if not callable(eject):
+            return False
+        return bool(eject(device_id))
+
     def write_result(
         self,
         result: ScanResult,

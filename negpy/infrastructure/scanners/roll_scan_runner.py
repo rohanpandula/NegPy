@@ -318,6 +318,10 @@ class _RunnerForwardOperations:
             frame=frame,
         )
 
+    def eject(self) -> bool:
+        """Trigger a capability-gated eject of the just-completed roll."""
+        return self._service.eject(self._device_id)
+
 
 def _plan_summary(plan: RollScanPlan, *, plan_path: Path | None = None) -> dict[str, object]:
     frames: list[dict[str, object]] = []
@@ -496,6 +500,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="resume only if the film has not been ejected or reinserted",
     )
     forward.add_argument("--live", action="store_true", help=f"allow hardware I/O when {LIVE_ENV}=YES")
+    forward.add_argument(
+        "--no-eject",
+        action="store_true",
+        help="do not eject the film once the entire declared roll completes (default: eject, capability-gated)",
+    )
     return parser
 
 
@@ -508,6 +517,36 @@ def _forward_roll_identity(output: Path, *, resume: bool) -> PlanIdentity:
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"cannot recover forward-roll identity from {checkpoint_path}: {exc}") from exc
     return PlanIdentity(str(uuid4()), str(uuid4()), str(uuid4()))
+
+
+def _eject_after_forward_roll(operations: object, *, complete: bool, requested: bool) -> bool:
+    """Fail-soft, capability-gated eject after a fully completed forward-roll.
+
+    Mirrors Nikon Scan ejecting film at batch completion instead of leaving
+    it parked (the LS-5000 feeder auto-parks a few minutes after any session
+    closes, and a parked feeder needs a power-cycle to recover mid-roll).
+    Fires only when this call finished the *entire* declared roll — a
+    ``--max-chunks``-truncated pause leaves ``complete`` False and must not
+    eject, since the next invocation resumes the same insertion.
+
+    Never raises: an eject failure must not take down an otherwise-complete,
+    already-persisted archive. ``operations`` is duck-typed so plain
+    ``ForwardRollOperations`` fakes without an ``eject`` method are a clean
+    no-op, matching the device-level capability gate in SaneBackend.eject.
+    """
+    if not complete or not requested:
+        return False
+    eject = getattr(operations, "eject", None)
+    if not callable(eject):
+        return False
+    try:
+        ejected = bool(eject())
+    except Exception as exc:
+        print(f"eject after forward-roll completion failed (archive unaffected): {exc}", file=sys.stderr)
+        return False
+    if not ejected:
+        print("forward-roll complete; device reports no eject capability, film left in the feeder", file=sys.stderr)
+    return ejected
 
 
 def main(
@@ -668,6 +707,11 @@ def main(
                     progress=_ProgressPrinter(),
                     max_chunks=args.max_chunks,
                 )
+            ejected = _eject_after_forward_roll(
+                operations,
+                complete=checkpoint.complete,
+                requested=not args.no_eject,
+            )
             print(
                 json.dumps(
                     {
@@ -677,6 +721,7 @@ def main(
                         "completed_frames": list(checkpoint.completed_frames),
                         "invalid_frames": list(checkpoint.invalid_frames),
                         "complete": checkpoint.complete,
+                        "ejected": ejected,
                     },
                     indent=2,
                 )
