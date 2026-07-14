@@ -3,7 +3,7 @@
 import math
 
 import pytest
-from negpy.infrastructure.scanners.params import RegisteredScanGeometry, ScanMode, ScanParams
+from negpy.infrastructure.scanners.params import RegisteredScanGeometry, ScanMode, ScanParams, parse_registration_manifest
 from negpy.infrastructure.scanners.base import ScannerCapabilities
 
 
@@ -63,6 +63,73 @@ class TestScanParams:
         params = ScanParams(dpi=1200, depth=16, capture_ir=False)
         with pytest.raises(Exception):
             params.dpi = 2400  # type: ignore[misc]
+
+
+class TestParseRegistrationManifest:
+    """Schema matches roll_scan_runner's --registration-json. Numeric/geometric
+    validation is intentionally delegated to RegisteredScanGeometry.__post_init__
+    rather than duplicated here."""
+
+    def test_extracts_matching_frame_entry(self) -> None:
+        data = {"frames": [{"frame": 3, "subframe_mm": 6.35, "br_y": 5003}]}
+        geometry = parse_registration_manifest(data, frame=3)
+        assert geometry == RegisteredScanGeometry(subframe_mm=6.35, br_y_device_px=5003, frame=3)
+
+    def test_picks_correct_entry_among_several(self) -> None:
+        data = {
+            "frames": [
+                {"frame": 1, "subframe_mm": 1.0, "br_y": 100},
+                {"frame": 3, "subframe_mm": 6.35, "br_y": 5003},
+            ]
+        }
+        geometry = parse_registration_manifest(data, frame=3)
+        assert geometry.subframe_mm == 6.35
+        assert geometry.br_y_device_px == 5003
+
+    def test_missing_frames_key_raises(self) -> None:
+        with pytest.raises(ValueError, match="frames"):
+            parse_registration_manifest({}, frame=1)
+
+    def test_non_dict_payload_raises(self) -> None:
+        with pytest.raises(ValueError):
+            parse_registration_manifest([{"frame": 1}], frame=1)
+
+    def test_no_matching_frame_raises(self) -> None:
+        data = {"frames": [{"frame": 1, "subframe_mm": 1.0, "br_y": 100}]}
+        with pytest.raises(ValueError, match="no entry for frame 3"):
+            parse_registration_manifest(data, frame=3)
+
+    def test_duplicate_frame_entries_raise(self) -> None:
+        data = {
+            "frames": [
+                {"frame": 3, "subframe_mm": 6.35, "br_y": 5003},
+                {"frame": 3, "subframe_mm": 6.4, "br_y": 5010},
+            ]
+        }
+        with pytest.raises(ValueError, match="duplicate"):
+            parse_registration_manifest(data, frame=3)
+
+    def test_missing_subframe_mm_raises(self) -> None:
+        data = {"frames": [{"frame": 3, "br_y": 5003}]}
+        with pytest.raises(ValueError, match="subframe_mm"):
+            parse_registration_manifest(data, frame=3)
+
+    def test_missing_br_y_raises(self) -> None:
+        data = {"frames": [{"frame": 3, "subframe_mm": 6.35}]}
+        with pytest.raises(ValueError, match="br_y"):
+            parse_registration_manifest(data, frame=3)
+
+    def test_bool_frame_does_not_masquerade_as_int_frame(self) -> None:
+        # JSON `true`/`false` decode to Python bool, and True == 1 / False == 0 —
+        # type(...) is int (not isinstance) keeps a boolean entry from matching.
+        data = {"frames": [{"frame": True, "subframe_mm": 6.35, "br_y": 5003}]}
+        with pytest.raises(ValueError, match="no entry for frame 1"):
+            parse_registration_manifest(data, frame=1)
+
+    def test_invalid_geometry_values_delegate_to_dataclass_validation(self) -> None:
+        data = {"frames": [{"frame": 3, "subframe_mm": -1.0, "br_y": 5003}]}
+        with pytest.raises(ValueError):
+            parse_registration_manifest(data, frame=3)
 
 
 class TestCapabilityFiltering:

@@ -302,6 +302,20 @@ def _detect_multi_sample(opt) -> bool:
     return "samples_per_scan" in opt
 
 
+def _detect_auto_exposure(opt) -> bool:
+    """True if the device exposes hardware auto-exposure metering (SANE `ae`).
+
+    Presence-only, like `_detect_multi_sample` — the fail-loud enforcement of
+    an unavailable option lives in SaneBackend.scan()."""
+    return "ae" in opt
+
+
+def _detect_registered_geometry(opt) -> bool:
+    """True if the device exposes both registration-window options
+    (`subframe` + `br_y`) needed to honor ScanParams.registered_geometry."""
+    return "subframe" in opt and "br_y" in opt
+
+
 def _detect_adapter_frame_capacity(opt) -> int | None:
     """Return the adapter's advertised transport bound, not an exposure count."""
     if "frame" not in opt:
@@ -426,6 +440,8 @@ def _caps_from_options(opt, device_id: str = "") -> ScannerCapabilities:
         max_area_mm=_detect_max_area(opt),
         multi_sample=_detect_multi_sample(opt),
         adapter_frame_capacity=_detect_adapter_frame_capacity(opt),
+        auto_exposure=_detect_auto_exposure(opt),
+        registered_geometry=_detect_registered_geometry(opt),
     )
 
 

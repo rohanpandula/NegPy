@@ -1,6 +1,6 @@
 import os
 import time
-from dataclasses import dataclass, fields, replace
+from dataclasses import fields, replace
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -9,76 +9,47 @@ from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import QCheckBox, QMessageBox
 
 from negpy.desktop.converters import ImageConverter
-from negpy.desktop.render_memo import RenderMemo
-from negpy.desktop.session import AppState, DesktopSessionManager, ToolMode, resolve_asset_rgbscan, resolve_asset_stitch
+from negpy.desktop.session import AppState, DesktopSessionManager, ToolMode, resolve_asset_rgbscan
 from negpy.desktop.workers.export import ExportTask, ExportWorker, find_export_conflicts
 from negpy.desktop.workers.render import (
     AssetDiscoveryTask,
     AssetDiscoveryWorker,
-    BatchAutoCropInput,
-    BatchAutoCropResult,
-    BatchAutoCropTask,
-    BatchAutoCropWorker,
     NormalizationTask,
     NormalizationWorker,
     PreviewLoadTask,
     PreviewLoadWorker,
     RenderTask,
     RenderWorker,
-    TestStripTask,
     ThumbnailUpdateTask,
     ThumbnailWorker,
 )
-from negpy.desktop.workers.scan_worker import BatchRequest, RollPreviewRequest, ScanRequest, ScanWorker
-from negpy.desktop.workers.stitch import StitchTask, StitchWorker
-from negpy.features.stitch.models import stitch_hash, stitch_name
-from negpy.desktop.workers.capture_worker import (
-    CalibrationRequest,
-    CaptureRequest,
-    CaptureWorker,
-    LiveViewRequest,
-)
+from negpy.desktop.workers.scan_worker import ScanRequest, ScanWorker
+from negpy.infrastructure.scanners.params import RegisteredScanGeometry, ScanParams
 from negpy.domain.models import (
-    ColorSpace,
+    ExportFormat,
     ExportPreset,
     ExportPresetOutputMode,
     ExportResolutionMode,
     WorkspaceConfig,
-    canonical_crop_ratio,
     export_blocked,
     flat_export_config,
     flat_master_config,
     preset_from_export_config,
     resolve_preset_export,
 )
-from negpy.services.assets.half_frame import base_hash, slice_half
 from negpy.services.assets.sidecar import load_or_promote, write_sidecar
-from negpy.features.exposure.analysis import (
-    RING_GRID,
-    STRIP_GRID,
-    proof_grid,
-    ring_cells,
-    ring_overrides,
-    rotate_grid,
-    strip_cells,
-    strip_overrides,
-)
 from negpy.features.exposure.logic import (
     calculate_wb_shifts,
     calculate_wb_shifts_from_log,
 )
 from negpy.features.exposure.models import ExposureConfig
 from negpy.features.finish.models import FinishConfig
-from negpy.features.geometry.logic import apply_fine_rotation, detect_closest_aspect_ratio, enforce_roi_aspect_ratio
-from negpy.features.geometry.models import FINE_ROTATION_LIMIT, AutocropMode
+from negpy.features.geometry.logic import apply_fine_rotation, detect_closest_aspect_ratio
 from negpy.features.lab.models import LabConfig
 from negpy.features.local.models import LocalAdjustmentsConfig
-from negpy.features.process.models import ProcessConfig, ProcessMode, invalidate_local_bounds, scan_setup_values
-from negpy.features.rgbscan.models import is_rgb_triplet
-from negpy.services.assets.thumbnails import thumbnail_cache_key
-from negpy.kernel.system.paths import get_resource_path
+from negpy.features.process.models import ProcessMode, invalidate_local_bounds
 from negpy.features.retouch.logic import fallback_source_offset, select_source_offset
-from negpy.features.retouch.models import HEAL_SIZE_REF, RetouchConfig
+from negpy.features.retouch.models import RetouchConfig
 from negpy.features.toning.models import ToningConfig
 from negpy.infrastructure.display.color_spaces import ColorSpaceRegistry
 from negpy.infrastructure.filesystem.watcher import FolderWatchService
@@ -91,58 +62,6 @@ from negpy.services.rendering.preview_manager import PreviewManager
 from negpy.services.view.coordinate_mapping import CoordinateMapping
 
 logger = get_logger(__name__)
-
-_THUMB_FAILED_MSG = "thumbnail failed — file may be unreadable"
-
-
-@dataclass(frozen=True)
-class _PendingCaptureImport:
-    """Capture intent carried across asynchronous discovery and session hydration."""
-
-    process_mode: Optional[ProcessMode] = None
-    detect_mode: bool = False
-
-
-def _capture_import_key(path: str) -> str:
-    return os.path.normcase(os.path.abspath(path))
-
-
-def _autocrop_fingerprint(config: WorkspaceConfig, workspace_color_space: str) -> tuple:
-    """Identity of every setting that changes detection pixels or crop coordinates."""
-    geometry = config.geometry
-    flatfield = config.flatfield
-    rgbscan = config.rgbscan
-    return (
-        int(geometry.rotation),
-        round(float(geometry.fine_rotation), 7),
-        bool(geometry.flip_horizontal),
-        bool(geometry.flip_vertical),
-        str(geometry.autocrop_mode),
-        str(geometry.autocrop_ratio),
-        int(geometry.autocrop_offset),
-        round(float(geometry.autocrop_rebate_trim), 4),
-        bool(flatfield.apply),
-        str(flatfield.reference_path),
-        round(float(flatfield.k1), 9),
-        bool(config.process.linear_raw),
-        bool(rgbscan.enabled),
-        str(rgbscan.green_path),
-        str(rgbscan.blue_path),
-        bool(rgbscan.align),
-        str(workspace_color_space),
-    )
-
-
-@dataclass(frozen=True)
-class _DiscoveryRequest:
-    paths: tuple[str, ...]
-    auto_open: bool
-    restore_triplets: Optional[dict]
-    replace_existing: bool
-    reselect_path: Optional[str]
-    rgb_scan: bool
-    half_frame: bool
-    restore_stitches: Optional[dict] = None
 
 
 def baseline_compare_config(config: WorkspaceConfig) -> WorkspaceConfig:
@@ -186,17 +105,9 @@ class AppController(QObject):
     render_requested = pyqtSignal(RenderTask)
     preview_load_requested = pyqtSignal(PreviewLoadTask)
     normalization_requested = pyqtSignal(NormalizationTask)
-    batch_autocrop_requested = pyqtSignal(BatchAutoCropTask)
     analysis_buffer_preview_requested = pyqtSignal(float)
     rotation_guide_requested = pyqtSignal()
-    crop_guide_changed = pyqtSignal()
-    dust_overlay_changed = pyqtSignal()
-    zones_overlay_changed = pyqtSignal(bool)
-    grain_focuser_changed = pyqtSignal(bool)
-    strip_requested = pyqtSignal(TestStripTask)
-    test_strip_changed = pyqtSignal(bool)  # True = mosaic is up, False = cleared or building
     asset_discovery_requested = pyqtSignal(AssetDiscoveryTask)
-    stitch_requested = pyqtSignal(object)
     thumbnail_requested = pyqtSignal(list)
     thumbnail_update_requested = pyqtSignal(ThumbnailUpdateTask)
     tool_sync_requested = pyqtSignal()
@@ -214,53 +125,14 @@ class AppController(QObject):
     batch_progress = pyqtSignal(int, int, str)  # current, total, label
     batch_finished = pyqtSignal()
     pixel_readout_rgb = pyqtSignal(object)  # (r255, g255, b255) tuple or None
-    densitometer_readout = pyqtSignal(object)  # DensitometerReading or None
     tone_drag_changed = pyqtSignal(str)  # exposure field being slider-dragged; "" = drag ended
     scan_devices_requested = pyqtSignal()
-    scan_backend_requested = pyqtSignal(str)
     scan_requested = pyqtSignal(ScanRequest)
     scan_devices_ready = pyqtSignal(list)
     scan_progress = pyqtSignal(float)
     scan_finished = pyqtSignal(str)
     scan_error = pyqtSignal(str)
     scan_started = pyqtSignal()
-    scan_cancelled = pyqtSignal()
-    scan_ejected = pyqtSignal(bool)
-    scan_eject_error = pyqtSignal(str)
-    scan_frame_done = pyqtSignal(int, str)  # batch: frame number, rgb path
-    scan_batch_finished = pyqtSignal(list)  # batch: all completed rgb paths
-    scan_batch_requested = pyqtSignal(BatchRequest)
-    scan_eject_requested = pyqtSignal(str)
-    scan_roll_preview_requested = pyqtSignal(RollPreviewRequest)
-    scan_roll_preview_ready = pyqtSignal(object)  # one RollPreview per strip slot
-    scan_roll_preview_finished = pyqtSignal()
-    capture_light_requested = pyqtSignal(int, int, int, int, str)
-    capture_requested = pyqtSignal(CaptureRequest)
-    capture_light_set = pyqtSignal(int, int, int, int)
-    capture_progress = pyqtSignal(float)
-    capture_channel = pyqtSignal(str)  # "R"/"G"/"B" as each triplet channel starts
-    capture_camera_setting_applied = pyqtSignal(str)  # a set_camera_setting call ran to completion
-    capture_live_view_failed = pyqtSignal(str)  # preview thread died after retries; session dropped
-    capture_live_view_unsupported = pyqtSignal(str)  # body advertises no preview; none was attempted
-    capture_finished = pyqtSignal(list)
-    capture_cancelled = pyqtSignal()
-    capture_error = pyqtSignal(str)
-    capture_status = pyqtSignal(str)
-    live_view_requested = pyqtSignal(LiveViewRequest)
-    live_view_stop_requested = pyqtSignal()
-    camera_session_close_requested = pyqtSignal()
-    live_view_focus_magnifier_requested = pyqtSignal(bool)
-    live_view_focus_magnifier_pos_requested = pyqtSignal(int, int)
-    live_view_camera_setting_requested = pyqtSignal(str, int)
-    capture_live_view_started = pyqtSignal(str)
-    calibration_requested = pyqtSignal(CalibrationRequest)
-    capture_calibration_progress = pyqtSignal(float, str)
-    capture_calibration_finished = pyqtSignal(object)
-    capture_calibration_exposure = pyqtSignal(str)  # "over"/"under": target unreachable, aborted, no preset
-    poll_connection_requested = pyqtSignal(str)  # light port (auto-poll)
-    connection_polled = pyqtSignal(dict)  # {usb_ok, usb_model, light_ok, light_detail}
-    poll_light_temp_requested = pyqtSignal(str)  # light port (temp-only poll, runs even mid-live-view)
-    light_temp_polled = pyqtSignal(object)  # Scanlight LED temperature °C, or None
 
     def __init__(self, session_manager: DesktopSessionManager):
         super().__init__()
@@ -274,24 +146,11 @@ class AppController(QObject):
         self._auto_open_after_discovery = False
         self._replace_after_discovery = False
         self._reselect_after_discovery: Optional[str] = None
-        self._pending_capture_imports: Dict[str, _PendingCaptureImport] = {}
-        self._pending_asset_discoveries: List[_DiscoveryRequest] = []
-        self._active_discovery_keys: frozenset[str] = frozenset()
-        self._pending_scanned_file: Optional[str] = None
         self._gpu_fallback_notified = False
         self._cleaned_up = False
         self._active_batch: Optional[str] = None
-        self._active_batch_title = ""
-        self._active_batch_abortable = False
-        self._batch_serial = 0
-        self._active_batch_token: Optional[int] = None
-        self._autocrop_batch_token: Optional[int] = None
-        self._autocrop_dispatched = 0
-        self._autocrop_preflight_skipped = 0
-        self._autocrop_cancel_requested = False
 
         self.preview_service = PreviewManager()
-        self.batch_autocrop_preview_service = PreviewManager()
         self.watcher = FolderWatchService()
         self.asset_store = LocalAssetStore(APP_CONFIG.cache_dir, APP_CONFIG.user_icc_dir)
         self.asset_store.initialize()
@@ -305,9 +164,6 @@ class AppController(QObject):
         self.export_thread = QThread()
         self.export_worker = ExportWorker()
         self.export_worker.moveToThread(self.export_thread)
-        # Shares the export thread: the batch lane serializes them anyway.
-        self.stitch_worker = StitchWorker()
-        self.stitch_worker.moveToThread(self.export_thread)
         self.export_thread.start()
 
         self.thumb_thread = QThread()
@@ -318,8 +174,6 @@ class AppController(QObject):
         self.norm_thread = QThread()
         self.norm_worker = NormalizationWorker(self.preview_service, self.session.repo)
         self.norm_worker.moveToThread(self.norm_thread)
-        self.batch_autocrop_worker = BatchAutoCropWorker(self.batch_autocrop_preview_service)
-        self.batch_autocrop_worker.moveToThread(self.norm_thread)
         self.norm_thread.start()
 
         self.discovery_thread = QThread()
@@ -337,25 +191,9 @@ class AppController(QObject):
         self.scan_worker.moveToThread(self.scan_thread)
         self.scan_thread.start()
 
-        self.capture_thread = QThread()
-        self.capture_worker = CaptureWorker()
-        self.capture_worker.moveToThread(self.capture_thread)
-        # Started lazily on first capture use (_ensure_capture_thread): a *running* QThread aborts
-        # if destroyed without quit(), and controller unit tests build AppController without ever
-        # scanning — leaving the thread unstarted keeps it invisible to their teardown loops (so
-        # upstream tests needn't know about it), and the app starts it the moment the Camera
-        # Scanning tab polls or the user acts.
-        self._capture_thread_started = False
-
         self.canvas: Any = None
         self._is_rendering = False
         self._pending_render_task: Any = None
-
-        # Last displayed render per frame — navigate-back paints it instantly
-        # while the authoritative render refreshes underneath.
-        self._render_memo = RenderMemo()
-        # Test strips, keyed density/grade-blind (see _strip_memo_key).
-        self._strip_memo = RenderMemo()
 
         self._render_debounce = QTimer()
         self._render_debounce.setSingleShot(True)
@@ -402,7 +240,6 @@ class AppController(QObject):
         self._pending_cursor_nx = None
         self._pending_cursor_ny = None
         self.pixel_readout_rgb.emit(None)
-        self.densitometer_readout.emit(None)
 
     def _emit_pixel_readout(self) -> None:
         nx, ny = self._pending_cursor_nx, self._pending_cursor_ny
@@ -416,157 +253,55 @@ class AppController(QObject):
         g255 = int(round(max(0.0, min(1.0, g)) * 255))
         b255 = int(round(max(0.0, min(1.0, b)) * 255))
         self.pixel_readout_rgb.emit((r255, g255, b255))
-        self.densitometer_readout.emit(self._compute_densitometer_reading(nx, ny, rgb))
-
-    def _compute_densitometer_reading(self, nx: float, ny: float, display_rgb: tuple) -> Optional[Any]:
-        """Probe the normalized-log frame under the cursor; None when unavailable."""
-        from negpy.features.exposure.densitometer import compute_reading, map_display_to_norm
-
-        metrics = self.state.last_metrics
-        nl = metrics.get("normalized_log")
-        bounds = metrics.get("final_bounds") or metrics.get("log_bounds")
-        if nl is None or bounds is None or self.canvas is None:
-            return None
-        disp = self.canvas.display_size()
-        if disp is None:
-            return None
-        if isinstance(nl, np.ndarray):
-            norm_h, norm_w = nl.shape[:2]
-        else:
-            norm_w, norm_h = nl.width, nl.height
-        # nx,ny arrive content-normalized (the overlay subtracts the border) —
-        # passing content_rect here would compensate twice.
-        pos = map_display_to_norm(
-            nx,
-            ny,
-            disp[0],
-            disp[1],
-            None,
-            metrics.get("active_roi"),
-            self.state.active_tool in (ToolMode.CROP_MANUAL, ToolMode.ANALYSIS_DRAW),
-            norm_w,
-            norm_h,
-        )
-        if pos is None:
-            return None
-        x, y = pos
-        try:
-            if isinstance(nl, np.ndarray):
-                val = nl[y, x]
-            else:
-                val = nl.readback_region(x, y, 1, 1)[0, 0]
-        except Exception:
-            return None
-        return compute_reading((float(val[0]), float(val[1]), float(val[2])), bounds, display_rgb)
 
     def set_status(self, message: str, timeout: int = 0) -> None:
         self.status_message_requested.emit(message, timeout)
 
     def _connect_signals(self) -> None:
         self.render_requested.connect(self.render_worker.process)
-        self.strip_requested.connect(self.render_worker.build_strip)
         self._render_cleanup_requested.connect(self.render_worker.cleanup)
-        self.render_worker.strip_finished.connect(self.on_strip_finished)
-        self.render_worker.strip_progress.connect(self.on_strip_progress)
         self.render_worker.finished.connect(self._on_render_finished)
         self.render_worker.metrics_updated.connect(self._on_metrics_updated)
         self.render_worker.error.connect(self._on_render_error)
-        self.render_worker.error.connect(self._on_strip_error)
 
         self.export_worker.progress.connect(self.export_progress.emit)
         self.export_worker.progress.connect(self._on_batch_progress)
         self.export_worker.finished.connect(self._on_export_finished)
-        self.export_worker.cancelled.connect(self._on_export_batch_cancelled)
+        self.export_worker.cancelled.connect(self._on_batch_cancelled)
         self.export_worker.error.connect(self._on_render_error)
         self.export_worker.error.connect(self._on_export_task_error)
-
-        self.stitch_requested.connect(self.stitch_worker.run)
-        self.stitch_worker.progress.connect(self._on_batch_progress)
-        self.stitch_worker.registered.connect(self._on_stitch_registered)
-        self.stitch_worker.cancelled.connect(self._on_stitch_cancelled)
-        self.stitch_worker.error.connect(self._on_stitch_error)
 
         self.thumbnail_requested.connect(self.thumb_worker.generate)
         self.thumb_worker.progress.connect(self._on_thumbnail_progress)
         self.thumbnail_update_requested.connect(self.thumb_worker.update_rendered)
         self.thumb_worker.finished.connect(self._on_thumbnails_finished)
-        self.thumb_worker.rendered_finished.connect(self._on_rendered_thumbnail)
         self.thumb_worker.error.connect(self._on_render_error)
-        self.thumb_worker.error.connect(self._on_thumbnail_batch_error)
 
         self.normalization_requested.connect(self.norm_worker.process)
         self.norm_worker.progress.connect(self._on_normalization_progress)
         self.norm_worker.finished.connect(self._on_normalization_finished)
-        self.norm_worker.cancelled.connect(self._on_normalization_cancelled)
+        self.norm_worker.cancelled.connect(self._on_batch_cancelled)
         self.norm_worker.error.connect(self._on_render_error)
-        self.norm_worker.error.connect(self._on_normalization_error)
-
-        self.batch_autocrop_requested.connect(self.batch_autocrop_worker.process)
-        self.batch_autocrop_worker.progress.connect(self._on_batch_autocrop_progress)
-        self.batch_autocrop_worker.finished.connect(self._on_batch_autocrop_finished)
-        self.batch_autocrop_worker.cancelled.connect(self._on_batch_autocrop_cancelled)
-        self.batch_autocrop_worker.error.connect(self._on_batch_autocrop_error)
+        self.norm_worker.error.connect(self._on_batch_error)
 
         self.asset_discovery_requested.connect(self.discovery_worker.process)
         self.discovery_worker.progress.connect(self._on_discovery_progress)
         self.discovery_worker.finished.connect(self._on_discovery_finished)
         self.discovery_worker.error.connect(self._on_render_error)
-        self.discovery_worker.error.connect(self._on_discovery_batch_error)
 
         self.preview_load_requested.connect(self.preview_load_worker.process)
         self.preview_load_worker.splash.connect(self._on_splash_preview)
         self.preview_load_worker.finished.connect(self._on_preview_loaded)
         self.preview_load_worker.error.connect(self._on_render_error)
-        self.preview_load_worker.load_failed.connect(self._on_preview_load_failed)
 
         self.scan_devices_requested.connect(self.scan_worker.list_devices)
-        self.scan_backend_requested.connect(self.scan_worker.set_backend)
         self.scan_worker.devices_ready.connect(self.scan_devices_ready.emit)
         self.scan_worker.progress.connect(self.scan_progress.emit)
         self.scan_worker.finished.connect(self._on_scan_finished)
         self.scan_worker.error.connect(self.scan_error.emit)
         self.scan_requested.connect(self.scan_worker.run_scan)
-        self.scan_batch_requested.connect(self.scan_worker.run_batch)
-        self.scan_eject_requested.connect(self.scan_worker.eject)
-        self.scan_worker.cancelled.connect(self.scan_cancelled.emit)
-        self.scan_worker.frame_done.connect(self.scan_frame_done.emit)
-        self.scan_worker.batch_finished.connect(self._on_scan_batch_finished)
-        self.scan_worker.ejected.connect(self.scan_ejected.emit)
-        self.scan_worker.eject_error.connect(self.scan_eject_error.emit)
-        self.scan_roll_preview_requested.connect(self.scan_worker.run_roll_preview)
-        self.scan_worker.roll_preview_ready.connect(self.scan_roll_preview_ready.emit)
-        self.scan_worker.roll_preview_finished.connect(self.scan_roll_preview_finished.emit)
-        self.capture_light_requested.connect(self.capture_worker.set_light)
-        self.capture_requested.connect(self.capture_worker.run_capture)
-        self.capture_worker.light_set.connect(self.capture_light_set.emit)
-        self.capture_worker.progress.connect(self.capture_progress.emit)
-        self.capture_worker.channel.connect(self.capture_channel.emit)
-        self.capture_worker.camera_setting_applied.connect(self.capture_camera_setting_applied.emit)
-        self.capture_worker.live_view_failed.connect(self.capture_live_view_failed.emit)
-        self.capture_worker.live_view_unsupported.connect(self.capture_live_view_unsupported.emit)
-        self.capture_worker.finished.connect(self._on_capture_finished)
-        self.capture_worker.cancelled.connect(self.capture_cancelled.emit)
-        self.capture_worker.error.connect(self.capture_error.emit)
-        self.capture_worker.status.connect(self.capture_status.emit)
-        self.live_view_requested.connect(self.capture_worker.start_live_view)
-        self.live_view_stop_requested.connect(self.capture_worker.stop_live_view)
-        self.camera_session_close_requested.connect(self.capture_worker.close_camera_session)
-        self.live_view_focus_magnifier_requested.connect(self.capture_worker.set_focus_magnifier)
-        self.live_view_focus_magnifier_pos_requested.connect(self.capture_worker.set_focus_magnifier_pos)
-        self.live_view_camera_setting_requested.connect(self.capture_worker.set_camera_setting)
-        self.capture_worker.live_view_started.connect(self.capture_live_view_started.emit)
-        self.calibration_requested.connect(self.capture_worker.run_calibration)
-        self.capture_worker.calibration_progress.connect(self.capture_calibration_progress.emit)
-        self.capture_worker.calibration_finished.connect(self.capture_calibration_finished.emit)
-        self.capture_worker.calibration_exposure.connect(self.capture_calibration_exposure.emit)
-        self.poll_connection_requested.connect(self.capture_worker.poll_connection)
-        self.capture_worker.poll_status.connect(self.connection_polled.emit)
-        self.poll_light_temp_requested.connect(self.capture_worker.poll_light_temp)
-        self.capture_worker.light_temp_polled.connect(self.light_temp_polled.emit)
 
         self.session.active_file_changing.connect(lambda: self._update_thumbnail_from_state(force_readback=True))
-        self.session.session_emptied.connect(self._render_memo.clear)
-        self.session.session_emptied.connect(self._strip_memo.clear)
         self.session.file_selected.connect(self.load_file)
         self.session.state_changed.connect(self.config_updated.emit)
         self.session.state_changed.connect(self._render_debounce.start)
@@ -575,131 +310,51 @@ class AppController(QObject):
     def generate_missing_thumbnails(self) -> None:
         missing = [f for f in self.state.uploaded_files if f["name"] not in self.state.thumbnails]
         if missing:
-            if self._begin_batch("thumbnails", "Generating thumbnails", abortable=False) is None:
-                return
-            self._thumb_requested = [f["name"] for f in missing]
             self.set_status("GENERATING THUMBNAILS...")
+            self._begin_batch("Generating thumbnails", abortable=False)
             self.thumbnail_requested.emit(missing)
-
-    def clear_thumbnail_cache(self) -> None:
-        """Drops cached thumbnails on disk and in memory, then regenerates loaded ones."""
-        self.asset_store.clear_thumbnails()
-        # Must precede generate_missing_thumbnails: it only enqueues names absent here.
-        self.state.thumbnails.clear()
-        self.state.rendered_thumbnails.clear()
-        self.session.asset_model.refresh()
-        self.generate_missing_thumbnails()
 
     def _on_thumbnail_progress(self, current: int, total: int, name: str) -> None:
         self.set_status(f"THUMBNAIL {current}/{total}: {name}")
         self.status_progress_requested.emit(current, total)
         self.batch_progress.emit(current, total, name)
 
-    def _set_thumbnail(self, name: str, pil_img: Any) -> None:
-        u8_arr = np.array(pil_img.convert("RGB"))
-        self.state.thumbnails[name] = QIcon(QPixmap.fromImage(ImageConverter.to_qimage(u8_arr)))
-
     def _on_thumbnails_finished(self, new_thumbs: Dict[str, Any]) -> None:
+        self.set_status("GALLERIES UPDATED", 3000)
         self.status_progress_requested.emit(0, 0)
-        self._end_batch("thumbnails")
-        for name, pil_img in new_thumbs.items():
-            # A frame that already rendered on the canvas has the correct (inverted)
-            # thumbnail; don't let this batch overwrite it with the source-decode placeholder.
-            if pil_img and name not in self.state.rendered_thumbnails:
-                self._set_thumbnail(name, pil_img)
-
-        requested = getattr(self, "_thumb_requested", [])
-        self._thumb_requested = []
-        failed = {n for n in requested if not new_thumbs.get(n)}
-        for f in self.state.uploaded_files:
-            if f["name"] in failed:
-                f.setdefault("decode_failed", _THUMB_FAILED_MSG)
-            elif f["name"] in new_thumbs and f.get("decode_failed") == _THUMB_FAILED_MSG:
-                del f["decode_failed"]
-        self.session.asset_model.refresh()
-
-    def _on_rendered_thumbnail(self, new_thumbs: Dict[str, Any]) -> None:
-        """A canvas render produced a thumbnail — it supersedes any batch placeholder."""
+        self._end_batch()
         for name, pil_img in new_thumbs.items():
             if pil_img:
-                self._set_thumbnail(name, pil_img)
-                self.state.rendered_thumbnails.add(name)
+                u8_arr = np.array(pil_img.convert("RGB"))
+                self.state.thumbnails[name] = QIcon(QPixmap.fromImage(ImageConverter.to_qimage(u8_arr)))
         self.session.asset_model.refresh()
 
     # --- Batch progress popup -------------------------------------------------
 
-    def _begin_batch(self, owner: str, title: str, abortable: bool) -> Optional[int]:
-        """Claim the shared batch lane and return its generation token."""
-        if self._active_batch is not None:
-            self.set_status(f"{self._active_batch_title} is already running", 3000)
-            return None
-        self._batch_serial += 1
-        self._active_batch = owner
-        self._active_batch_title = title
-        self._active_batch_abortable = abortable
-        self._active_batch_token = self._batch_serial
+    def _begin_batch(self, title: str, abortable: bool) -> None:
+        self._active_batch = title if abortable else None
         self.batch_started.emit(title, abortable)
-        return self._active_batch_token
 
-    def _batch_busy(self, requested: str) -> bool:
-        if self._active_batch is None:
-            return False
-        self.set_status(f"Cannot start {requested} while {self._active_batch_title} is running", 3000)
-        return True
-
-    def _end_batch(self, owner: str, token: Optional[int] = None) -> bool:
-        """Release only the batch generation that owns the progress lane."""
-        if self._active_batch != owner:
-            return False
-        if token is not None and token != self._active_batch_token:
-            return False
+    def _end_batch(self) -> None:
         self._active_batch = None
-        self._active_batch_title = ""
-        self._active_batch_abortable = False
-        self._active_batch_token = None
         self.batch_finished.emit()
-        if self._pending_asset_discoveries and not self._discovery_running:
-            QTimer.singleShot(0, self._start_next_asset_discovery)
-        return True
 
     def _on_batch_progress(self, current: int, total: int, name: str) -> None:
         self.batch_progress.emit(current, total, name)
 
-    def _on_batch_cancelled(self, owner: str) -> None:
+    def _on_batch_cancelled(self) -> None:
         self.set_status("Aborted", 3000)
-        self._end_batch(owner)
+        self._end_batch()
 
-    def _on_export_batch_cancelled(self) -> None:
-        owner = self._active_batch if self._active_batch in ("export", "contact_sheet") else "export"
-        self._on_batch_cancelled(owner)
-
-    def _on_discovery_batch_error(self, _message: str) -> None:
-        self._discovery_running = False
-        self._end_batch("discovery")
-
-    def _on_thumbnail_batch_error(self, _message: str) -> None:
-        self._on_batch_error("thumbnails")
-
-    def _on_normalization_cancelled(self) -> None:
-        self._on_batch_cancelled("normalization")
-
-    def _on_normalization_error(self, _message: str) -> None:
-        self._on_batch_error("normalization")
-
-    def _on_batch_error(self, owner: str) -> None:
-        self._end_batch(owner)
+    def _on_batch_error(self, _message: str) -> None:
+        self._end_batch()
 
     def abort_active_batch(self) -> None:
         """Requests cancellation of the running abortable batch (export or analysis)."""
-        if self._active_batch in ("export", "contact_sheet"):
+        if self._active_batch in ("Exporting", "Contact sheet"):
             self.export_worker.cancel()
-        elif self._active_batch == "normalization":
+        elif self._active_batch == "Analyzing roll":
             self.norm_worker.cancel()
-        elif self._active_batch == "autocrop":
-            self._autocrop_cancel_requested = True
-            self.batch_autocrop_worker.cancel(self._autocrop_batch_token)
-        elif self._active_batch == "stitch":
-            self.stitch_worker.cancel()
 
     def saved_session_paths(self) -> List[str]:
         """Returns last session's file paths that still exist on disk."""
@@ -714,8 +369,7 @@ class AppController(QObject):
         active = self.session.repo.get_global_setting("session_active_path")
         self._pending_scanned_file = active if active in paths else paths[0]
         triplets = self.session.repo.get_global_setting("session_triplets", {}) or {}
-        stitches = self.session.repo.get_global_setting("session_stitches", {}) or {}
-        self.request_asset_discovery(paths, auto_open=True, restore_triplets=triplets, restore_stitches=stitches)
+        self.request_asset_discovery(paths, auto_open=True, restore_triplets=triplets)
 
     def request_asset_discovery(
         self,
@@ -724,150 +378,39 @@ class AppController(QObject):
         restore_triplets: Optional[dict] = None,
         replace_existing: bool = False,
         reselect_path: Optional[str] = None,
-        restore_stitches: Optional[dict] = None,
     ) -> None:
         """
         Starts asynchronous discovery of supported assets.
-        Requests arriving while hashing is in progress are queued in order.
+        Silently skips if a discovery task is already in progress.
 
         `replace_existing` rebuilds the asset list from the results (instead of
         appending) and reselects `reselect_path` — used when re-running discovery
         over already-loaded files (e.g. an RGB-scan mode toggle).
         """
-        request = _DiscoveryRequest(
-            paths=tuple(paths),
-            auto_open=auto_open,
-            restore_triplets=restore_triplets,
-            replace_existing=replace_existing,
-            reselect_path=reselect_path,
-            rgb_scan=bool(self.session.repo.get_global_setting("rgbscan_mode", False)),
-            half_frame=bool(self.session.repo.get_global_setting("half_frame_mode", False)),
-            restore_stitches=restore_stitches,
-        )
         if self._discovery_running:
-            self._pending_asset_discoveries.append(request)
             return
-
-        if self._active_batch is not None:
-            self._pending_asset_discoveries.append(request)
-            self.set_status(f"Queued asset discovery until {self._active_batch_title} finishes", 3000)
-            return
-
-        self._start_asset_discovery(request)
-
-    def _start_asset_discovery(self, request: _DiscoveryRequest) -> None:
-        """Start one request; callers ensure only one discovery is active."""
 
         from negpy.infrastructure.loaders.constants import SUPPORTED_RAW_EXTENSIONS
 
-        if self._begin_batch("discovery", "Hashing files", abortable=False) is None:
-            self._pending_asset_discoveries.insert(0, request)
-            return
         self._discovery_running = True
-        self._auto_open_after_discovery = request.auto_open
-        self._replace_after_discovery = request.replace_existing
-        self._reselect_after_discovery = request.reselect_path
-        self._active_discovery_keys = frozenset(_capture_import_key(path) for path in request.paths)
+        self._auto_open_after_discovery = auto_open
+        self._replace_after_discovery = replace_existing
+        self._reselect_after_discovery = reselect_path
         self.set_status("SCANNING FOR ASSETS...")
+        self._begin_batch("Hashing files", abortable=False)
+        rgb_scan = bool(self.session.repo.get_global_setting("rgbscan_mode", False))
         task = AssetDiscoveryTask(
-            paths=list(request.paths),
+            paths=paths,
             supported_extensions=tuple(SUPPORTED_RAW_EXTENSIONS),
-            rgb_scan=request.rgb_scan,
-            restore_triplets=request.restore_triplets,
-            half_frame=request.half_frame,
-            restore_stitches=request.restore_stitches,
+            rgb_scan=rgb_scan,
+            restore_triplets=restore_triplets,
         )
         self.asset_discovery_requested.emit(task)
-
-    def _start_next_asset_discovery(self) -> None:
-        if self._pending_asset_discoveries and not self._discovery_running and self._active_batch is None:
-            self._start_asset_discovery(self._pending_asset_discoveries.pop(0))
 
     def set_rgb_scan_mode(self, enabled: bool) -> None:
         """Persist the RGB-scan toggle and re-discover already-loaded assets so the
         mode regroups/ungroups triplets in place (not only on the next folder load)."""
         self.session.repo.save_global_setting("rgbscan_mode", bool(enabled))
-        if enabled:
-            # Narrowband LEDs are what RGB-scan triplets are captured with — correcting
-            # for them is the point of the toggle, so switch it on together.
-            self.session.repo.save_global_setting("last_narrowband_scan", True)
-        files = self.session.state.uploaded_files
-        if not files:
-            return
-        if enabled and not self.state.config.process.narrowband_scan:
-            self.session.update_config(
-                replace(self.state.config, process=replace(self.state.config.process, narrowband_scan=True)), persist=True
-            )
-            self.request_render()
-        paths: List[str] = []
-        for f in files:
-            paths.append(f["path"])
-            for k in ("green_path", "blue_path"):
-                if f.get(k):
-                    paths.append(f[k])
-        self.request_asset_discovery(paths, replace_existing=True, reselect_path=self.state.current_file_path)
-
-    def apply_scan_setup(self, capture: str, light: str) -> None:
-        """Apply the scanning-setup wizard's answer: Linear RAW and Narrowband are rig
-        properties, so they land on the new-file defaults, the open frame and every
-        already-edited frame at once."""
-        linear_raw, narrowband = scan_setup_values(capture, light)
-        self.session.repo.save_global_settings(
-            {
-                "scan_setup": {"capture": capture, "light": light},
-                "last_linear_raw": linear_raw,
-                "last_narrowband_scan": narrowband,
-            }
-        )
-
-        reload_needed = False
-        if self.state.current_file_hash:
-            reload_needed = self.state.config.process.linear_raw != linear_raw
-            new_config = replace(
-                self.state.config,
-                process=replace(
-                    self.state.config.process,
-                    linear_raw=linear_raw,
-                    narrowband_scan=narrowband,
-                    **invalidate_local_bounds(self.state.config.process),
-                ),
-            )
-            # render=False when reloading: bounds must not be analysed on the stale decode.
-            self.session.update_config(new_config, persist=True, render=not reload_needed)
-
-        count = 0
-        for asset in self.session.state.uploaded_files:
-            file_hash = asset["hash"]
-            if file_hash == self.state.current_file_hash:
-                continue
-            # Frames with no saved edits inherit the values from the sticky defaults when
-            # they are first hydrated — writing them here would only churn the DB.
-            saved = self.session.repo.load_file_settings(file_hash)
-            if saved is None:
-                continue
-            updated = replace(
-                saved,
-                process=replace(
-                    saved.process,
-                    linear_raw=linear_raw,
-                    narrowband_scan=narrowband,
-                    **invalidate_local_bounds(saved.process),
-                ),
-            )
-            self.session.push_external_history(file_hash, saved, updated)
-            self.session.repo.save_file_settings(file_hash, updated, file_path=asset["path"])
-            count += 1
-
-        if reload_needed and self.state.current_file_path:
-            self.load_file(self.state.current_file_path)
-        if count:
-            self.session.settings_synced.emit(f"Scanning setup applied to {count} other frame{'s' if count != 1 else ''}")
-            self.session.settings_saved.emit()
-
-    def set_half_frame_mode(self, enabled: bool) -> None:
-        """Persist the half-frame toggle and re-discover already-loaded assets so the
-        mode splits/collapses frames in place (not only on the next folder load)."""
-        self.session.repo.save_global_setting("half_frame_mode", bool(enabled))
         files = self.session.state.uploaded_files
         if not files:
             return
@@ -888,11 +431,7 @@ class AppController(QObject):
         """
         Adds discovered assets to the session and starts thumbnail generation.
         """
-        ended_batch = self._end_batch("discovery")
-        if not ended_batch and self._active_batch is None:
-            # Preserve the completion signal for direct invocations and late
-            # delivery without releasing a newer batch owner.
-            self.batch_finished.emit()
+        self._end_batch()
         self.status_progress_requested.emit(0, 0)
         self._discovery_running = False
         auto_open = self._auto_open_after_discovery
@@ -901,15 +440,12 @@ class AppController(QObject):
         reselect_path = self._reselect_after_discovery
         self._replace_after_discovery = False
         self._reselect_after_discovery = None
-        active_discovery_keys = self._active_discovery_keys
-        self._active_discovery_keys = frozenset()
         pending_scan = getattr(self, "_pending_scanned_file", None)
 
         if replace_existing and valid_assets:
             # Re-run over already-loaded files (e.g. RGB-scan toggle): rebuild the list
             # so dedup-by-hash doesn't drop a regrouped red, then reselect the active frame.
             self.session.state.uploaded_files.clear()
-            self.session.state.rendered_thumbnails.clear()
             self.session.add_files([], validated_info=valid_assets)
             self.generate_missing_thumbnails()
             idx = next(
@@ -921,35 +457,20 @@ class AppController(QObject):
                 0,
             )
             self.session.select_file(idx)
-            self._start_next_asset_discovery()
             return
 
-        selected_pending_scan = False
         if valid_assets:
             first_new_idx = len(self.session.state.uploaded_files)
             self.session.add_files([], validated_info=valid_assets)
             self.generate_missing_thumbnails()
-            if pending_scan and self._select_file_by_path(pending_scan):
-                selected_pending_scan = True
+            if pending_scan:
+                self._select_file_by_path(pending_scan)
+                self._pending_scanned_file = None
             elif auto_open and not self.state.current_file_path and len(self.session.state.uploaded_files) > first_new_idx:
                 self.session.select_file(first_new_idx)
         else:
             self.set_status("NO SUPPORTED ASSETS FOUND", 3000)
             self.status_progress_requested.emit(0, 0)
-
-        if pending_scan:
-            pending_key = _capture_import_key(pending_scan)
-            if selected_pending_scan:
-                # select_file emits load_file synchronously in the real session. Pop again
-                # as a fallback for alternate session implementations and tests.
-                self._pending_capture_imports.pop(pending_key, None)
-                self._pending_scanned_file = None
-            elif pending_key in active_discovery_keys:
-                # This request finished without the intended primary asset. Drop only its
-                # metadata; a later capture may already be waiting in the FIFO queue.
-                self._pending_capture_imports.pop(pending_key, None)
-                self._pending_scanned_file = None
-        self._start_next_asset_discovery()
 
     def _file_hash_for_path(self, file_path: str) -> Optional[str]:
         if self.state.current_file_path == file_path and self.state.current_file_hash:
@@ -959,56 +480,6 @@ class AppController(QObject):
                 return f.get("hash")
         return None
 
-    def _active_half(self) -> Optional[tuple[int, float]]:
-        """(half, split_x) of the active asset, or None for whole-frame assets."""
-        h = self.state.current_file_hash
-        if not h:
-            return None
-        for f in self.state.uploaded_files:
-            if f.get("hash") == h:
-                half = int(f.get("half") or 0)
-                return (half, float(f.get("split_x") or 0.5)) if half else None
-        return None
-
-    def _render_memo_key(self, config: Optional[WorkspaceConfig] = None) -> str:
-        """Identity of everything that shapes the displayed render of the current
-        config: the edit itself plus every display-path input. Any mismatch is a
-        memo miss, so navigate-back only skips straight to pixels that would be
-        reproduced exactly."""
-        import hashlib
-        import json
-
-        config = self.state.config if config is None else config
-        proofing = self.state.soft_proof_enabled
-        narrowband = self.state.config.process.narrowband_scan
-        parts = (
-            json.dumps(config.to_dict(), sort_keys=True, default=str),
-            self.state.hq_preview,
-            self.state.workspace_color_space,
-            self.state.gpu_enabled,
-            proofing,
-            self.effective_input_icc() if (proofing or narrowband) else None,
-            self.effective_output_icc() if proofing else None,
-            hashlib.md5(self.state.monitor_icc_bytes).hexdigest() if self.state.monitor_icc_bytes else "",
-        )
-        return hashlib.md5(repr(parts).encode()).hexdigest()
-
-    def _strip_memo_key(self, kind: str = "tone") -> str:
-        """The render key for a proof mosaic, prefixed by kind so the two can't collide.
-
-        Both ladders are absolute, so each proof supplies the fields it varies and its mosaic
-        is invariant to whatever those currently are. Pinning them makes print/pick/print again
-        a cache hit. Any other edit (crop, paper, toning...) lands on a different key.
-
-        Rotation is not in the key: an entry holds all four orientations.
-        """
-        exposure = self.state.config.exposure
-        if kind == "colour":
-            exposure = replace(exposure, wb_magenta=0.0, wb_yellow=0.0)
-        else:
-            exposure = replace(exposure, density=1.0, grade=115.0)
-        return f"{kind}:{self._render_memo_key(replace(self.state.config, exposure=exposure))}"
-
     def load_file(self, file_path: str, preserve_zoom: bool = False, force_detect: bool = False) -> None:
         """
         Dispatches RAW decode to a background worker to keep the UI thread free.
@@ -1016,121 +487,45 @@ class AppController(QObject):
         self._prefetch_gen += 1
         self._preview_load_t0 = time.perf_counter()
         self._requested_file_path = file_path
-        # A strip belongs to one frame, and the memo fast path below repaints without
-        # going through request_render — so drop it here, not only there.
-        self._clear_test_strip()
-
-        # Navigate-back fast path: the frame's last render is memoized and nothing
-        # that shaped it has changed (select_file already hydrated its config), so
-        # paint it now — no spinner, no toasts — and let the real render refresh
-        # metrics quietly underneath.
-        target_hash = self._file_hash_for_path(file_path)
-        memo = self._render_memo.get(target_hash, self._render_memo_key()) if target_hash else None
-
         if not preserve_zoom:
             self.zoom_requested.emit(1.0)
-        if memo is None:
-            self.loading_started.emit()
+        self.set_status(f"Loading {os.path.basename(file_path)}...")
+        self.loading_started.emit()
         self._thumb_config = None
 
         self._render_cleanup_requested.emit()
-        # The cleanup destroys the GPU textures last_metrics still points at; drop the
-        # densitometer's probe source so hover readouts go quiet until the next render.
-        self.state.last_metrics.pop("normalized_log", None)
-
-        if memo is not None:
-            with self.state.metrics_lock:
-                self.state.last_metrics["base_positive"] = memo["base_positive"]
-                self.state.last_metrics["content_rect"] = memo.get("content_rect")
-                self.state.last_metrics["splash"] = False
-                self.state.last_metrics["compare"] = False
-            self.image_updated.emit()
 
         self.state.preview_raw = None
         self.state.preview_ir = None
         self.state.has_ir = False
         self.state.original_res = (0, 0)
 
-        pending_import = self._pending_capture_imports.pop(_capture_import_key(file_path), None)
-        if pending_import is not None and pending_import.process_mode is not None:
-            process = self.state.config.process
-            process = replace(
-                process,
-                process_mode=pending_import.process_mode,
-                **invalidate_local_bounds(process),
-            )
-            self.state.config = replace(self.state.config, process=process)
-            self.state.is_dirty = True
-
         rgbscan = self.state.config.rgbscan
-        stitch = self.state.config.stitch
-        flatfield = self.state.config.flatfield
         self.preview_load_requested.emit(
             PreviewLoadTask(
                 file_path=file_path,
                 workspace_color_space=self.state.workspace_color_space,
                 use_camera_wb=not self.state.config.process.linear_raw,
                 full_resolution=self.state.hq_preview,
-                file_hash=base_hash(self._file_hash_for_path(file_path)),  # halves share the per-file decode cache
-                # A memoized frame is already painted — the embedded-JPEG splash
-                # would repaint stale pixels over it.
-                use_splash=memo is None,
-                detect_mode=(
-                    pending_import.detect_mode
-                    if pending_import is not None
-                    else force_detect or (self.state.autodetect_enabled and self.state.current_file_is_new)
-                ),
+                file_hash=self._file_hash_for_path(file_path),
+                detect_mode=force_detect or (self.state.autodetect_enabled and self.state.current_file_is_new),
                 green_path=rgbscan.green_path if rgbscan.enabled else "",
                 blue_path=rgbscan.blue_path if rgbscan.enabled else "",
                 align=rgbscan.align,
-                stitch_paths=stitch.stitch_paths if stitch.stitch_enabled else (),
-                stitch_transforms=stitch.stitch_transforms if stitch.stitch_enabled else (),
-                stitch_canvas=stitch.stitch_canvas,
-                stitch_sizes=stitch.stitch_sizes,
-                flatfield_path=flatfield.reference_path if (stitch.stitch_enabled and flatfield.apply) else "",
             )
         )
-
-    def _split_active_half(self, raw: Any, dims: Any) -> tuple[Any, Any]:
-        """Slice a full-frame decode/splash down to the active half asset (no-op otherwise).
-
-        Both halves decode identically, so slicing by the current selection is safe
-        even for a stale same-path load; cached buffers are read-only, hence the copy.
-        """
-        half_info = self._active_half()
-        if half_info is None:
-            return raw, dims
-        half, split_x = half_info
-        raw = np.ascontiguousarray(slice_half(raw, half, split_x))
-        if dims is not None:
-            h0, w0 = dims
-            xs = min(max(int(round(w0 * split_x)), 1), w0 - 1)
-            dims = (h0, xs) if half == 1 else (h0, w0 - xs)
-        return raw, dims
 
     def _on_splash_preview(self, file_path: str, raw: Any, dims: Any) -> None:
         if self._requested_file_path != file_path:
             return
-        raw, dims = self._split_active_half(raw, dims)
         self.state.original_res = dims
         # Paint the embedded sRGB thumbnail directly — no pipeline; the real render replaces it.
         with self.state.metrics_lock:
             self.state.last_metrics["base_positive"] = raw
             self.state.last_metrics["splash"] = True
-            self.state.last_metrics["compare"] = False
         self.image_updated.emit()
 
-    def _on_preview_load_failed(self, file_path: str, message: str) -> None:
-        for f in self.state.uploaded_files:
-            if f["path"] == file_path:
-                f["decode_failed"] = message
-                self.session.asset_model.refresh()
-                return
-
     def _on_preview_loaded(self, file_path: str, raw: Any, dims: Any, source_cs: str, ir_preview: Any, detected_mode: str) -> None:
-        for f in self.state.uploaded_files:
-            if f["path"] == file_path and f.pop("decode_failed", None) is not None:
-                self.session.asset_model.refresh()
         if self._requested_file_path != file_path:
             return
         logger.info(
@@ -1138,14 +533,9 @@ class AppController(QObject):
             (time.perf_counter() - self._preview_load_t0) * 1000,
             file_path,
         )
-        raw, dims = self._split_active_half(raw, dims)
-        if ir_preview is not None:
-            ir_preview, _ = self._split_active_half(ir_preview, None)
         self.state.preview_raw = raw
         self.state.preview_ir = ir_preview
         self.state.has_ir = ir_preview is not None
-        if not self.state.has_ir and self.state.dust_overlay_mode == "ir":
-            self.state.dust_overlay_mode = "off"
         self.state.original_res = dims
         self.state.current_file_path = file_path
         self.state.source_cs = source_cs
@@ -1166,10 +556,7 @@ class AppController(QObject):
                 return
             idx = self.state.selected_file_idx
             files = self.state.uploaded_files
-            if idx < 0 or not files:
-                return
-            display_order = self.session.asset_model.visible_actual_indices_ordered()
-            for path, h in neighbor_paths_and_hashes(files, display_order, idx):
+            for path, h in neighbor_paths_and_hashes(files, idx):
                 # Match the cache key load_file will use for this neighbour: its own saved
                 # linear_raw, not the current file's. Otherwise the warm buffer lands under
                 # the wrong key and navigation re-decodes anyway.
@@ -1183,7 +570,7 @@ class AppController(QObject):
                         # Half-size only: a full-res HQ neighbour (~720MB) evicts the
                         # active buffer; the cache key separates resolutions.
                         full_resolution=False,
-                        file_hash=base_hash(h),
+                        file_hash=h,
                         use_splash=False,
                         for_cache_warm=True,
                     )
@@ -1236,12 +623,6 @@ class AppController(QObject):
             self.session.update_config(replace(self.state.config, process=new_proc), render=False)
             self._crop_bounds_dirty = False
         if preview_mode_changed:
-            if leaving_crop:
-                # Same spinner/overlay treatment as an initial file load: the bounds
-                # recompute above plus this render can take a noticeable moment on a
-                # large HQ frame, and image_updated (fired when the render lands)
-                # dismisses it — guaranteed since request_render() runs right below.
-                self.loading_started.emit()
             self.request_render()
 
     def cancel_active_tool(self) -> None:
@@ -1251,178 +632,6 @@ class AppController(QObject):
     def show_rotation_guide(self) -> None:
         """Request the canvas show the fine-rotation alignment grid."""
         self.rotation_guide_requested.emit()
-
-    def set_crop_guide(self, guide: str) -> None:
-        self.session.set_crop_guide(guide)
-        self.crop_guide_changed.emit()
-
-    def cycle_crop_guide_orientation(self) -> None:
-        self.session.set_crop_guide_orientation((self.state.crop_guide_orientation + 1) % 8)
-        self.crop_guide_changed.emit()
-
-    def cycle_dust_overlay(self) -> None:
-        """Advance the dust-detection overlay: Off → Marked → IR → Off
-        (IR skipped when the scan has no IR channel). Repaint only — the data is
-        already in state.last_metrics / state.preview_ir, no re-render needed."""
-        seq = ["off", "marked", "ir"]
-        if not self.state.has_ir:
-            seq.remove("ir")
-        cur = self.state.dust_overlay_mode if self.state.dust_overlay_mode in seq else "off"
-        self.state.dust_overlay_mode = seq[(seq.index(cur) + 1) % len(seq)]
-        self.dust_overlay_changed.emit()
-
-    def toggle_zones_overlay(self, force: Optional[bool] = None) -> None:
-        """Adams-zone box overlay. Repaint only — the boxes are carved from the frame
-        the canvas already holds, so no re-render is needed."""
-        self.state.zones_overlay = (not self.state.zones_overlay) if force is None else bool(force)
-        self.zones_overlay_changed.emit(self.state.zones_overlay)
-
-    def toggle_grain_focuser(self, force: Optional[bool] = None) -> None:
-        """Grain focuser loupe. Repaint only — it magnifies the frame the canvas already
-        holds, so no re-render is needed."""
-        self.state.grain_focuser = (not self.state.grain_focuser) if force is None else bool(force)
-        self.grain_focuser_changed.emit(self.state.grain_focuser)
-
-    def toggle_ring_around(self, force: Optional[bool] = None) -> None:
-        """Print (or clear) the colour ring-around — the M/Y filtration proof."""
-        self.toggle_test_strip(force, kind="colour")
-
-    def toggle_test_strip(self, force: Optional[bool] = None, kind: str = "tone") -> None:
-        """Print (or clear) a proof mosaic: the density × grade strip, or the colour ring-around.
-        Entering dispatches one job, since these need pixels the canvas doesn't have.
-
-        Both share the one proof slot, so asking for the other kind swaps it.
-        """
-        showing = (self.state.test_strip or self.state.test_strip_pending) and self.state.test_strip_kind == kind
-        target = (not showing) if force is None else bool(force)
-        if not target:
-            self._clear_test_strip()
-            return
-        if self.state.preview_raw is None:
-            return
-
-        # Unrotated: one print yields every orientation, so rotating never re-renders.
-        grid = RING_GRID if kind == "colour" else STRIP_GRID
-        overrides = ring_overrides() if kind == "colour" else strip_overrides()
-        toast = "Printing the colour ring-around…" if kind == "colour" else "Printing test strip…"
-
-        # Reprinting an unchanged proof is a pile of renders for pixels we already have.
-        cached = self._strip_memo.get(self.state.current_file_hash or "", self._strip_memo_key(kind))
-        if cached is not None:
-            self.state.test_strip_kind = kind
-            self.on_strip_finished(cached["mosaics"], cached["content_rect"], from_cache=True)
-            return
-
-        proofing = self.state.soft_proof_enabled
-        icc_input = self.effective_input_icc() if (proofing or self.state.config.process.narrowband_scan) else None
-        self.state.test_strip_kind = kind
-        self.state.test_strip_pending = True
-        self.test_strip_changed.emit(False)
-        # A few seconds of renders: tick the HUD so it doesn't read as wedged.
-        self.status_message_requested.emit(toast, 2500)
-        self.status_progress_requested.emit(0, len(overrides))
-        self.strip_requested.emit(
-            TestStripTask(
-                buffer=self.state.preview_raw,
-                config=self.state.config,
-                source_hash=self.state.current_file_hash or "preview",
-                # Always preview res, never HQ: full-res renders per patch would take minutes,
-                # and each patch is shown at a fraction of the frame's width anyway.
-                preview_size=float(APP_CONFIG.preview_render_size),
-                overrides=tuple(overrides),
-                grid=grid,
-                icc_input_path=icc_input,
-                icc_output_path=self.effective_output_icc() if proofing else None,
-                color_space=self.state.workspace_color_space,
-                gpu_enabled=self.state.gpu_enabled,
-                ir_buffer=self.state.preview_ir,
-                monitor_icc_bytes=self.state.monitor_icc_bytes,
-            )
-        )
-
-    def on_strip_progress(self, done: int, total: int) -> None:
-        if self.state.test_strip_pending:
-            self.status_progress_requested.emit(done, total)
-
-    def _clear_test_strip(self) -> None:
-        """Drop the strip and its mosaic; silent when there was nothing up."""
-        if not (self.state.test_strip or self.state.test_strip_pending):
-            return
-        if self.state.test_strip_pending:
-            self.status_progress_requested.emit(0, 0)  # total <= 0 hides the bar
-        self.state.test_strip = False
-        self.state.test_strip_pending = False
-        self.state.test_strip_mosaic = None
-        self.state.test_strip_mosaics = None
-        self.state.test_strip_content_rect = None
-        self.test_strip_changed.emit(False)
-
-    def on_strip_finished(self, mosaics: Any, content_rect: Any, from_cache: bool = False) -> None:
-        # A render that landed while the strip was building already cancelled it.
-        if not (self.state.test_strip_pending or from_cache):
-            return
-        if not from_cache:
-            # Keyed on the config as it stands now, not as it was at dispatch: measured
-            # bounds are persisted after a render with render=False, so the config drifts
-            # mid-print without invalidating anything (the same drift RenderMemo.rekey
-            # exists for). Keying at dispatch made every reprint a miss. Safe because a
-            # change that *did* matter would have gone through request_render, which
-            # cancels the strip outright.
-            self._strip_memo.store(
-                self.state.current_file_hash or "",
-                self._strip_memo_key(self.state.test_strip_kind),
-                {"mosaics": mosaics, "content_rect": content_rect},
-            )
-        self.state.test_strip_pending = False
-        self.state.test_strip = True
-        self.state.test_strip_mosaics = mosaics
-        self.state.test_strip_mosaic = mosaics[self.state.test_strip_rotation]
-        self.state.test_strip_content_rect = content_rect
-        self.test_strip_changed.emit(True)
-        label = "Ring-around" if self.state.test_strip_kind == "colour" else "Test strip"
-        self.status_message_requested.emit(f"{label} ready — click a patch to keep it", 4000)
-
-    def rotate_test_strip(self, direction: int) -> bool:
-        """Turn the ladder rather than the image while a proof is on the canvas; True = consumed.
-
-        Gated on a mosaic being up, never on `pending`: the rotate controls are global, and a
-        proof that is only expected must not swallow them. Mid-print the turn falls through to
-        the image, dropping the print like any other edit.
-        """
-        if not (self.state.test_strip and self.state.test_strip_mosaics):
-            return False
-        self.state.test_strip_rotation = (self.state.test_strip_rotation + direction) % 4
-        self.state.test_strip_mosaic = self.state.test_strip_mosaics[self.state.test_strip_rotation]
-        self.test_strip_changed.emit(True)
-        return True
-
-    def _on_strip_error(self, _message: str) -> None:
-        """A print that errors never reaches on_strip_finished, and the stuck `pending` flag holds
-        the progress bar open and blocks a reprint."""
-        if self.state.test_strip_pending:
-            self._clear_test_strip()
-
-    def apply_test_strip_pick(self, row: int, col: int) -> None:
-        """Commit the clicked patch's settings, then drop the proof.
-
-        Cast Removal and the Auto toggles are left alone: the patches were rendered under
-        them, so flipping one would render something other than the patch that was clicked.
-        """
-        if not self.state.test_strip:
-            return
-        exposure = self.state.config.exposure
-        colour = self.state.test_strip_kind == "colour"
-        base_grid = RING_GRID if colour else STRIP_GRID
-        rotation = self.state.test_strip_rotation
-        cells = rotate_grid(ring_cells() if colour else strip_cells(), base_grid, rotation)
-        _, _, first, second = cells[row * proof_grid(base_grid, rotation)[1] + col]
-        if colour:
-            new_exposure = replace(exposure, wb_magenta=first, wb_yellow=second)
-        else:
-            new_exposure = replace(exposure, density=first, grade=second)
-        self._clear_test_strip()
-        self.session.update_config(replace(self.state.config, exposure=new_exposure), persist=True)
-        self.request_render()
 
     def handle_crop_rect_changed(self, nx1: float, ny1: float, nx2: float, ny2: float, persist: bool) -> None:
         """Live-updates (persist=False) or commits (persist=True) the manual crop rect
@@ -1465,65 +674,11 @@ class AppController(QObject):
         else:
             self._render_debounce.start()
 
-    def handle_straighten_completed(self, delta_deg: float) -> None:
-        """Applies the straighten tool's measured correction on top of the current
-        fine rotation and closes the tool (one-shot, like a Lightroom straighten
-        line). ``delta_deg`` is stored-convention (positive = CCW on screen) and
-        display-space, so it composes additively under flips/90° turns."""
-        if self.state.active_tool != ToolMode.STRAIGHTEN:
-            return
-        current = self.state.config.geometry.fine_rotation
-        new_angle = float(np.clip(current + delta_deg, -FINE_ROTATION_LIMIT, FINE_ROTATION_LIMIT))
-        new_geo = replace(self.state.config.geometry, fine_rotation=new_angle)
-        self.session.update_config(replace(self.state.config, geometry=new_geo), persist=True)
-        self.rotation_guide_requested.emit()
-        self.set_active_tool(ToolMode.NONE)
-        self.request_render()
-
     def confirm_manual_crop(self) -> None:
         """Close the crop tool (committing the current rect) — invoked by a double-click
         inside the crop box so the user needn't return to the Crop button."""
         if self.state.active_tool == ToolMode.CROP_MANUAL:
             self.set_active_tool(ToolMode.NONE)
-
-    def set_crop_ratio(self, ratio: str) -> None:
-        """Sets the sidebar Ratio picker's target ratio. If a manual crop box is
-        already drawn, reshapes it to the new ratio in place — same center, shrunk
-        to fit within its current footprint (enforce_roi_aspect_ratio, the same
-        centered-reshape auto-crop uses) — instead of leaving the box visually
-        stale until the user redrags it.
-
-        Deliberately does NOT invalidate the metering bounds, unlike the other crop
-        entry points. Those clear them because the crop decides whether the film
-        rebate is inside the metered region (resolve_analysis_region meters within
-        context.active_roi), and letting clear base into the meter wrecks the
-        bounds. A ratio change can't do that: both this reshape and autocrop's
-        _enforce_ratio_by_occupancy only ever shrink the box inside a footprint
-        that already excludes the rebate, so the new ROI is a subset of the old
-        one. Re-metering there can only drift the per-channel floors/ceils — i.e.
-        a visible colour shift from what is supposed to be a pure reframe."""
-        geom = self.state.config.geometry
-        if ratio == geom.autocrop_ratio:
-            return
-        new_geo = replace(geom, autocrop_ratio=ratio)
-
-        rect = geom.manual_crop_rect
-        img = self.state.preview_raw
-        if rect is not None and img is not None:
-            h, w = img.shape[:2]
-            if geom.rotation in (1, 3):
-                h, w = w, h
-            nx1, ny1, nx2, ny2 = rect
-            roi_px = (round(ny1 * h), round(ny2 * h), round(nx1 * w), round(nx2 * w))
-            y1, y2, x1, x2 = enforce_roi_aspect_ratio(roi_px, h, w, ratio)
-            new_geo = replace(new_geo, manual_crop_rect=(x1 / w, y1 / h, x2 / w, y2 / h))
-
-        self.session.update_config(replace(self.state.config, geometry=new_geo), persist=True)
-        # Same spinner/overlay treatment as reset_crop/apply_auto_crop: the base
-        # stage still re-runs (geometry is part of its cache key), which can take a
-        # noticeable moment on a large HQ frame.
-        self.loading_started.emit()
-        self.request_render()
 
     def handle_analysis_rect_changed(self, nx1: float, ny1: float, nx2: float, ny2: float, persist: bool) -> None:
         """Live-update (persist=False) or commit (persist=True) the freehand analysis
@@ -1565,9 +720,6 @@ class AppController(QObject):
                 process=new_proc,
             )
         )
-        # Same spinner/overlay treatment as an initial file load: the bounds
-        # recompute above can take a noticeable moment on a large HQ frame.
-        self.loading_started.emit()
         self.request_render()
 
     def apply_auto_crop(self) -> None:
@@ -1588,153 +740,7 @@ class AppController(QObject):
                 process=new_proc,
             )
         )
-        self.loading_started.emit()
         self.request_render()
-
-    def _config_for_autocrop_asset(self, asset: dict) -> WorkspaceConfig:
-        """Resolve per-asset settings, including unsaved edits on the active frame."""
-        if asset.get("hash") == self.state.current_file_hash:
-            return resolve_asset_stitch(resolve_asset_rgbscan(self.state.config, asset), asset)
-        return self.session.config_for_asset(asset)
-
-    def request_batch_auto_crop(self) -> None:
-        """Analyze visible landscape frames together and persist explicit safe crops."""
-        if self._batch_busy("Auto Crop All"):
-            return
-        if self.state.config.geometry.autocrop_mode != AutocropMode.IMAGE:
-            self.set_status("Auto Crop All currently supports Image only mode", 4000)
-            return
-        visible_files = [self.state.uploaded_files[i] for i in self.session.asset_model.visible_actual_indices_ordered()]
-        if not visible_files:
-            return
-
-        frames: list[BatchAutoCropInput] = []
-        preflight_skipped = 0
-        for asset in visible_files:
-            config = self._config_for_autocrop_asset(asset)
-            if config.geometry.manual_crop_rect is not None or config.geometry.autocrop_mode != AutocropMode.IMAGE:
-                preflight_skipped += 1
-                continue
-            frames.append(
-                BatchAutoCropInput(
-                    file_info=asset,
-                    config=config,
-                    fingerprint=_autocrop_fingerprint(config, self.state.workspace_color_space),
-                )
-            )
-
-        if not frames:
-            self.set_status(f"Auto Crop All preserved {preflight_skipped} frame(s); nothing to analyze", 4000)
-            return
-
-        token = self._begin_batch("autocrop", "Auto cropping roll", abortable=True)
-        if token is None:
-            return
-        self._autocrop_batch_token = token
-        self._autocrop_dispatched = len(frames)
-        self._autocrop_preflight_skipped = preflight_skipped
-        self._autocrop_cancel_requested = False
-        self.set_status(f"Auto cropping {len(frames)} frame(s)...")
-        self.batch_autocrop_requested.emit(
-            BatchAutoCropTask(
-                frames=frames,
-                workspace_color_space=self.state.workspace_color_space,
-                generation=token,
-            )
-        )
-
-    def _on_batch_autocrop_progress(self, current: int, total: int, name: str) -> None:
-        self.set_status(f"Auto crop {current}/{total}: {name}")
-        self.status_progress_requested.emit(current, total)
-        self.batch_progress.emit(current, total, name)
-
-    def _on_batch_autocrop_finished(self, results: list[BatchAutoCropResult]) -> None:
-        token = self._autocrop_batch_token
-        if self._active_batch != "autocrop" or token is None or token != self._active_batch_token:
-            return  # stale completion from an older generation
-        if self._autocrop_cancel_requested:
-            self._on_batch_autocrop_cancelled()
-            return
-
-        saved = 0
-        conflicted = 0
-        failed = 0
-        active_changed = False
-        try:
-            for result in results:
-                asset = result.file_info
-                try:
-                    latest = self._config_for_autocrop_asset(asset)
-                    if latest.geometry.manual_crop_rect is not None:
-                        conflicted += 1
-                        continue
-                    if _autocrop_fingerprint(latest, self.state.workspace_color_space) != result.fingerprint:
-                        conflicted += 1
-                        continue
-
-                    rect = result.manual_crop_rect
-                    if len(rect) != 4 or not (0.0 <= rect[0] < rect[2] <= 1.0 and 0.0 <= rect[1] < rect[3] <= 1.0):
-                        conflicted += 1
-                        continue
-                    fine_rotation = latest.geometry.fine_rotation + result.correction_angle
-                    if not np.isfinite(fine_rotation) or abs(fine_rotation) > FINE_ROTATION_LIMIT:
-                        conflicted += 1
-                        continue
-
-                    new_geometry = replace(
-                        latest.geometry,
-                        manual_crop_rect=tuple(float(value) for value in rect),
-                        auto_crop_enabled=False,
-                        fine_rotation=float(fine_rotation),
-                    )
-                    new_process = replace(latest.process, **invalidate_local_bounds(latest.process))
-                    updated = replace(latest, geometry=new_geometry, process=new_process)
-                    if asset.get("hash") == self.state.current_file_hash:
-                        self.session.persist_active_batch_config(updated)
-                        active_changed = True
-                    else:
-                        self.session.repo.save_file_settings(asset["hash"], updated, file_path=asset["path"])
-                    saved += 1
-                except Exception:
-                    failed += 1
-                    logger.exception("Auto Crop All could not persist %s", asset.get("path", asset.get("hash", "frame")))
-        finally:
-            self._end_batch("autocrop", token)
-            self._autocrop_batch_token = None
-            self._autocrop_cancel_requested = False
-            self.status_progress_requested.emit(0, 0)
-
-        unresolved = max(0, self._autocrop_dispatched - len(results))
-        preserved = self._autocrop_preflight_skipped + conflicted
-        failure_suffix = f", failed {failed}" if failed else ""
-        self.set_status(
-            f"Auto Crop All: saved {saved}, preserved {preserved}, unchanged {unresolved}{failure_suffix}",
-            5000,
-        )
-        if active_changed:
-            self.config_updated.emit()
-            self.request_render()
-
-    def _on_batch_autocrop_cancelled(self) -> None:
-        token = self._autocrop_batch_token
-        if token is None:
-            return
-        self._end_batch("autocrop", token)
-        self._autocrop_batch_token = None
-        self._autocrop_cancel_requested = False
-        self.status_progress_requested.emit(0, 0)
-        self.set_status("Auto Crop All aborted; no crops were saved", 4000)
-
-    def _on_batch_autocrop_error(self, message: str) -> None:
-        token = self._autocrop_batch_token
-        if token is None:
-            return
-        self._end_batch("autocrop", token)
-        self._autocrop_batch_token = None
-        self._autocrop_cancel_requested = False
-        self.status_progress_requested.emit(0, 0)
-        logger.error("Auto Crop All failed: %s", message)
-        self.set_status(f"Auto Crop All failed: {message}", 5000)
 
     def detect_aspect_ratio(self) -> None:
         img = self.state.preview_raw
@@ -1752,11 +758,7 @@ class AppController(QObject):
         if geom.fine_rotation != 0.0:
             transformed = apply_fine_rotation(transformed, geom.fine_rotation)
 
-        # Detection can match a portrait-oriented frame to a portrait-only AspectRatio
-        # (e.g. "2:3") that the ratio picker doesn't display — canonicalize so the
-        # stored ratio always matches an entry the picker can show (see
-        # domain.models.CROP_RATIO_CHOICES; the crop tool auto-orients regardless).
-        new_ratio = canonical_crop_ratio(detect_closest_aspect_ratio(transformed, fallback=geom.autocrop_ratio))
+        new_ratio = detect_closest_aspect_ratio(transformed, fallback=geom.autocrop_ratio)
         if new_ratio == geom.autocrop_ratio:
             return
 
@@ -1782,41 +784,11 @@ class AppController(QObject):
             self._update_thumbnail_from_state(force_readback=True)
 
     def clear_retouch(self) -> None:
-        from negpy.desktop.view.confirm import confirm_clear_heals
-
-        conf = self.state.config.retouch
-        count = len(conf.manual_dust_spots) + len(conf.manual_heal_strokes)
-        if count == 0:
-            return
-        # Wiping every heal is not step-recoverable like single-heal undo — confirm.
-        if not confirm_clear_heals(None, count):
-            return
         self.session.update_config(
             replace(
                 self.state.config,
                 retouch=replace(self.state.config.retouch, manual_dust_spots=[], manual_heal_strokes=[]),
-            ),
-            persist=True,
-        )
-        self.request_render()
-
-    def delete_heal(self, kind: str, index: int) -> None:
-        """Removes one placed heal by identity ("stroke"/"spot", index) — lets the
-        user pick off a bad patch directly instead of unwinding newer heals first."""
-        strokes = list(self.state.config.retouch.manual_heal_strokes)
-        spots = list(self.state.config.retouch.manual_dust_spots)
-        if kind == "stroke" and 0 <= index < len(strokes):
-            strokes.pop(index)
-        elif kind == "spot" and 0 <= index < len(spots):
-            spots.pop(index)
-        else:
-            return
-        self.session.update_config(
-            replace(
-                self.state.config,
-                retouch=replace(self.state.config.retouch, manual_dust_spots=spots, manual_heal_strokes=strokes),
-            ),
-            persist=True,
+            )
         )
         self.request_render()
 
@@ -1836,8 +808,7 @@ class AppController(QObject):
             replace(
                 self.state.config,
                 retouch=replace(self.state.config.retouch, manual_dust_spots=spots, manual_heal_strokes=strokes),
-            ),
-            persist=True,
+            )
         )
         self.request_render()
 
@@ -1864,12 +835,12 @@ class AppController(QObject):
         index = len(conf.manual_heal_strokes)
 
         # Score the clone source on the source-frame preview. Brush size is a
-        # diameter at HEAL_SIZE_REF scale (same convention as the pipeline
-        # radius and the overlay cursor).
+        # diameter at preview_render_size scale (same convention as the pipeline
+        # radius size/2·scale_factor and the overlay cursor).
         offset = (0.0, 0.0)
         preview = self.state.preview_raw
         if preview is not None:
-            scale = max(preview.shape[:2]) / float(HEAL_SIZE_REF)
+            scale = max(preview.shape[:2]) / float(APP_CONFIG.preview_render_size)
             offset = select_source_offset(preview, raw_pts, 0.5 * size * scale, index)
         else:
             offset = fallback_source_offset(index, size, (self.state.original_res[1], self.state.original_res[0]))
@@ -1879,8 +850,7 @@ class AppController(QObject):
             replace(
                 self.state.config,
                 retouch=replace(self.state.config.retouch, manual_heal_strokes=conf.manual_heal_strokes + [stroke]),
-            ),
-            persist=True,
+            )
         )
         self.request_render()
 
@@ -1894,7 +864,7 @@ class AppController(QObject):
 
         from negpy.features.local.models import PolygonMask
 
-        mask = PolygonMask(vertices=raw_vertices, strength=0.3)
+        mask = PolygonMask(vertices=raw_vertices, strength=0.3, feather=0.02)
         local = self.state.config.local
         new_masks = local.masks + (mask,)
         new_local = replace(local, masks=new_masks)
@@ -1904,72 +874,26 @@ class AppController(QObject):
         self.config_updated.emit()
         self.request_render()
 
-    def handle_local_mask_edited(self, index: int, viewport_vertices: list) -> None:
-        """Replace a mask's vertices after an on-canvas drag/add edit (persist on release)."""
-        with self.state.metrics_lock:
-            uv_grid = self.state.last_metrics.get("uv_grid")
-        local = self.state.config.local
-        if uv_grid is None or not (0 <= index < len(local.masks)) or len(viewport_vertices) < 3:
-            return
-        raw_vertices = tuple(CoordinateMapping.map_click_to_raw(nx, ny, uv_grid) for nx, ny in viewport_vertices)
-        masks = list(local.masks)
-        masks[index] = replace(masks[index], vertices=raw_vertices)
-        new_local = replace(local, masks=tuple(masks))
-        self.session.update_config(replace(self.state.config, local=new_local), persist=True)
-        self.config_updated.emit()
-        self.request_render()
-
-    def delete_local_vertex(self, index: int, vertex_index: int) -> None:
-        """Remove one vertex from a mask (keeps a minimum of 3)."""
-        local = self.state.config.local
-        if not (0 <= index < len(local.masks)):
-            return
-        mask = local.masks[index]
-        if len(mask.vertices) <= 3 or not (0 <= vertex_index < len(mask.vertices)):
-            return
-        verts = mask.vertices[:vertex_index] + mask.vertices[vertex_index + 1 :]
-        masks = list(local.masks)
-        masks[index] = replace(mask, vertices=verts)
-        new_local = replace(local, masks=tuple(masks))
-        self.session.update_config(replace(self.state.config, local=new_local), persist=True)
-        self.config_updated.emit()
-        self.request_render()
-
     def select_local_mask(self, index: int) -> None:
         self.state.local_selected_mask = index
         self.config_updated.emit()
 
-    def set_local_mask_visible(self, index: int, visible: bool) -> None:
-        """Show/hide one mask's outline on the canvas (view-only; no re-render)."""
-        if not (0 <= index < len(self.state.config.local.masks)):
-            return
-        hidden = set(self.state.local_hidden_masks)
-        if visible:
-            hidden.discard(index)
-        else:
-            hidden.add(index)
-        self.state.local_hidden_masks = hidden
-        self.session.persist_hidden_masks()
-        if self.canvas:
-            self.canvas.overlay.update()
-
-    def delete_local_mask(self, index: int) -> None:
+    def delete_selected_local_mask(self) -> None:
         local = self.state.config.local
-        if not (0 <= index < len(local.masks)):
+        idx = self.state.local_selected_mask
+        if not (0 <= idx < len(local.masks)):
             return
-        from negpy.desktop.view.confirm import confirm_delete_mask
-
-        if not confirm_delete_mask(None):
-            return
-        new_masks = local.masks[:index] + local.masks[index + 1 :]
+        new_masks = local.masks[:idx] + local.masks[idx + 1 :]
         new_local = replace(local, masks=new_masks)
         self.session.update_config(replace(self.state.config, local=new_local), persist=True)
+        self.state.local_selected_mask = -1
+        self.config_updated.emit()
+        self.request_render()
 
-        sel = self.state.local_selected_mask
-        self.state.local_selected_mask = -1 if sel == index else (sel - 1 if sel > index else sel)
-        self.state.local_hidden_masks = {j - 1 if j > index else j for j in self.state.local_hidden_masks if j != index}
-        self.session.persist_hidden_masks()
-
+    def clear_local(self) -> None:
+        new_local = replace(self.state.config.local, masks=())
+        self.session.update_config(replace(self.state.config, local=new_local), persist=True)
+        self.state.local_selected_mask = -1
         self.config_updated.emit()
         self.request_render()
 
@@ -2082,8 +1006,6 @@ class AppController(QObject):
         """
         Initiates background analysis for batch normalization.
         """
-        if self._batch_busy("Batch Analysis"):
-            return
         visible_files = [self.state.uploaded_files[i] for i in self.session.asset_model.visible_actual_indices_ordered()]
         if not visible_files:
             return
@@ -2118,14 +1040,9 @@ class AppController(QObject):
             crop_status = f"Crop status: all {total} files are cropped."
             crop_warning = "Analysis will run on each file's cropped negative area."
 
-        sheet_note = ""
-        if self.session.asset_model.sheet_filter != "all":
-            sheet_note = f"Note: the Sheet filter is on — only the {total} visible frame(s) are analyzed.\n\n"
-
         reply = QMessageBox.question(
             None,
             "Batch Analysis",
-            f"{sheet_note}"
             f"{crop_status}\n"
             f"{crop_warning}\n\n"
             "Batch Analysis measures the exposure bounds of every file and applies "
@@ -2145,10 +1062,8 @@ class AppController(QObject):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        token = self._begin_batch("normalization", "Analyzing roll", abortable=True)
-        if token is None:
-            return
         self.set_status("Starting Batch Normalization...")
+        self._begin_batch("Analyzing roll", abortable=True)
         task = NormalizationTask(
             files=visible_files,
             workspace_color_space=self.state.workspace_color_space,
@@ -2173,7 +1088,7 @@ class AppController(QObject):
         """
         Applies averaged normalization baseline to all files.
         """
-        self._end_batch("normalization")
+        self._end_batch()
         for f_info in self.state.uploaded_files:
             p = self.session.repo.load_file_settings(f_info["hash"]) or replace(self.state.config)
             new_process = replace(
@@ -2185,10 +1100,7 @@ class AppController(QObject):
                 roll_name=None,
             )
             new_p = replace(p, process=new_process)
-            # The active file records its step via update_config(persist=True) below.
-            if f_info["hash"] != self.state.current_file_hash:
-                self.session.push_external_history(f_info["hash"], p, new_p)
-            self.session.repo.save_file_settings(f_info["hash"], new_p, file_path=f_info["path"])
+            self.session.repo.save_file_settings(f_info["hash"], new_p)
 
         # Update current state
         new_process = replace(
@@ -2236,9 +1148,7 @@ class AppController(QObject):
                     roll_name=name,
                 )
                 new_p = replace(p, process=new_process)
-                if f_info["hash"] != self.state.current_file_hash:
-                    self.session.push_external_history(f_info["hash"], p, new_p)
-                self.session.repo.save_file_settings(f_info["hash"], new_p, file_path=f_info["path"])
+                self.session.repo.save_file_settings(f_info["hash"], new_p)
 
             new_process = replace(
                 self.state.config.process,
@@ -2251,19 +1161,6 @@ class AppController(QObject):
             self.session.update_config(replace(self.state.config, process=new_process), persist=True)
             self.set_status(f"Applied Roll '{name}'", 2000)
             self.request_render()
-
-    def clear_roll_baseline(self) -> None:
-        """Roll Analysis section reset: take the current frame off the roll baseline
-        (both averaging axes + named roll) and re-meter it per-frame."""
-        new_process = replace(
-            self.state.config.process,
-            use_luma_average=False,
-            use_colour_average=False,
-            roll_name=None,
-            **invalidate_local_bounds(self.state.config.process),
-        )
-        self.session.update_config(replace(self.state.config, process=new_process), persist=True)
-        self.request_render()
 
     def reanalyze_current_file(self) -> None:
         """
@@ -2344,31 +1241,53 @@ class AppController(QObject):
         """Request device enumeration on the scan worker thread."""
         self.scan_devices_requested.emit()
 
-    def set_scan_backend(self, backend_id: str) -> None:
-        """Route the chosen scanner backend to the worker thread."""
-        self.scan_backend_requested.emit(backend_id)
+    @staticmethod
+    def build_scan_params(
+        *,
+        dpi: int,
+        depth: int,
+        capture_ir: bool,
+        autofocus: bool,
+        samples_per_scan: int,
+        frame: int | None = None,
+        auto_exposure: bool = False,
+        subframe_mm: float | None = None,
+        br_y_device_px: int | None = None,
+    ) -> ScanParams:
+        """Translate Scan-tab control values into one ScanParams recipe.
+
+        Registered geometry (``subframe_mm`` + ``br_y_device_px``) is opt-in:
+        pass both together to position a fine transport shift and shortened
+        scan window for this frame, or leave both None for a plain full-window
+        scan. When geometry is supplied, ``frame`` rides inside it
+        (``RegisteredScanGeometry.frame``) instead of also riding on
+        ``ScanParams.frame`` — the two can never disagree because only one of
+        them is ever set.
+        """
+        if (subframe_mm is None) != (br_y_device_px is None):
+            raise ValueError("registered geometry requires both subframe_mm and br_y_device_px, or neither")
+
+        geometry: RegisteredScanGeometry | None = None
+        effective_frame = frame
+        if subframe_mm is not None and br_y_device_px is not None:
+            geometry = RegisteredScanGeometry(subframe_mm=subframe_mm, br_y_device_px=br_y_device_px, frame=frame)
+            effective_frame = None
+
+        return ScanParams(
+            dpi=dpi,
+            depth=depth,
+            capture_ir=capture_ir,
+            autofocus=autofocus,
+            samples_per_scan=samples_per_scan,
+            frame=effective_frame,
+            auto_exposure=auto_exposure,
+            registered_geometry=geometry,
+        )
 
     def start_scan(self, req: ScanRequest) -> None:
         """Start a scan. The UI connects to scan signals for state updates."""
-        self.scan_worker.prepare_scan()
         self.scan_started.emit()
         self.scan_requested.emit(req)
-
-    def start_batch(self, req: BatchRequest) -> None:
-        """Start a frame-range batch scan over a roll/strip feeder."""
-        self.scan_worker.prepare_scan()
-        self.scan_started.emit()
-        self.scan_batch_requested.emit(req)
-
-    def start_roll_preview(self, req: RollPreviewRequest) -> None:
-        """Preview strip slots (results via scan_roll_preview_ready, then
-        scan_roll_preview_finished). No scan_started — preview is dialog-local."""
-        self.scan_worker.prepare_scan()
-        self.scan_roll_preview_requested.emit(req)
-
-    def eject_scanner(self, device_id: str) -> None:
-        """Trigger the scanner's eject action on the worker thread."""
-        self.scan_eject_requested.emit(device_id)
 
     def cancel_scan(self) -> None:
         self.scan_worker.cancel()
@@ -2379,223 +1298,21 @@ class AppController(QObject):
         self._pending_scanned_file = path
         self.request_asset_discovery([path])
 
-    def _on_scan_batch_finished(self, paths: list) -> None:
-        """Import every frame a batch completed, including a stopped or failed run."""
-        self.scan_batch_finished.emit(paths)
-        if paths:
-            self._pending_scanned_file = paths[-1]
-            self.request_asset_discovery(list(paths))
-
-    # ── Stitch (multi-part scan composite) ─────────────────────────────
-
-    def request_stitch_selected(self) -> None:
-        """Register the selected frames into one stitched composite asset."""
-        if self._batch_busy("Stitch"):
-            return
-        files = [self.state.uploaded_files[i] for i in sorted(set(self.state.selected_indices)) if 0 <= i < len(self.state.uploaded_files)]
-        by_path = {f["path"]: f for f in files}  # half-frame assets share a path
-        ordered = sorted(by_path.values(), key=lambda f: os.path.basename(f["path"]).lower())
-        if len(ordered) < 2:
-            self.set_status("Select two or more frames to stitch", 4000)
-            return
-        if any(f.get("green_path") or f.get("stitch_paths") for f in ordered):
-            self.set_status("Stitching RGB-scan or already-stitched frames is not supported", 4000)
-            return
-        if self._begin_batch("stitch", "Stitching frames", abortable=True) is None:
-            return
-        self.stitch_requested.emit(
-            StitchTask(
-                files=tuple(dict(f) for f in ordered),
-                params_by_path={f["path"]: self._batch_params_for(f) for f in ordered},
-            )
-        )
-
-    def _on_stitch_registered(self, payload: dict) -> None:
-        self._end_batch("stitch")
-        files = payload["files"]
-        part_paths = [f["path"] for f in files]
-        composite = {
-            "name": stitch_name(part_paths),
-            "path": part_paths[0],
-            "hash": stitch_hash([f["hash"] for f in files]),
-            "stitch_paths": tuple(part_paths[1:]),
-            "stitch_transforms": payload["transforms"],
-            "stitch_canvas": payload["canvas"],
-            "stitch_sizes": payload["sizes"],
-        }
-        wanted = set(part_paths)
-        indices = [i for i, f in enumerate(self.state.uploaded_files) if f["path"] in wanted]
-        self.session.apply_stitch(indices, composite)
-        self.set_status(f"Stitched {len(files)} frames", 4000)
-        # The composite bypasses asset discovery, so nothing else queues its thumbnail.
-        self.generate_missing_thumbnails()
-
-    def _on_stitch_cancelled(self) -> None:
-        self._on_batch_cancelled("stitch")
-
-    def _on_stitch_error(self, message: str) -> None:
-        self._end_batch("stitch")
-        self.set_status(message, 6000)
-
-    def request_unstitch(self) -> None:
-        """Dissolve the active stitched composite back into its part frames.
-
-        Part edits restore from the DB by content hash; the composite's edits stay
-        keyed under its stitch hash for a future re-stitch of the same parts."""
-        idx = self.state.selected_file_idx
-        if not (0 <= idx < len(self.state.uploaded_files)):
-            return
-        asset = self.state.uploaded_files[idx]
-        parts = asset.get("stitch_paths")
-        if not parts:
-            return
-        paths = [asset["path"], *parts]
-        self.state.uploaded_files.pop(idx)
-        self.session.state.thumbnails.pop(asset["name"], None)
-        self.session.state.rendered_thumbnails.discard(asset["name"])
-        self.session.asset_model.refresh()
-        self._pending_scanned_file = paths[0]
-        self.request_asset_discovery(paths)
-
-    def _select_file_by_path(self, path: str) -> bool:
+    def _select_file_by_path(self, path: str) -> None:
         """Find a file by path in uploaded_files and select it."""
         for i, f_info in enumerate(self.session.state.uploaded_files):
             if f_info.get("path") == path:
                 self.session.select_file(i)
-                return True
-        return False
-
-    # ── Scanlight capture integration ─────────────────────────────────
-
-    def _ensure_capture_thread(self) -> None:
-        """Start the capture worker's thread on first use (lazy). Every capture entry point that
-        emits to the worker calls this first, so the thread is running when the queued cross-thread
-        signal is delivered. The live-view sub-controls and cancel skip it: they only run once a
-        session is already up (started here) or touch the worker's thread-safe cancel Event."""
-        if not self._capture_thread_started:
-            self.capture_thread.start()
-            self._capture_thread_started = True
-
-    def set_scanlight_color(self, r: int, g: int, b: int, w: int = 0, port: str = "") -> None:
-        """Live light control (no capture): RGB for preview, or white (w) for focus."""
-        self._ensure_capture_thread()
-        self.capture_light_requested.emit(r, g, b, w, port)
-
-    def start_capture(self, req: CaptureRequest) -> None:
-        """Start a capture; the Scanlight sidebar tracks state via signals."""
-        self._ensure_capture_thread()
-        self._last_capture_req = req
-        self.capture_requested.emit(req)
-
-    def cancel_capture(self) -> None:
-        self.capture_worker.cancel()
-
-    def start_live_view(self, req: LiveViewRequest) -> None:
-        self._ensure_capture_thread()
-        self.live_view_requested.emit(req)
-
-    def stop_live_view(self) -> None:
-        self.live_view_stop_requested.emit()
-
-    def close_camera_session(self) -> None:
-        """Release the held PTP session. Call once neither the scan window nor the
-        preset-calibration pop-up is open — some bodies (Fuji) get stuck in a
-        tethered-capture state until the session is cleanly exited, and leaving it
-        open past the last consuming window makes the next connection attempt hang."""
-        if self._capture_thread_started:
-            self.camera_session_close_requested.emit()
-
-    def set_focus_magnifier(self, on: bool) -> None:
-        self.live_view_focus_magnifier_requested.emit(on)
-
-    def set_focus_magnifier_pos(self, x: int, y: int) -> None:
-        self.live_view_focus_magnifier_pos_requested.emit(x, y)
-
-    def set_camera_setting(self, which: str, raw: int) -> None:
-        # Ensure the worker thread runs: the sidebar counts these writes and gates Scan until
-        # each one reports back, so a write queued to a never-started thread would gate forever.
-        self._ensure_capture_thread()
-        self.live_view_camera_setting_requested.emit(which, raw)
-
-    def start_calibration(self, req: CalibrationRequest) -> None:
-        self._ensure_capture_thread()
-        self.calibration_requested.emit(req)
-
-    def poll_connection(self, port: str) -> None:
-        self._ensure_capture_thread()
-        self.poll_connection_requested.emit(port)
-
-    def poll_light_temp(self, port: str) -> None:
-        self._ensure_capture_thread()
-        self.poll_light_temp_requested.emit(port)
-
-    def _on_capture_finished(self, paths: list) -> None:
-        """Feed the captured frame(s) into NegPy. A 3-file RGB triplet → RGB-Scan negative
-        (C-41) pipeline; a single white-light slide → E-6/positive; a normal white-light
-        camera scan → an ordinary single RAW (RGB-Scan off, process left to NegPy)."""
-        self.capture_finished.emit(paths)
-        if not paths:
-            return
-        req = getattr(self, "_last_capture_req", None)
-        white = bool(req is not None and req.white_mode)
-        rgb = bool(req is not None and getattr(req, "rgb_mode", True))
-        # RGB-Scan (triplet merge) is on only for an actual RGB triplet — off for a single
-        # white-light slide OR a normal (non-Scanlight) camera scan.
-        self.session.repo.save_global_setting("rgbscan_mode", rgb and not white)
-        if white:  # slides/B&W force a positive process
-            mode = (req.white_process_mode or "auto").lower()
-            target = {"e-6": ProcessMode.E6, "b&w": ProcessMode.BW}.get(mode)
-            self._pending_capture_imports[_capture_import_key(paths[0])] = _PendingCaptureImport(
-                process_mode=target,
-                detect_mode=target is None,
-            )
-        elif rgb:
-            # Independently exposed RGB channels have no broadband orange-mask signal for
-            # the normal classifier. They are negative scans unless capture metadata says
-            # otherwise, so carry C-41 through discovery instead of guessing from the merge.
-            self._pending_capture_imports[_capture_import_key(paths[0])] = _PendingCaptureImport(process_mode=ProcessMode.C41)
-        self._pending_scanned_file = paths[0]
-        self.request_asset_discovery(list(paths))
+                return
 
     def effective_output_icc(self) -> Optional[str]:
         """Output profile the preview proofs through: a custom override, else the
         profile for the selected export color space. None means no proof (Same as Source)."""
         return self.state.icc_output_path or ColorSpaceRegistry.get_icc_path(self.state.config.export.export_color_space)
 
-    def effective_input_icc(self, process: Optional[ProcessConfig] = None) -> Optional[str]:
-        """Source profile for color management: an explicit Input ICC wins; else the
-        bundled RGBScan profile when Narrowband Scan is on; else None."""
-        p = process if process is not None else self.state.config.process
-        if self.state.icc_input_path:
-            return self.state.icc_input_path
-        if p.narrowband_scan:
-            return get_resource_path("icc/RGBScan.icc")
-        return None
-
-    def display_transform_params(self, splash: bool = False) -> tuple[str, Optional[bytes]]:
-        """Source space + monitor profile to hand the display transform for the
-        current render, as ``(color_space, monitor_icc_bytes)``.
-
-        Single source of truth for every consumer of a rendered buffer — the canvas
-        and the filmstrip thumbnail must agree, or the same frame shows two different
-        colours. With a proof active the render worker already baked
-        source→output→monitor into the buffer, so the transform has to be a no-op
-        (sRGB→sRGB, no monitor profile); treating that buffer as working-space instead
-        re-applies the working→sRGB conversion and blows the saturation out. ``splash``
-        marks the embedded camera thumbnail, which is already sRGB.
-        """
-        if splash:
-            return ColorSpace.SRGB.value, self.state.monitor_icc_bytes
-        if self.proof_active():
-            return ColorSpace.SRGB.value, None
-        return self.state.workspace_color_space, self.state.monitor_icc_bytes
-
     def proof_active(self) -> bool:
         """True when the preview should soft-proof: the toggle is on and an input or
-        output profile is available, or Narrowband Scan supplies an implicit input
-        profile. Off → preview is the edit on the monitor."""
-        if self.state.config.process.narrowband_scan:
-            return True
+        output profile is available. Off → preview is the edit on the monitor."""
         return self.state.soft_proof_enabled and bool(self.state.icc_input_path or self.effective_output_icc())
 
     def set_soft_proof(self, enabled: bool) -> None:
@@ -2653,14 +1370,10 @@ class AppController(QObject):
             self.state.flat_peek = False
             self.flat_peek_changed.emit(False)
 
-        # The strip's patches were printed from the config as it stood; once the edit
-        # moves they are a proof of something else, so drop them (this also cancels a
-        # strip still building).
-        if config_override is None:
-            self._clear_test_strip()
-
         if self.state.preview_raw is None:
             return
+
+        self.set_status("Rendering...")
 
         preview_raw = self.state.preview_raw
         if preview_raw is None:
@@ -2672,18 +1385,9 @@ class AppController(QObject):
 
         # Soft-proof gating: Output/Input ICC only touch the preview when the toggle is
         # on; otherwise the preview is the edit shown on the monitor (export unaffected).
-        # Narrowband Scan supplies an implicit input profile regardless of the toggle.
         proofing = self.state.soft_proof_enabled
-        narrowband = self.state.config.process.narrowband_scan
-        icc_input = self.effective_input_icc() if (proofing or narrowband) else None
+        icc_input = self.state.icc_input_path if proofing else None
         effective_output = self.effective_output_icc() if proofing else None
-
-        crop_preview_full = self.state.active_tool in (ToolMode.CROP_MANUAL, ToolMode.ANALYSIS_DRAW)
-        # Only a plain render of the saved edit is reproducible on navigate-back;
-        # overrides (compare/flat peek), splash and tool previews are not memoized.
-        memo_key = ""
-        if config_override is None and not ephemeral and not crop_preview_full:
-            memo_key = self._render_memo_key()
 
         task = RenderTask(
             buffer=preview_raw,
@@ -2697,10 +1401,8 @@ class AppController(QObject):
             readback_metrics=readback_metrics,
             ir_buffer=self.state.preview_ir,
             monitor_icc_bytes=self.state.monitor_icc_bytes,
-            crop_preview_full=crop_preview_full,
+            crop_preview_full=self.state.active_tool in (ToolMode.CROP_MANUAL, ToolMode.ANALYSIS_DRAW),
             ephemeral=ephemeral,
-            memo_key=memo_key,
-            compare=self.state.compare_mode,
         )
 
         if self._is_rendering:
@@ -2722,31 +1424,9 @@ class AppController(QObject):
             self.compare_changed.emit(False)
             self.request_render()
         else:
-            # Mutually exclusive with flat-peek: drop it so its toggle can't linger
-            # lit while the compare baseline is what's actually on screen (mirrors
-            # toggle_flat_peek, which exits compare on the way in).
-            if self.state.flat_peek:
-                self.state.flat_peek = False
-                self.flat_peek_changed.emit(False)
-            # Same reason the strip and the peek are exclusive: both want the canvas.
-            self._clear_test_strip()
             self.state.compare_mode = True
             self.compare_changed.emit(True)
             self.request_render(readback_metrics=False, config_override=self._baseline_compare_config())
-
-    def rerender_active_view(self) -> None:
-        """Re-render the canvas keeping whatever comparison overlay is active.
-
-        Geometry ops (rotate/flip) change the config but shouldn't kick the user
-        out of before/after or flat-peek; a plain request_render() would exit both.
-        Passing the mode's config_override re-renders in place and leaves the mode on.
-        """
-        if self.state.compare_mode:
-            self.request_render(readback_metrics=False, config_override=self._baseline_compare_config())
-        elif self.state.flat_peek:
-            self.request_render(readback_metrics=False, config_override=flat_master_config(self.state.config))
-        else:
-            self.request_render()
 
     # --- Flat ("for editing elsewhere") master output -----------------------
 
@@ -2774,6 +1454,17 @@ class AppController(QObject):
         if not enabled and self.state.flat_peek:
             self.toggle_flat_peek(force=False)
 
+    def _flat_export_format(self) -> str:
+        return ExportFormat.DNG if self.state.flat_format == "DNG" else ExportFormat.TIFF
+
+    def set_flat_format(self, fmt: str) -> None:
+        """Set the flat master file format ('TIFF' 16-bit or 'DNG' linear)."""
+        fmt = fmt if fmt in ("TIFF", "DNG") else "TIFF"
+        if self.state.flat_format == fmt:
+            return
+        self.state.flat_format = fmt
+        self.session.save_flat_output_prefs()
+
     def toggle_flat_peek(self, force: Optional[bool] = None) -> None:
         """Preview the flat master render in the canvas without changing the saved edit.
 
@@ -2789,8 +1480,6 @@ class AppController(QObject):
         if target and self.state.compare_mode:
             self.state.compare_mode = False
             self.compare_changed.emit(False)
-        if target:
-            self._clear_test_strip()
 
         self.state.flat_peek = target
         self.flat_peek_changed.emit(target)
@@ -2799,6 +1488,12 @@ class AppController(QObject):
             self.request_render(readback_metrics=False, config_override=flat_master_config(self.state.config))
         else:
             self.request_render()
+
+    def set_local_overlay_visible(self, visible: bool) -> None:
+        """Show/hide the dodge/burn mask overlay (view-only; no re-render)."""
+        self.state.show_local_overlay = visible
+        if self.canvas:
+            self.canvas.overlay.update()
 
     def _enabled_presets(self) -> List[ExportPreset]:
         return [p for p in self.state.export_presets if p.enabled]
@@ -2821,7 +1516,7 @@ class AppController(QObject):
         config), with its own RGB-scan green/blue re-injected from the asset dict — the
         same authoritative source individual export gets via select_file."""
         params = self.session.repo.load_file_settings(f["hash"]) or self.state.config
-        return resolve_asset_stitch(resolve_asset_rgbscan(params, f), f)
+        return resolve_asset_rgbscan(params, f)
 
     def _tasks_for_file(
         self,
@@ -2835,7 +1530,7 @@ class AppController(QObject):
         tasks = []
         for preset in presets:
             task_params, export_settings = resolve_preset_export(preset, params)
-            export_settings.icc_input_path = self.effective_input_icc(task_params.process)
+            export_settings.icc_input_path = self.state.icc_input_path
             tasks.append(
                 ExportTask(
                     file_info=file_info,
@@ -2902,8 +1597,6 @@ class AppController(QObject):
 
     def request_export(self) -> None:
         """Exports the current file using the settings currently shown in the Export panel."""
-        if self._batch_busy("export"):
-            return
         if not self.state.current_file_path:
             return
 
@@ -2914,13 +1607,13 @@ class AppController(QObject):
         export_conf = replace(
             self.state.config.export,
             export_path=export_path,
-            icc_input_path=self.effective_input_icc(),
+            icc_input_path=self.state.icc_input_path,
             icc_output_path=self.state.icc_output_path,
         )
         params = self.state.config
         if self.state.flat_output:
             params = flat_master_config(params)
-            export_conf = flat_export_config(export_conf)
+            export_conf = flat_export_config(export_conf, fmt=self._flat_export_format())
         source_exif = self.state.source_exif.get(self.state.current_file_hash or "")
 
         self._run_export_tasks(
@@ -2944,26 +1637,21 @@ class AppController(QObject):
     def request_export_selected(self) -> None:
         """Batch-exports the currently selected files using each file's own saved settings."""
         selected = [self.state.uploaded_files[i] for i in self.state.selected_indices if 0 <= i < len(self.state.uploaded_files)]
-        self.request_batch_export(files=[f for f in selected if not f.get("excluded")])
+        self.request_batch_export(files=selected)
 
     def request_batch_export(self, override_settings: bool = False, files: list[dict] | None = None) -> None:
         """Batch-exports the given files (all visible by default) using current settings, optionally applied to all."""
-        if self._batch_busy("export"):
-            return
         export_path = self._ensure_valid_export_path()
         if not export_path:
             return
 
         current_export = replace(self.state.config.export, export_path=export_path)
+        icc_input = self.state.icc_input_path
         icc_output = self.state.icc_output_path
         sync_metadata = self.state.config.metadata.sync_to_batch
 
         if files is None:
-            files = [
-                self.state.uploaded_files[i]
-                for i in self.session.asset_model.visible_actual_indices_ordered()
-                if not self.state.uploaded_files[i].get("excluded")
-            ]
+            files = [self.state.uploaded_files[i] for i in self.session.asset_model.visible_actual_indices_ordered()]
 
         if len(files) > 1 and not self._confirm_bulk_export(f"Export {len(files)} frames?"):
             return
@@ -2972,6 +1660,7 @@ class AppController(QObject):
             self._write_edit_sidecars(files)
 
         flat = self.state.flat_output
+        flat_fmt = self._flat_export_format()
 
         tasks = []
         for f in files:
@@ -2979,32 +1668,16 @@ class AppController(QObject):
 
             if override_settings:
                 params = replace(params, export=current_export)
-            else:
-                # Always use current session export path/mode/format even for
-                # per-file exports. Per-file configs from the DB bypass
-                # _apply_sticky_settings and may have stale ABSOLUTE/export_path
-                # or export_fmt values that don't match what the UI shows.
-                params = replace(
-                    params,
-                    export=replace(
-                        params.export,
-                        output_mode=current_export.output_mode,
-                        export_path=current_export.export_path,
-                        output_subfolder=current_export.output_subfolder,
-                        export_fmt=current_export.export_fmt,
-                        export_color_space=current_export.export_color_space,
-                    ),
-                )
 
             final_export = replace(
                 params.export,
-                icc_input_path=self.effective_input_icc(params.process),
+                icc_input_path=icc_input,
                 icc_output_path=icc_output,
             )
 
             if flat:
                 params = flat_master_config(params)
-                final_export = flat_export_config(final_export)
+                final_export = flat_export_config(final_export, fmt=flat_fmt)
 
             bounds_override = None
             if f["hash"] == self.state.current_file_hash:
@@ -3089,8 +1762,6 @@ class AppController(QObject):
         return reply == QMessageBox.StandardButton.Yes
 
     def _dispatch_preset_export(self, files: list[dict]) -> None:
-        if self._batch_busy("export"):
-            return
         if not files:
             return
 
@@ -3155,8 +1826,6 @@ class AppController(QObject):
 
     def request_contact_sheet(self) -> None:
         """Renders all visible files small and writes darkroom contact sheet(s)."""
-        if self._batch_busy("contact sheet"):
-            return
         visible_files = [self.state.uploaded_files[i] for i in self.session.asset_model.visible_actual_indices_ordered()]
         if not visible_files:
             return
@@ -3184,8 +1853,7 @@ class AppController(QObject):
         cs = self.state.config.export
         self._export_start_time = time.time()
         self._export_failures = 0
-        if self._begin_batch("contact_sheet", "Contact sheet", abortable=True) is None:
-            return
+        self._begin_batch("Contact sheet", abortable=True)
         QMetaObject.invokeMethod(
             self.export_worker,
             "run_contact_sheet",
@@ -3196,9 +1864,6 @@ class AppController(QObject):
             Q_ARG(int, cs.contact_sheet_gap),
             Q_ARG(int, cs.contact_sheet_margin),
             Q_ARG(int, cs.contact_sheet_max_tiles),
-            Q_ARG(bool, cs.contact_sheet_show_labels),
-            Q_ARG(str, cs.contact_sheet_background_color),
-            Q_ARG(str, cs.contact_sheet_label_color),
         )
 
     def _write_edit_sidecars(self, files: list[dict]) -> int:
@@ -3206,10 +1871,9 @@ class AppController(QObject):
         repo = self.session.repo
         written = 0
         for f in files:
-            half = int(f.get("half") or 0)
-            params = load_or_promote(repo, f["hash"], f["path"], half=half) or self.state.config
+            params = load_or_promote(repo, f["hash"], f["path"]) or self.state.config
             try:
-                write_sidecar(f["path"], params, half=half)
+                write_sidecar(f["path"], params)
                 written += 1
             except Exception as exc:
                 logger.warning("Sidecar write failed for %s: %s", f.get("path"), exc)
@@ -3217,11 +1881,7 @@ class AppController(QObject):
 
     def export_edit_sidecars(self) -> None:
         """Explicit batch sidecar export for all visible files (ignores the on-export toggle)."""
-        visible_files = [
-            self.state.uploaded_files[i]
-            for i in self.session.asset_model.visible_actual_indices_ordered()
-            if not self.state.uploaded_files[i].get("excluded")
-        ]
+        visible_files = [self.state.uploaded_files[i] for i in self.session.asset_model.visible_actual_indices_ordered()]
         if not visible_files:
             return
         written = self._write_edit_sidecars(visible_files)
@@ -3247,8 +1907,7 @@ class AppController(QObject):
 
         self._export_start_time = time.time()
         self._export_failures = 0
-        if self._begin_batch("export", "Exporting", abortable=True) is None:
-            return
+        self._begin_batch("Exporting", abortable=True)
         QMetaObject.invokeMethod(
             self.export_worker,
             "run_batch",
@@ -3351,21 +2010,11 @@ class AppController(QObject):
             self.state.last_metrics.update(metrics)
             self.state.last_metrics["splash"] = False
 
-        # Memoize the displayed pixels for instant navigate-back. ndarray only:
-        # GPU textures are destroyed on navigation (in the default soft-proof
-        # path the displayed buffer is already a CPU array). Stored by reference
-        # — display buffers are read-only downstream.
-        result = metrics.get("base_positive")
-        if metrics.get("memo_key") and isinstance(result, np.ndarray) and metrics.get("source_hash") == self.state.current_file_hash:
-            self._render_memo.store(
-                metrics["source_hash"],
-                metrics["memo_key"],
-                {"base_positive": result, "content_rect": metrics.get("content_rect")},
-            )
-
         if metrics.get("gpu_fallback") and not self._gpu_fallback_notified:
             self._gpu_fallback_notified = True
             self.set_status("GPU acceleration failed — using CPU", 5000)
+        else:
+            self.set_status("READY", 1000)
 
         self.image_updated.emit()
 
@@ -3386,8 +2035,6 @@ class AppController(QObject):
         """
         with self.state.metrics_lock:
             self.state.last_metrics.update(metrics)
-        if "ir_degenerate" in metrics:
-            self.state.ir_degenerate = bool(metrics["ir_degenerate"])
         self.metrics_available.emit(metrics)
 
         # Don't persist bounds from an ephemeral (splash) render or a render of a different
@@ -3416,10 +2063,6 @@ class AppController(QObject):
                     render=False,
                     record_history=False,
                 )
-                # render=False: the displayed pixels already reflect these measured
-                # bounds — move the frame's memo entry to the updated config's key
-                # so the first navigate-back after an initial render still hits.
-                self._render_memo.rekey(src or self.state.current_file_hash or "", self._render_memo_key())
 
     def _on_render_error(self, message: str) -> None:
         self.state.is_processing = self._is_rendering = False
@@ -3438,23 +2081,13 @@ class AppController(QObject):
 
     def _on_export_finished(self) -> None:
         elapsed = time.time() - self._export_start_time
-        owner = self._active_batch if self._active_batch in ("export", "contact_sheet") else "export"
-        self._end_batch(owner)
+        self._end_batch()
         self.export_finished.emit(elapsed, self._export_failures)
         self._update_thumbnail_from_state(force_readback=True)
 
     def _update_thumbnail_from_state(self, force_readback: bool = False, persist: bool = True) -> None:
         if not self.state.current_file_path or not self.state.current_file_hash:
             return
-        idx = self.state.selected_file_idx
-        if not (0 <= idx < len(self.state.uploaded_files)):
-            return
-        # The filmstrip keys state.thumbnails by the asset's display name, which for an
-        # RGB-scan triplet is "<base> (RGB)" — NOT basename(current_file_path), which is
-        # the underlying red exposure's filename. Keying by the wrong name silently
-        # orphans every triplet's rendered thumbnail under a key nothing ever reads.
-        asset_name = self.state.uploaded_files[idx]["name"]
-
         with self.state.metrics_lock:
             metrics = dict(self.state.last_metrics)
         buffer = metrics.get("base_positive")
@@ -3465,7 +2098,7 @@ class AppController(QObject):
             logger.info(
                 "thumb-refresh readback %.1fms %s",
                 (time.perf_counter() - t0) * 1000,
-                asset_name,
+                os.path.basename(self.state.current_file_path),
             )
 
         if buffer is not None and not isinstance(buffer, np.ndarray):
@@ -3473,19 +2106,12 @@ class AppController(QObject):
         if buffer is None or not isinstance(buffer, np.ndarray):
             return
 
-        # Same transform the canvas used for this buffer, so the filmstrip and the
-        # canvas can't disagree about the frame's colour.
-        display_cs, monitor_bytes = self.display_transform_params(splash=bool(metrics.get("splash")))
-        # Cache under the triplet-namespaced key so the batch (source) path re-serves this
-        # rendered positive instead of the uninverted source merge it decodes itself.
-        cache_key = thumbnail_cache_key(self.state.current_file_hash, is_rgb_triplet(self.state.config.rgbscan))
         self.thumbnail_update_requested.emit(
             ThumbnailUpdateTask(
-                filename=asset_name,
-                file_hash=cache_key,
+                filename=os.path.basename(self.state.current_file_path),
+                file_hash=self.state.current_file_hash,
                 buffer=buffer,
-                color_space=display_cs,
-                monitor_icc_bytes=monitor_bytes,
+                color_space=self.state.workspace_color_space,
                 persist=persist,
             )
         )
@@ -3508,8 +2134,6 @@ class AppController(QObject):
         if self.thumb_thread.isRunning():
             self.thumb_thread.quit()
             self.thumb_thread.wait()
-        self._autocrop_cancel_requested = True
-        self.batch_autocrop_worker.cancel(self._autocrop_batch_token)
         if self.norm_thread.isRunning():
             self.norm_thread.quit()
             self.norm_thread.wait()
@@ -3523,10 +2147,6 @@ class AppController(QObject):
         if self.scan_thread.isRunning():
             self.scan_thread.quit()
             self.scan_thread.wait()
-        self.capture_worker.shutdown()
-        if self.capture_thread.isRunning():
-            self.capture_thread.quit()
-            self.capture_thread.wait()
         self.render_worker.destroy_all()
 
         # All GPU-touching threads are now joined; release the wgpu device.

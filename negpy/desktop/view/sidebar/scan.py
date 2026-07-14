@@ -1,8 +1,12 @@
+import json
+import os
+
 import qtawesome as qta
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -15,10 +19,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from negpy.desktop.view.styles.templates import hint_label
+from negpy.desktop.view.styles.templates import hint_label, section_subheader
 from negpy.desktop.view.styles.theme import THEME
 from negpy.infrastructure.scanners.base import ScannerCapabilities, ScannerDevice
-from negpy.infrastructure.scanners.registry import DEFAULT_BACKEND_ID, backend_choices
 from negpy.infrastructure.scanners.settings import ScannerSettings
 
 
@@ -64,23 +67,13 @@ class ScanSidebar(QWidget):
 
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(THEME.space_xl, 0, THEME.space_xl, 5)
-        layout.setSpacing(THEME.space_lg)
+        layout.setContentsMargins(5, 0, 5, 5)
+        layout.setSpacing(10)
 
         # ── DEVICE ───────────────────────────────────────────
-        device_form = QFormLayout()
-        device_form.setSpacing(6)
-
-        self.backend_combo = QComboBox()
-        self.backend_combo.setToolTip("Scanner transport backend")
-        for backend_id, backend_label in backend_choices():
-            self.backend_combo.addItem(backend_label, backend_id)
-        idx = self.backend_combo.findData(self._settings.backend)
-        self.backend_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        device_form.addRow("Backend", self.backend_combo)
+        layout.addWidget(section_subheader("DEVICE"))
 
         device_row = QHBoxLayout()
-        device_row.setContentsMargins(0, 0, 0, 0)
         self.device_combo = QComboBox()
         self.device_combo.setToolTip("Select scanner")
         self.device_combo.addItem("Detecting scanners…", None)
@@ -90,19 +83,9 @@ class ScanSidebar(QWidget):
         self.refresh_btn.setToolTip("Refresh device list")
         self.refresh_btn.setFixedWidth(32)
 
-        self.eject_btn = QPushButton()
-        self.eject_btn.setIcon(qta.icon("fa5s.eject", color=THEME.text_secondary))
-        self.eject_btn.setToolTip("Eject film")
-        self.eject_btn.setFixedWidth(32)
-        self.eject_btn.setVisible(False)
-
         device_row.addWidget(self.device_combo, 1)
         device_row.addWidget(self.refresh_btn)
-        device_row.addWidget(self.eject_btn)
-        device_row_widget = QWidget()
-        device_row_widget.setLayout(device_row)
-        device_form.addRow("Device", device_row_widget)
-        layout.addLayout(device_form)
+        layout.addLayout(device_row)
 
         # ── CAPS INFO ───────────────────────────────────────
         self.frame_label = hint_label("")
@@ -128,15 +111,20 @@ class ScanSidebar(QWidget):
         depth_row.addWidget(self.ir_check)
         self.form.addRow("Depth", depth_row)
 
-        # Spanning rows (no label column) so the checkboxes sit at the left edge.
+        self.frame_spin = QSpinBox()
+        self.frame_spin.setRange(0, 0)
+        self.frame_spin.setSpecialValueText("Current")
+        self.frame_spin.setToolTip("Frame selection not supported by this device")
+        self.form.addRow("Frame #", self.frame_spin)
+
         self.autofocus_check = QCheckBox("Autofocus")
         self.autofocus_check.setChecked(True)
-        self.autofocus_check.setToolTip("Autofocus before scanning (film is rarely perfectly flat)")
-        self.form.addRow(self.autofocus_check)
+        self.autofocus_check.setToolTip("Autofocus before scanning (recommended — film is rarely perfectly flat)")
+        self.form.addRow("Autofocus", self.autofocus_check)
 
-        self.ae_check = QCheckBox("Auto-exposure")
-        self.ae_check.setToolTip("Meter exposure in hardware before the scan")
-        self.form.addRow(self.ae_check)
+        self.ae_check = QCheckBox("Auto-Exposure")
+        self.ae_check.setToolTip("Hardware auto-exposure not supported by this device")
+        self.form.addRow("Auto-Exposure", self.ae_check)
 
         self.samples_combo = QComboBox()
         self.samples_combo.setToolTip("Hardware multi-sampling passes per line (higher = less noise, slower)")
@@ -144,43 +132,9 @@ class ScanSidebar(QWidget):
             self.samples_combo.addItem(f"{n}x", n)
         self.form.addRow("Samples/pass", self.samples_combo)
 
-        # Frame range (roll/strip feeders only — shown when a live capacity is known).
-        self.frame_range_widget = QWidget()
-        frame_row = QHBoxLayout(self.frame_range_widget)
-        frame_row.setContentsMargins(0, 0, 0, 0)
-        self.frame_from_spin = QSpinBox()
-        self.frame_from_spin.setMinimum(1)
-        self.frame_from_spin.setToolTip("First frame to scan")
-        self.frame_to_spin = QSpinBox()
-        self.frame_to_spin.setMinimum(1)
-        self.frame_to_spin.setToolTip("Last frame to scan")
-        frame_row.addWidget(self.frame_from_spin)
-        frame_row.addWidget(QLabel("–"))
-        frame_row.addWidget(self.frame_to_spin)
-        frame_row.addStretch()
-        self.frame_range_label = QLabel("Frames")
-        self.form.addRow(self.frame_range_label, self.frame_range_widget)
-        self.frame_range_label.setVisible(False)
-        self.frame_range_widget.setVisible(False)
-
-        # Scan window (strip/roll feeders): set once from a preview, reused per frame.
-        self.scan_window_widget = QWidget()
-        scan_window_row = QHBoxLayout(self.scan_window_widget)
-        scan_window_row.setContentsMargins(0, 0, 0, 0)
-        self.scan_window_btn = QPushButton("Set scan window…")
-        self.scan_window_btn.setToolTip("Preview a frame and set the scan window reused for every frame")
-        self.scan_window_clear_btn = QPushButton("Clear")
-        self.scan_window_clear_btn.setFixedWidth(56)
-        self.scan_window_clear_btn.setToolTip("Scan the whole default frame instead")
-        scan_window_row.addWidget(self.scan_window_btn, 1)
-        scan_window_row.addWidget(self.scan_window_clear_btn)
-        self.scan_window_row_label = QLabel("Batch")
-        self.form.addRow(self.scan_window_row_label, self.scan_window_widget)
-        self.scan_window_status = hint_label("")
-        self.form.addRow("", self.scan_window_status)
-        self.scan_window_row_label.setVisible(False)
-        self.scan_window_widget.setVisible(False)
-        self.scan_window_status.setVisible(False)
+        self.archival_split_check = QCheckBox("Archival Split (RGB4x + IR1x)")
+        self.archival_split_check.setToolTip("Requires both IR and hardware multi-sampling support")
+        self.form.addRow("Archival", self.archival_split_check)
 
         self.fmt_combo = QComboBox()
         self.fmt_combo.addItems(["TIFF", "DNG"])
@@ -203,6 +157,49 @@ class ScanSidebar(QWidget):
         self.form.addRow("Filename", self.pattern_edit)
 
         layout.addLayout(self.form)
+
+        # ── REGISTRATION ──────────────────────────────────────
+        layout.addWidget(section_subheader("REGISTRATION"))
+
+        self.registered_geometry_check = QCheckBox("Use Registered Geometry")
+        self.registered_geometry_check.setToolTip("Registered geometry not supported by this device")
+        layout.addWidget(self.registered_geometry_check)
+
+        self.registration_form = QFormLayout()
+        self.registration_form.setSpacing(6)
+
+        self.subframe_spin = QDoubleSpinBox()
+        self.subframe_spin.setDecimals(2)
+        # Upper bound mirrors RollRegistrationConfig.maximum_subframe_mm (the
+        # validated LS-5000 frame-pitch ceiling) — a UI convenience bound
+        # only; SaneBackend.scan() is the real enforcement point.
+        self.subframe_spin.setRange(0.0, 37.82)
+        self.subframe_spin.setSuffix(" mm")
+        self.subframe_spin.setEnabled(False)
+        self.subframe_spin.setToolTip("Fine transport shift for this frame (RegisteredScanGeometry.subframe_mm)")
+        self.registration_form.addRow("Subframe", self.subframe_spin)
+
+        self.br_y_spin = QSpinBox()
+        # Upper bound mirrors RollRegistrationConfig.maximum_br_y_device_px
+        # (the validated LS-5000 device-pixel ceiling) — a UI convenience
+        # bound only; SaneBackend.scan() is the real enforcement point.
+        self.br_y_spin.setRange(0, 5958)
+        self.br_y_spin.setEnabled(False)
+        self.br_y_spin.setToolTip(
+            "Inclusive bottom coordinate of the shortened scan window, in device pixels (RegisteredScanGeometry.br_y_device_px)"
+        )
+        self.registration_form.addRow("BR-Y", self.br_y_spin)
+
+        layout.addLayout(self.registration_form)
+
+        self.load_registration_btn = QPushButton(" Load Registration JSON…")
+        self.load_registration_btn.setIcon(qta.icon("fa5s.folder-open", color=THEME.text_primary))
+        self.load_registration_btn.setEnabled(False)
+        self.load_registration_btn.setToolTip(
+            "Load Subframe/BR-Y for the current Frame # from a registration manifest "
+            '({"frames": [{"frame": N, "subframe_mm": ..., "br_y": ...}]})'
+        )
+        layout.addWidget(self.load_registration_btn)
 
         # ── PROGRESS ────────────────────────────────────────
         self.progress_bar = QProgressBar()
@@ -231,11 +228,10 @@ class ScanSidebar(QWidget):
         self.pattern_edit.setText(self._settings.filename_pattern)
         self.autofocus_check.setChecked(self._settings.autofocus)
         self.ae_check.setChecked(self._settings.auto_exposure)
+        self.archival_split_check.setChecked(self._settings.archival_split_capture)
 
     def _connect_signals(self) -> None:
         self.refresh_btn.clicked.connect(self._on_refresh)
-        self.eject_btn.clicked.connect(self._on_eject)
-        self.backend_combo.currentIndexChanged.connect(self._on_backend_changed)
         self.device_combo.currentIndexChanged.connect(self._on_device_changed)
         self.browse_btn.clicked.connect(self._on_browse)
         self.scan_btn.clicked.connect(self._on_scan)
@@ -247,22 +243,16 @@ class ScanSidebar(QWidget):
         self.ir_check.toggled.connect(lambda: self._update_settings_from_ui())
         self.autofocus_check.toggled.connect(lambda: self._update_settings_from_ui())
         self.ae_check.toggled.connect(lambda: self._update_settings_from_ui())
-        self.frame_from_spin.valueChanged.connect(self._on_frame_from_changed)
-        self.frame_to_spin.valueChanged.connect(self._on_frame_to_changed)
-        self.scan_window_btn.clicked.connect(self._on_set_scan_window)
-        self.scan_window_clear_btn.clicked.connect(self._on_clear_scan_window)
         self.samples_combo.currentTextChanged.connect(lambda: self._update_settings_from_ui())
+        self.archival_split_check.toggled.connect(self._on_archival_split_toggled)
+        self.registered_geometry_check.toggled.connect(self._on_registered_geometry_toggled)
+        self.load_registration_btn.clicked.connect(self._on_load_registration_json)
 
         # Controller signals
         self.controller.scan_devices_ready.connect(self._on_devices_ready)
         self.controller.scan_progress.connect(self._on_scan_progress)
         self.controller.scan_finished.connect(self._on_scan_finished)
         self.controller.scan_error.connect(self._on_scan_error)
-        self.controller.scan_cancelled.connect(self._on_scan_cancelled)
-        self.controller.scan_frame_done.connect(self._on_scan_frame_done)
-        self.controller.scan_batch_finished.connect(self._on_scan_batch_finished)
-        self.controller.scan_ejected.connect(self._on_ejected)
-        self.controller.scan_eject_error.connect(self._on_eject_error)
 
     # ── activation hook ───────────────────────────────────────────────
 
@@ -275,33 +265,39 @@ class ScanSidebar(QWidget):
 
     def _request_devices(self) -> None:
         """Request device list from the scan worker thread."""
-        self.controller.set_scan_backend(self._current_backend_id())
+        if not self._sane_available():
+            self._show_sane_missing()
+            return
         self.device_combo.clear()
         self.device_combo.addItem("Detecting scanners…", None)
         self.device_combo.setEnabled(False)
         self.status_label.setText("Detecting scanners…")
         self.controller.request_scan_devices()
 
+    @staticmethod
+    def _sane_available() -> bool:
+        try:
+            import sane  # noqa: F401
+
+            return True
+        except Exception:
+            return False
+
+    def _show_sane_missing(self) -> None:
+        import sys
+
+        if sys.platform == "darwin":
+            hint = "brew install sane-backends"
+        else:
+            hint = "sudo apt install libsane  # Debian/Ubuntu\nsudo pacman -S sane  # Arch\nor your distro's sane equivalent"
+        self.device_combo.clear()
+        self.device_combo.addItem("SANE not available", None)
+        self.device_combo.setEnabled(False)
+        self.scan_btn.setEnabled(False)
+        self.status_label.setText(f"Scanner support requires SANE (libsane).\n\nTo enable:\n{hint}")
+
     def _on_refresh(self) -> None:
         self._request_devices()
-
-    def _current_backend_id(self) -> str:
-        return self.backend_combo.currentData() or DEFAULT_BACKEND_ID
-
-    def _on_backend_changed(self, _index: int) -> None:
-        # Device lists are backend-specific → persist the choice, then re-enumerate.
-        # Per-backend UI tweaks that capabilities can't express branch here on
-        # _current_backend_id(); none needed today.
-        self._update_settings_from_ui()
-        self._request_devices()
-
-    def _on_eject(self) -> None:
-        device = self._current_device()
-        if device is None:
-            return
-        self.eject_btn.setEnabled(False)
-        self.status_label.setText("Ejecting film…")
-        self.controller.eject_scanner(device.id)
 
     @pyqtSlot(list)
     def _on_devices_ready(self, devices: list) -> None:
@@ -350,18 +346,18 @@ class ScanSidebar(QWidget):
             self.dpi_combo.setEnabled(False)
             self.depth_combo.setEnabled(False)
             self.ir_check.setEnabled(False)
-            self.eject_btn.setVisible(False)
-            self.frame_range_label.setVisible(False)
-            self.frame_range_widget.setVisible(False)
             self.samples_combo.setEnabled(False)
+            self.frame_spin.setEnabled(False)
+            self.ae_check.setEnabled(False)
+            self.archival_split_check.setEnabled(False)
+            self.registered_geometry_check.setEnabled(False)
+            self._update_registration_fields_enabled()
             return
 
         caps = device.capabilities
         self.dpi_combo.setEnabled(True)
         self.depth_combo.setEnabled(True)
         self.ir_check.setEnabled(True)
-        self.eject_btn.setVisible(caps.can_eject)
-        self.eject_btn.setEnabled(caps.can_eject and not self._scanning)
         self.samples_combo.setEnabled(True)
         self.frame_label.setText(f"Frame: {caps.max_area_mm[0]:.0f} × {caps.max_area_mm[1]:.0f} mm")
 
@@ -379,10 +375,11 @@ class ScanSidebar(QWidget):
         self.dpi_combo.blockSignals(True)
         self.depth_combo.blockSignals(True)
         self.ir_check.blockSignals(True)
-        self.ae_check.blockSignals(True)
-        self.frame_from_spin.blockSignals(True)
-        self.frame_to_spin.blockSignals(True)
         self.samples_combo.blockSignals(True)
+        self.frame_spin.blockSignals(True)
+        self.ae_check.blockSignals(True)
+        self.archival_split_check.blockSignals(True)
+        self.registered_geometry_check.blockSignals(True)
 
         # DPI
         self.dpi_combo.clear()
@@ -396,16 +393,13 @@ class ScanSidebar(QWidget):
             else:
                 self.dpi_combo.setCurrentText(str(self._settings.dpi))
 
-        # Depth — default to the deepest supported when the saved value is absent
-        # (a saved 16 does not exist on a 14-bit LS-50; findData → -1 must not
-        # leave the combo silently on index 0 = 8-bit).
+        # Depth
         self.depth_combo.clear()
         if caps.supported_depths:
             for d in caps.supported_depths:
                 self.depth_combo.addItem(f"{d}-bit", d)
-            idx = self.depth_combo.findData(self._settings.depth) if self._settings.depth else -1
-            if idx < 0:
-                idx = self.depth_combo.findData(max(caps.supported_depths))
+        if self._settings.depth:
+            idx = self.depth_combo.findData(self._settings.depth)
             if idx >= 0:
                 self.depth_combo.setCurrentIndex(idx)
 
@@ -418,39 +412,6 @@ class ScanSidebar(QWidget):
             self.ir_check.setChecked(False)
             self.ir_check.setToolTip("IR scanning not supported by this device")
 
-        # Auto-exposure
-        self.ae_check.setEnabled(caps.auto_exposure)
-        if caps.auto_exposure:
-            self.ae_check.setChecked(self._settings.auto_exposure)
-            self.ae_check.setToolTip("Meter exposure in hardware before the scan")
-        else:
-            self.ae_check.setChecked(False)
-            self.ae_check.setToolTip("Auto-exposure not supported by this device")
-
-        # Frame range — only a roll/strip feeder reporting a live capacity
-        capacity = caps.adapter_frame_capacity
-        has_frames = capacity is not None
-        self.frame_range_label.setVisible(has_frames)
-        self.frame_range_widget.setVisible(has_frames)
-        if has_frames:
-            self.frame_from_spin.setMaximum(capacity)
-            self.frame_to_spin.setMaximum(capacity)
-            frm = min(max(self._settings.frame_from, 1), capacity)
-            to = min(max(self._settings.frame_to, frm), capacity)
-            # A stored (1, 1) is the unset default → offer the whole strip.
-            if self._settings.frame_from == 1 and self._settings.frame_to == 1:
-                to = capacity
-            self.frame_from_spin.setValue(frm)
-            self.frame_to_spin.setValue(to)
-
-        self.scan_window_row_label.setVisible(has_frames)
-        self.scan_window_widget.setVisible(has_frames)
-        self.scan_window_status.setVisible(has_frames)
-        if has_frames:
-            self.scan_window_btn.setText("Preview strip…")
-            self.scan_window_btn.setToolTip("Preview each frame, set a window per frame, and pick which frames to scan")
-            self._update_scan_window_status()
-
         # Samples/pass (hardware multi-sampling)
         self.samples_combo.setEnabled(caps.multi_sample)
         if caps.multi_sample:
@@ -461,80 +422,133 @@ class ScanSidebar(QWidget):
             self.samples_combo.setCurrentIndex(0)
             self.samples_combo.setToolTip("Multi-sampling not supported by this device")
 
+        # Frame selection (roll-adapter transport position)
+        if caps.adapter_frame_capacity is not None:
+            self.frame_spin.setEnabled(True)
+            self.frame_spin.setRange(0, caps.adapter_frame_capacity)
+            self.frame_spin.setValue(min(self.frame_spin.value(), caps.adapter_frame_capacity))
+            self.frame_spin.setToolTip(
+                f"Select a specific frame (1–{caps.adapter_frame_capacity}) on the roll adapter before scanning "
+                "(“Current” leaves the transport position unchanged)"
+            )
+        else:
+            self.frame_spin.setEnabled(False)
+            self.frame_spin.setRange(0, 0)
+            self.frame_spin.setValue(0)
+            self.frame_spin.setToolTip("Frame selection not supported by this device")
+
+        # Hardware auto-exposure
+        self.ae_check.setEnabled(caps.auto_exposure)
+        if caps.auto_exposure:
+            self.ae_check.setChecked(self._settings.auto_exposure)
+            self.ae_check.setToolTip("Meter this positioned frame in hardware before capture")
+        else:
+            self.ae_check.setChecked(False)
+            self.ae_check.setToolTip("Hardware auto-exposure not supported by this device")
+
+        # Archival split-capture (validated RGB4x + IR1x practical-parity recipe)
+        archival_supported = caps.ir_channel and caps.multi_sample
+        self.archival_split_check.setEnabled(archival_supported)
+        if archival_supported:
+            self.archival_split_check.setChecked(self._settings.archival_split_capture)
+            self.archival_split_check.setToolTip(
+                "Validated archival recipe: 4× hardware-multisampled RGB plus a registered single-pass IR channel"
+            )
+        else:
+            self.archival_split_check.setChecked(False)
+            self.archival_split_check.setToolTip("Requires both IR and hardware multi-sampling support")
+
+        # Registered geometry (fine transport shift + shortened scan window).
+        # Always resets on a capability refresh (device switch or Refresh
+        # click) — frame-specific geometry from a previous device/session
+        # must never silently carry over to a new one.
+        self.registered_geometry_check.setEnabled(caps.registered_geometry)
+        self.registered_geometry_check.setChecked(False)
+        self.subframe_spin.setValue(0.0)
+        self.br_y_spin.setValue(0)
+        if caps.registered_geometry:
+            self.registered_geometry_check.setToolTip("Position a fine transport shift and shortened scan window for this frame")
+        else:
+            self.registered_geometry_check.setToolTip("Registered geometry not supported by this device")
+
         self.dpi_combo.blockSignals(False)
         self.depth_combo.blockSignals(False)
         self.ir_check.blockSignals(False)
-        self.ae_check.blockSignals(False)
-        self.frame_from_spin.blockSignals(False)
-        self.frame_to_spin.blockSignals(False)
         self.samples_combo.blockSignals(False)
+        self.frame_spin.blockSignals(False)
+        self.ae_check.blockSignals(False)
+        self.archival_split_check.blockSignals(False)
+        self.registered_geometry_check.blockSignals(False)
 
-    def _on_frame_from_changed(self, _value: int) -> None:
-        if self.frame_to_spin.value() < self.frame_from_spin.value():
-            self.frame_to_spin.setValue(self.frame_from_spin.value())
+        # Cross-widget effects that must run after signals are unblocked
+        # (archival split may need to re-lock IR/samples; registration fields
+        # follow the "Use Registered Geometry" checkbox's restored state).
+        self._apply_archival_split_interlock()
+        self._update_registration_fields_enabled()
+
+    # ── new-control interlocks ───────────────────────────────────────────
+
+    def _apply_archival_split_interlock(self) -> None:
+        """Force + lock IR/samples to the validated RGB4x+IR1x recipe while
+        archival split-capture is active; leaves them alone otherwise."""
+        if not (self.archival_split_check.isChecked() and self.archival_split_check.isEnabled()):
+            return
+        self.ir_check.blockSignals(True)
+        self.ir_check.setChecked(True)
+        self.ir_check.blockSignals(False)
+        idx = self.samples_combo.findData(4)
+        if idx >= 0:
+            self.samples_combo.blockSignals(True)
+            self.samples_combo.setCurrentIndex(idx)
+            self.samples_combo.blockSignals(False)
+        self.ir_check.setEnabled(False)
+        self.samples_combo.setEnabled(False)
+
+    def _on_archival_split_toggled(self, _checked: bool) -> None:
+        if not self.archival_split_check.isChecked():
+            # Restore IR/samples to whatever the device's own capabilities allow.
+            device = self._current_device()
+            caps = device.capabilities if device is not None else None
+            self.ir_check.setEnabled(caps.ir_channel if caps is not None else False)
+            self.samples_combo.setEnabled(caps.multi_sample if caps is not None else False)
+        self._apply_archival_split_interlock()
         self._update_settings_from_ui()
 
-    def _on_frame_to_changed(self, _value: int) -> None:
-        if self.frame_from_spin.value() > self.frame_to_spin.value():
-            self.frame_from_spin.setValue(self.frame_to_spin.value())
-        self._update_settings_from_ui()
+    def _on_registered_geometry_toggled(self, _checked: bool) -> None:
+        self._update_registration_fields_enabled()
 
-    def _on_set_scan_window(self) -> None:
-        from dataclasses import replace
+    def _update_registration_fields_enabled(self) -> None:
+        active = self.registered_geometry_check.isChecked() and self.registered_geometry_check.isEnabled()
+        self.subframe_spin.setEnabled(active)
+        self.br_y_spin.setEnabled(active)
+        self.load_registration_btn.setEnabled(self.registered_geometry_check.isEnabled())
 
-        from negpy.desktop.view.widgets.strip_preview_dialog import StripPreviewDialog
-
-        device = self._current_device()
-        if device is None:
+    def _on_load_registration_json(self) -> None:
+        frame_value = self.frame_spin.value()
+        if frame_value <= 0:
+            self.status_label.setText("Set a Frame # before loading a registration manifest.")
             return
-        dialog = StripPreviewDialog(
-            self.controller,
-            device,
-            initial_windows=self._settings.frame_windows,
-            initial_selected=self._settings.selected_frames,
-            initial_offset=self._settings.frame_offset_mm,
-            initial_offset_modifier=self._settings.frame_offset_modifier_mm,
-            parent=self,
-        )
-        if dialog.exec():
-            self.settings = replace(
-                self._settings,
-                frame_windows=dialog.frame_windows(),
-                selected_frames=dialog.selected_frames(),
-                frame_offset_mm=dialog.frame_offset(),
-                frame_offset_modifier_mm=dialog.frame_offset_modifier(),
-            )
-            self._update_scan_window_status()
-            if dialog.scan_requested():
-                self._on_scan()
 
-    def _on_clear_scan_window(self) -> None:
-        from dataclasses import replace
-
-        self.settings = replace(self._settings, scan_window=None, frame_windows={}, selected_frames=())
-        self._update_scan_window_status()
-
-    def _update_scan_window_status(self) -> None:
-        from negpy.infrastructure.scanners.params import scan_window_to_area
-
-        offset = self._settings.frame_offset_mm
-        offset_txt = f"  ·  offset {offset:.1f} mm" if offset else ""
-        drift = self._settings.frame_offset_modifier_mm
-        offset_txt += f"  ·  drift {drift:+.2f} mm/frame" if drift else ""
-        selected = self._settings.selected_frames
-        if selected:
-            frames_txt = ", ".join(str(f) for f in sorted(selected))
-            n_windows = len(self._settings.frame_windows)
-            win_txt = f" · {n_windows} window(s)" if n_windows else ""
-            self.scan_window_status.setText(f"Frames {frames_txt}{win_txt}{offset_txt}")
+        path, _ = QFileDialog.getOpenFileName(self, "Load Registration JSON", "", "JSON Files (*.json)")
+        if not path:
             return
-        device = self._current_device()
-        area = scan_window_to_area(self._settings.scan_window, device.capabilities.max_area_mm) if device else None
-        if area is None:
-            self.scan_window_status.setText(f"Full frame{offset_txt}")
-        else:
-            tl_x, tl_y, br_x, br_y = area
-            self.scan_window_status.setText(f"{br_x - tl_x:.1f} × {br_y - tl_y:.1f} mm{offset_txt}")
+
+        from negpy.infrastructure.scanners.params import parse_registration_manifest
+
+        try:
+            with open(path, encoding="utf-8") as stream:
+                data = json.load(stream)
+            geometry = parse_registration_manifest(data, frame=frame_value)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self.status_label.setText(f"Could not load registration manifest: {exc}")
+            return
+
+        self.subframe_spin.setValue(geometry.subframe_mm)
+        self.br_y_spin.setValue(geometry.br_y_device_px)
+        self.registered_geometry_check.setChecked(True)
+        self._update_registration_fields_enabled()
+        self.status_label.setText(f"Loaded registration for frame {frame_value} from {os.path.basename(path)}")
+
     def _on_browse(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if folder:
@@ -559,64 +573,51 @@ class ScanSidebar(QWidget):
             if not output_folder:
                 return
 
-        from negpy.desktop.workers.scan_worker import BatchRequest, ScanRequest
-        from negpy.infrastructure.scanners.params import ScanParams
-        from negpy.infrastructure.scanners.settings import resolve_batch_selection
+        # Build ScanRequest
+        from negpy.desktop.workers.scan_worker import ScanRequest
 
         dpi = int(self.dpi_combo.currentData() or self.dpi_combo.currentText() or 3600)
         depth = int(self.depth_combo.currentData() or 16)
-        capture_ir = self.ir_check.isEnabled() and self.ir_check.isChecked()
-        autofocus = self.autofocus_check.isChecked()
-        auto_exposure = self.ae_check.isEnabled() and self.ae_check.isChecked()
-        pattern = self.pattern_edit.text().strip() or '{{ date }}_{{ "%03d" % seq }}'
-        fmt = self.fmt_combo.currentText()
+        # isChecked() alone is authoritative here (no isEnabled() guard): a
+        # device is guaranteed selected at this point (checked above), and
+        # ir_check.isChecked() is always kept truthful for it — forced False
+        # by _populate_form when the device lacks IR, forced True by the
+        # archival split-capture interlock, which also *disables* the box
+        # while leaving it checked=True to lock out manual edits. Gating on
+        # isEnabled() too would silently drop IR during archival capture.
+        capture_ir = self.ir_check.isChecked()
+        frame = self.frame_spin.value() or None
+        use_registered_geometry = self.registered_geometry_check.isEnabled() and self.registered_geometry_check.isChecked()
 
-        frames, frame_windows, base_window = resolve_batch_selection(
-            self._settings, self.frame_from_spin.value(), self.frame_to_spin.value()
-        )
-        base_params = ScanParams(
-            dpi=dpi,
-            depth=depth,
-            capture_ir=capture_ir,
-            autofocus=autofocus,
-            auto_exposure=auto_exposure,
-            window=base_window,
-            frame_offset_mm=self._settings.frame_offset_mm,
-            area=None,
-            samples_per_scan=int(self.samples_combo.currentData() or 1),
+        try:
+            params = self.controller.build_scan_params(
+                dpi=dpi,
+                depth=depth,
+                capture_ir=capture_ir,
+                autofocus=self.autofocus_check.isChecked(),
+                samples_per_scan=int(self.samples_combo.currentData() or 1),
+                frame=frame,
+                auto_exposure=self.ae_check.isEnabled() and self.ae_check.isChecked(),
+                subframe_mm=self.subframe_spin.value() if use_registered_geometry else None,
+                br_y_device_px=self.br_y_spin.value() if use_registered_geometry else None,
+            )
+        except ValueError as exc:
+            self.status_label.setText(f"Cannot start scan: {exc}")
+            return
+
+        req = ScanRequest(
+            device_id=device.id,
+            params=params,
+            output_folder=output_folder,
+            filename_pattern=self.pattern_edit.text().strip() or '{{ date }}_{{ "%03d" % seq }}',
+            output_format=self.fmt_combo.currentText(),
         )
 
         self._update_settings_from_ui()
         self._save_settings()
-        self.set_scanning(True)
 
-        try:
-            if device.capabilities.adapter_frame_capacity is not None:
-                self.controller.start_batch(
-                    BatchRequest(
-                        device_id=device.id,
-                        params=base_params,
-                        output_folder=output_folder,
-                        filename_pattern=pattern,
-                        output_format=fmt,
-                        frames=frames,
-                        frame_windows=frame_windows,
-                        frame_offset_modifier_mm=self._settings.frame_offset_modifier_mm,
-                    )
-                )
-            else:
-                self.controller.start_scan(
-                    ScanRequest(
-                        device_id=device.id,
-                        params=base_params,
-                        output_folder=output_folder,
-                        filename_pattern=pattern,
-                        output_format=fmt,
-                    )
-                )
-        except RuntimeError as e:
-            self.set_scanning(False)
-            self.status_label.setText(f"Scanner busy: {e}")
+        self.set_scanning(True)
+        self.controller.start_scan(req)
 
     @pyqtSlot(float)
     def _on_scan_progress(self, progress: float) -> None:
@@ -629,48 +630,16 @@ class ScanSidebar(QWidget):
         self.progress_bar.setVisible(False)
         self.status_label.setText(f"Scanned: {path}")
 
-    @pyqtSlot(int, str)
-    def _on_scan_frame_done(self, frame: int, path: str) -> None:
-        self.status_label.setText(f"Scanned frame {frame}: {path}")
-
-    @pyqtSlot(list)
-    def _on_scan_batch_finished(self, paths: list) -> None:
-        self.set_scanning(False)
-        self.progress_bar.setVisible(False)
-        if paths:
-            self.status_label.setText(f"Batch complete: {len(paths)} frame(s)")
-
-    @pyqtSlot()
-    def _on_scan_cancelled(self) -> None:
-        self.set_scanning(False)
-        self.progress_bar.setVisible(False)
-        self.status_label.setText("Scan stopped")
-
     @pyqtSlot(str)
     def _on_scan_error(self, msg: str) -> None:
         self.set_scanning(False)
         self.progress_bar.setVisible(False)
         self.status_label.setText(f"Error: {msg}")
 
-    @pyqtSlot(bool)
-    def _on_ejected(self, triggered: bool) -> None:
-        device = self._current_device()
-        self.eject_btn.setEnabled(bool(device and device.capabilities.can_eject) and not self._scanning)
-        self.status_label.setText("Film ejected" if triggered else "This device has no eject control")
-
-    @pyqtSlot(str)
-    def _on_eject_error(self, msg: str) -> None:
-        device = self._current_device()
-        self.eject_btn.setEnabled(bool(device and device.capabilities.can_eject) and not self._scanning)
-        self.status_label.setText(f"Eject failed: {msg}")
-
     # ── state helpers ─────────────────────────────────────────────────
 
     def set_scanning(self, active: bool) -> None:
         self._scanning = active
-        device = self._current_device()
-        self.backend_combo.setEnabled(not active)
-        self.eject_btn.setEnabled(bool(device and device.capabilities.can_eject) and not active)
         if active:
             self.scan_btn.setText(" Stop")
             self.scan_btn.setIcon(qta.icon("fa5s.stop", color=THEME.text_primary))
@@ -692,24 +661,19 @@ class ScanSidebar(QWidget):
         except (ValueError, TypeError):
             depth = 16
 
-        from dataclasses import replace
-
         device = self._current_device()
-        # replace(), never a fresh ScannerSettings: fields with no sidebar
-        # control must survive UI edits — reconstruction silently resets any
-        # field missing from this list.
-        self.settings = replace(
-            self._settings,
+        self.settings = ScannerSettings(
             last_device_id=device.id if device else self._settings.last_device_id,
-            backend=self._current_backend_id(),
             dpi=dpi,
             depth=depth,
-            capture_ir=self.ir_check.isChecked() and self.ir_check.isEnabled(),
+            # See the matching comment in _on_scan(): isChecked() alone is
+            # authoritative — an isEnabled() guard would misread the archival
+            # split-capture interlock's locked-but-checked state as "off".
+            capture_ir=self.ir_check.isChecked(),
             autofocus=self.autofocus_check.isChecked(),
-            auto_exposure=self.ae_check.isChecked() and self.ae_check.isEnabled(),
-            frame_from=self.frame_from_spin.value(),
-            frame_to=self.frame_to_spin.value(),
             samples_per_scan=int(self.samples_combo.currentData() or 1),
+            auto_exposure=self.ae_check.isChecked() and self.ae_check.isEnabled(),
+            archival_split_capture=self.archival_split_check.isChecked() and self.archival_split_check.isEnabled(),
             output_folder=self.folder_edit.text().strip(),
             output_format=self.fmt_combo.currentText(),
             filename_pattern=self.pattern_edit.text().strip() or '{{ date }}_{{ "%03d" % seq }}',
@@ -721,14 +685,11 @@ class _ScanUnsupportedPlaceholder(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        # No layout alignment and no QSS padding: either one breaks the wrapped
-        # QLabel's height-for-width negotiation and clips the text — the label
-        # must be stretched to full width so it can report its wrapped height.
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         label = QLabel("Scanner support not yet available on Windows.")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setWordWrap(True)
-        label.setStyleSheet(f"color: {THEME.text_muted}; font-size: {THEME.font_size_base}px;")
+        label.setStyleSheet(f"color: {THEME.text_muted}; font-size: {THEME.font_size_base}px; padding: 20px;")
         layout.addWidget(label)

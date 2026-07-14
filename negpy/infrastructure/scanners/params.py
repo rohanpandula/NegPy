@@ -62,6 +62,33 @@ class RegisteredScanGeometry:
             raise ValueError("registered bottom coordinate must be a non-negative integer")
 
 
+def parse_registration_manifest(data: object, *, frame: int) -> RegisteredScanGeometry:
+    """Extract one frame's window from an already-parsed registration manifest.
+
+    Schema matches the roll-scan CLI's ``--registration-json``
+    (``negpy.infrastructure.scanners.roll_scan_runner``):
+    ``{"frames": [{"frame": N, "subframe_mm": ..., "br_y": ...}, ...]}``.
+
+    Fails loud (``ValueError``) on anything missing, ambiguous, or malformed.
+    Numeric/geometric validation of the matched entry is delegated to
+    ``RegisteredScanGeometry.__post_init__`` rather than duplicated here.
+    File I/O is the caller's concern — this only walks already-decoded JSON.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("frames"), list):
+        raise ValueError("registration manifest must contain a 'frames' array")
+    # `type(...) is int` (not `isinstance`) so a JSON `true`/`false` — which
+    # Python bools satisfy `== 1`/`== 0` for — can never masquerade as frame 1/0.
+    matches = [item for item in data["frames"] if isinstance(item, dict) and type(item.get("frame")) is int and item["frame"] == frame]
+    if not matches:
+        raise ValueError(f"registration manifest has no entry for frame {frame}")
+    if len(matches) > 1:
+        raise ValueError(f"registration manifest has duplicate entries for frame {frame}")
+    entry = matches[0]
+    if "subframe_mm" not in entry or "br_y" not in entry:
+        raise ValueError(f"registration entry for frame {frame} must contain subframe_mm and br_y")
+    return RegisteredScanGeometry(subframe_mm=entry["subframe_mm"], br_y_device_px=entry["br_y"], frame=frame)
+
+
 @dataclass(frozen=True)
 class ScanParams:
     dpi: int
