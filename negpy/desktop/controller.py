@@ -24,10 +24,12 @@ from negpy.desktop.workers.render import (
     PreviewLoadWorker,
     RenderTask,
     RenderWorker,
+    TestStripTask,
     ThumbnailUpdateTask,
     ThumbnailWorker,
 )
 from negpy.desktop.workers.scan_worker import ScanRequest, ScanWorker
+from negpy.infrastructure.scanners.params import RegisteredScanGeometry, ScanParams
 from negpy.desktop.workers.capture_worker import (
     CalibrationRequest,
     CaptureRequest,
@@ -47,17 +49,33 @@ from negpy.domain.models import (
     resolve_preset_export,
 )
 from negpy.services.assets.sidecar import load_or_promote, write_sidecar
+from negpy.desktop.render_memo import RenderMemo
 from negpy.features.exposure.logic import (
     calculate_wb_shifts,
     calculate_wb_shifts_from_log,
 )
 from negpy.features.exposure.models import ExposureConfig
+from negpy.features.exposure.analysis import (
+    RING_GRID,
+    STRIP_GRID,
+    proof_grid,
+    ring_cells,
+    ring_overrides,
+    rotate_grid,
+    strip_cells,
+    strip_overrides,
+)
 from negpy.features.finish.models import FinishConfig
 from negpy.features.geometry.logic import apply_fine_rotation, detect_closest_aspect_ratio
 from negpy.features.geometry.models import FINE_ROTATION_LIMIT, AutocropMode
 from negpy.features.lab.models import LabConfig
 from negpy.features.local.models import LocalAdjustmentsConfig
-from negpy.features.process.models import ProcessMode, invalidate_local_bounds
+from negpy.features.process.models import (
+    ProcessConfig,
+    ProcessMode,
+    invalidate_local_bounds,
+    scan_setup_values,
+)
 from negpy.features.retouch.logic import fallback_source_offset, select_source_offset
 from negpy.features.retouch.models import HEAL_SIZE_REF, RetouchConfig
 from negpy.features.toning.models import ToningConfig
@@ -68,6 +86,7 @@ from negpy.infrastructure.gpu.resources import GPUTexture
 from negpy.infrastructure.storage.local_asset_store import LocalAssetStore
 from negpy.kernel.system.config import APP_CONFIG
 from negpy.kernel.system.logging import get_logger
+from negpy.kernel.system.paths import get_resource_path
 from negpy.services.rendering.preview_manager import PreviewManager
 from negpy.services.view.coordinate_mapping import CoordinateMapping
 
@@ -175,6 +194,9 @@ class AppController(QObject):
     compare_changed = pyqtSignal(bool)
     flat_output_changed = pyqtSignal(bool)
     flat_peek_changed = pyqtSignal(bool)
+    grain_focuser_changed = pyqtSignal(bool)
+    strip_requested = pyqtSignal(TestStripTask)
+    test_strip_changed = pyqtSignal(bool)  # True = mosaic is up, False = cleared or building
     zoom_requested = pyqtSignal(float)
     zoom_changed = pyqtSignal(float)
     _render_cleanup_requested = pyqtSignal()
@@ -234,6 +256,8 @@ class AppController(QObject):
         self._pending_scanned_file: Optional[str] = None
         self._gpu_fallback_notified = False
         self._cleaned_up = False
+        self._render_memo = RenderMemo()
+        self._strip_memo = RenderMemo()
         self._active_batch: Optional[str] = None
         self._active_batch_title = ""
         self._active_batch_abortable = False
@@ -379,12 +403,14 @@ class AppController(QObject):
             norm_h, norm_w = nl.shape[:2]
         else:
             norm_w, norm_h = nl.width, nl.height
+        # nx,ny arrive content-normalized (the overlay subtracts the border) —
+        # passing content_rect here would compensate twice.
         pos = map_display_to_norm(
             nx,
             ny,
             disp[0],
             disp[1],
-            self.canvas.content_rect(),
+            None,
             metrics.get("active_roi"),
             self.state.active_tool in (ToolMode.CROP_MANUAL, ToolMode.ANALYSIS_DRAW),
             norm_w,
@@ -407,10 +433,14 @@ class AppController(QObject):
 
     def _connect_signals(self) -> None:
         self.render_requested.connect(self.render_worker.process)
+        self.strip_requested.connect(self.render_worker.build_strip)
         self._render_cleanup_requested.connect(self.render_worker.cleanup)
+        self.render_worker.strip_finished.connect(self.on_strip_finished)
+        self.render_worker.strip_progress.connect(self.on_strip_progress)
         self.render_worker.finished.connect(self._on_render_finished)
         self.render_worker.metrics_updated.connect(self._on_metrics_updated)
         self.render_worker.error.connect(self._on_render_error)
+        self.render_worker.error.connect(self._on_strip_error)
 
         self.export_worker.progress.connect(self.export_progress.emit)
         self.export_worker.progress.connect(self._on_batch_progress)
@@ -751,6 +781,45 @@ class AppController(QObject):
                 return f.get("hash")
         return None
 
+    def _render_memo_key(self, config: Optional[WorkspaceConfig] = None) -> str:
+        """Identity of everything that shapes the displayed render of the current
+        config: the edit itself plus every display-path input. Any mismatch is a
+        memo miss, so navigate-back only skips straight to pixels that would be
+        reproduced exactly."""
+        import hashlib
+        import json
+
+        config = self.state.config if config is None else config
+        proofing = self.state.soft_proof_enabled
+        narrowband = self.state.config.process.narrowband_scan
+        parts = (
+            json.dumps(config.to_dict(), sort_keys=True, default=str),
+            self.state.hq_preview,
+            self.state.workspace_color_space,
+            self.state.gpu_enabled,
+            proofing,
+            self.effective_input_icc() if (proofing or narrowband) else None,
+            self.effective_output_icc() if proofing else None,
+            hashlib.md5(self.state.monitor_icc_bytes).hexdigest() if self.state.monitor_icc_bytes else "",
+        )
+        return hashlib.md5(repr(parts).encode()).hexdigest()
+
+    def _strip_memo_key(self, kind: str = "tone") -> str:
+        """The render key for a proof mosaic, prefixed by kind so the two can't collide.
+
+        Both ladders are absolute, so each proof supplies the fields it varies and its mosaic
+        is invariant to whatever those currently are. Pinning them makes print/pick/print again
+        a cache hit. Any other edit (crop, paper, toning...) lands on a different key.
+
+        Rotation is not in the key: an entry holds all four orientations.
+        """
+        exposure = self.state.config.exposure
+        if kind == "colour":
+            exposure = replace(exposure, wb_magenta=0.0, wb_yellow=0.0)
+        else:
+            exposure = replace(exposure, density=1.0, grade=115.0)
+        return f"{kind}:{self._render_memo_key(replace(self.state.config, exposure=exposure))}"
+
     def load_file(self, file_path: str, preserve_zoom: bool = False, force_detect: bool = False) -> None:
         """
         Dispatches RAW decode to a background worker to keep the UI thread free.
@@ -758,6 +827,9 @@ class AppController(QObject):
         self._prefetch_gen += 1
         self._preview_load_t0 = time.perf_counter()
         self._requested_file_path = file_path
+        # A strip belongs to one frame, and the memo fast path below repaints without
+        # going through request_render — so drop it here, not only there.
+        self._clear_test_strip()
         if not preserve_zoom:
             self.zoom_requested.emit(1.0)
         self.set_status(f"Loading {os.path.basename(file_path)}...")
@@ -809,6 +881,7 @@ class AppController(QObject):
         with self.state.metrics_lock:
             self.state.last_metrics["base_positive"] = raw
             self.state.last_metrics["splash"] = True
+            self.state.last_metrics["compare"] = False
         self.image_updated.emit()
 
     def _on_preview_loaded(self, file_path: str, raw: Any, dims: Any, source_cs: str, ir_preview: Any, detected_mode: str) -> None:
@@ -1769,6 +1842,49 @@ class AppController(QObject):
         """Request device enumeration on the scan worker thread."""
         self.scan_devices_requested.emit()
 
+    @staticmethod
+    def build_scan_params(
+        *,
+        dpi: int,
+        depth: int,
+        capture_ir: bool,
+        autofocus: bool,
+        samples_per_scan: int,
+        frame: int | None = None,
+        auto_exposure: bool = False,
+        subframe_mm: float | None = None,
+        br_y_device_px: int | None = None,
+    ) -> ScanParams:
+        """Translate Scan-tab control values into one ScanParams recipe.
+
+        Registered geometry (``subframe_mm`` + ``br_y_device_px``) is opt-in:
+        pass both together to position a fine transport shift and shortened
+        scan window for this frame, or leave both None for a plain full-window
+        scan. When geometry is supplied, ``frame`` rides inside it
+        (``RegisteredScanGeometry.frame``) instead of also riding on
+        ``ScanParams.frame`` — the two can never disagree because only one of
+        them is ever set.
+        """
+        if (subframe_mm is None) != (br_y_device_px is None):
+            raise ValueError("registered geometry requires both subframe_mm and br_y_device_px, or neither")
+
+        geometry: RegisteredScanGeometry | None = None
+        effective_frame = frame
+        if subframe_mm is not None and br_y_device_px is not None:
+            geometry = RegisteredScanGeometry(subframe_mm=subframe_mm, br_y_device_px=br_y_device_px, frame=frame)
+            effective_frame = None
+
+        return ScanParams(
+            dpi=dpi,
+            depth=depth,
+            capture_ir=capture_ir,
+            autofocus=autofocus,
+            samples_per_scan=samples_per_scan,
+            frame=effective_frame,
+            auto_exposure=auto_exposure,
+            registered_geometry=geometry,
+        )
+
     def start_scan(self, req: ScanRequest) -> None:
         """Start a scan. The UI connects to scan signals for state updates."""
         self.scan_started.emit()
@@ -1880,6 +1996,16 @@ class AppController(QObject):
         self._pending_scanned_file = paths[0]
         self.request_asset_discovery(list(paths))
 
+    def effective_input_icc(self, process: Optional[ProcessConfig] = None) -> Optional[str]:
+        """Source profile for color management: an explicit Input ICC wins; else the
+        bundled RGBScan profile when Narrowband Scan is on; else None."""
+        p = process if process is not None else self.state.config.process
+        if self.state.icc_input_path:
+            return self.state.icc_input_path
+        if p.narrowband_scan:
+            return get_resource_path("icc/RGBScan.icc")
+        return None
+
     def effective_output_icc(self) -> Optional[str]:
         """Output profile the preview proofs through: a custom override, else the
         profile for the selected export color space. None means no proof (Same as Source)."""
@@ -1922,6 +2048,63 @@ class AppController(QObject):
         self.session.save_icc_prefs()
         self._apply_monitor_profile()
 
+    def apply_scan_setup(self, capture: str, light: str) -> None:
+        """Apply the scanning-setup wizard's answer: Linear RAW and Narrowband are rig
+        properties, so they land on the new-file defaults, the open frame and every
+        already-edited frame at once."""
+        linear_raw, narrowband = scan_setup_values(capture, light)
+        self.session.repo.save_global_settings(
+            {
+                "scan_setup": {"capture": capture, "light": light},
+                "last_linear_raw": linear_raw,
+                "last_narrowband_scan": narrowband,
+            }
+        )
+
+        reload_needed = False
+        if self.state.current_file_hash:
+            reload_needed = self.state.config.process.linear_raw != linear_raw
+            new_config = replace(
+                self.state.config,
+                process=replace(
+                    self.state.config.process,
+                    linear_raw=linear_raw,
+                    narrowband_scan=narrowband,
+                    **invalidate_local_bounds(self.state.config.process),
+                ),
+            )
+            # render=False when reloading: bounds must not be analysed on the stale decode.
+            self.session.update_config(new_config, persist=True, render=not reload_needed)
+
+        count = 0
+        for asset in self.session.state.uploaded_files:
+            file_hash = asset["hash"]
+            if file_hash == self.state.current_file_hash:
+                continue
+            # Frames with no saved edits inherit the values from the sticky defaults when
+            # they are first hydrated — writing them here would only churn the DB.
+            saved = self.session.repo.load_file_settings(file_hash)
+            if saved is None:
+                continue
+            updated = replace(
+                saved,
+                process=replace(
+                    saved.process,
+                    linear_raw=linear_raw,
+                    narrowband_scan=narrowband,
+                    **invalidate_local_bounds(saved.process),
+                ),
+            )
+            self.session.push_external_history(file_hash, saved, updated)
+            self.session.repo.save_file_settings(file_hash, updated, file_path=asset["path"])
+            count += 1
+
+        if reload_needed and self.state.current_file_path:
+            self.load_file(self.state.current_file_path)
+        if count:
+            self.session.settings_synced.emit(f"Scanning setup applied to {count} other frame{'s' if count != 1 else ''}")
+            self.session.settings_saved.emit()
+
     def request_render(
         self, readback_metrics: bool = True, config_override: Optional[WorkspaceConfig] = None, ephemeral: bool = False
     ) -> None:
@@ -1944,6 +2127,10 @@ class AppController(QObject):
         if config_override is None and self.state.flat_peek:
             self.state.flat_peek = False
             self.flat_peek_changed.emit(False)
+
+        # Any real render invalidates a proof mosaic — the edit moved under it.
+        if config_override is None:
+            self._clear_test_strip()
 
         if self.state.preview_raw is None:
             return
@@ -1978,6 +2165,7 @@ class AppController(QObject):
             monitor_icc_bytes=self.state.monitor_icc_bytes,
             crop_preview_full=self.state.active_tool in (ToolMode.CROP_MANUAL, ToolMode.ANALYSIS_DRAW),
             ephemeral=ephemeral,
+            compare=self.state.compare_mode,
         )
 
         if self._is_rendering:
@@ -1999,6 +2187,8 @@ class AppController(QObject):
             self.compare_changed.emit(False)
             self.request_render()
         else:
+            # Same reason the strip and the peek are exclusive: both want the canvas.
+            self._clear_test_strip()
             self.state.compare_mode = True
             self.compare_changed.emit(True)
             self.request_render(readback_metrics=False, config_override=self._baseline_compare_config())
@@ -2055,6 +2245,8 @@ class AppController(QObject):
         if target and self.state.compare_mode:
             self.state.compare_mode = False
             self.compare_changed.emit(False)
+        if target:
+            self._clear_test_strip()
 
         self.state.flat_peek = target
         self.flat_peek_changed.emit(target)
@@ -2063,6 +2255,158 @@ class AppController(QObject):
             self.request_render(readback_metrics=False, config_override=flat_master_config(self.state.config))
         else:
             self.request_render()
+
+    def toggle_grain_focuser(self, force: Optional[bool] = None) -> None:
+        """Grain focuser loupe. Repaint only — it magnifies the frame the canvas already
+        holds, so no re-render is needed."""
+        self.state.grain_focuser = (not self.state.grain_focuser) if force is None else bool(force)
+        self.grain_focuser_changed.emit(self.state.grain_focuser)
+
+    def toggle_ring_around(self, force: Optional[bool] = None) -> None:
+        """Print (or clear) the colour ring-around — the M/Y filtration proof."""
+        self.toggle_test_strip(force, kind="colour")
+
+    def toggle_test_strip(self, force: Optional[bool] = None, kind: str = "tone") -> None:
+        """Print (or clear) a proof mosaic: the density × grade strip, or the colour ring-around.
+        Entering dispatches one job, since these need pixels the canvas doesn't have.
+
+        Both share the one proof slot, so asking for the other kind swaps it.
+        """
+        showing = (self.state.test_strip or self.state.test_strip_pending) and self.state.test_strip_kind == kind
+        target = (not showing) if force is None else bool(force)
+        if not target:
+            self._clear_test_strip()
+            return
+        if self.state.preview_raw is None:
+            return
+
+        # Unrotated: one print yields every orientation, so rotating never re-renders.
+        grid = RING_GRID if kind == "colour" else STRIP_GRID
+        overrides = ring_overrides() if kind == "colour" else strip_overrides()
+        toast = "Printing the colour ring-around…" if kind == "colour" else "Printing test strip…"
+
+        # Reprinting an unchanged proof is a pile of renders for pixels we already have.
+        cached = self._strip_memo.get(self.state.current_file_hash or "", self._strip_memo_key(kind))
+        if cached is not None:
+            self.state.test_strip_kind = kind
+            self.on_strip_finished(cached["mosaics"], cached["content_rect"], from_cache=True)
+            return
+
+        proofing = self.state.soft_proof_enabled
+        icc_input = self.effective_input_icc() if (proofing or self.state.config.process.narrowband_scan) else None
+        self.state.test_strip_kind = kind
+        self.state.test_strip_pending = True
+        self.test_strip_changed.emit(False)
+        # A few seconds of renders: tick the HUD so it doesn't read as wedged.
+        self.status_message_requested.emit(toast, 2500)
+        self.status_progress_requested.emit(0, len(overrides))
+        self.strip_requested.emit(
+            TestStripTask(
+                buffer=self.state.preview_raw,
+                config=self.state.config,
+                source_hash=self.state.current_file_hash or "preview",
+                # Always preview res, never HQ: full-res renders per patch would take minutes,
+                # and each patch is shown at a fraction of the frame's width anyway.
+                preview_size=float(APP_CONFIG.preview_render_size),
+                overrides=tuple(overrides),
+                grid=grid,
+                icc_input_path=icc_input,
+                icc_output_path=self.effective_output_icc() if proofing else None,
+                color_space=self.state.workspace_color_space,
+                gpu_enabled=self.state.gpu_enabled,
+                ir_buffer=self.state.preview_ir,
+                monitor_icc_bytes=self.state.monitor_icc_bytes,
+            )
+        )
+
+    def on_strip_progress(self, done: int, total: int) -> None:
+        if self.state.test_strip_pending:
+            self.status_progress_requested.emit(done, total)
+
+    def _clear_test_strip(self) -> None:
+        """Drop the strip and its mosaic; silent when there was nothing up."""
+        if not (self.state.test_strip or self.state.test_strip_pending):
+            return
+        if self.state.test_strip_pending:
+            self.status_progress_requested.emit(0, 0)  # total <= 0 hides the bar
+        self.state.test_strip = False
+        self.state.test_strip_pending = False
+        self.state.test_strip_mosaic = None
+        self.state.test_strip_mosaics = None
+        self.state.test_strip_content_rect = None
+        self.test_strip_changed.emit(False)
+
+    def on_strip_finished(self, mosaics: Any, content_rect: Any, from_cache: bool = False) -> None:
+        # A render that landed while the strip was building already cancelled it.
+        if not (self.state.test_strip_pending or from_cache):
+            return
+        if not from_cache:
+            # Keyed on the config as it stands now, not as it was at dispatch: measured
+            # bounds are persisted after a render with render=False, so the config drifts
+            # mid-print without invalidating anything. Keying at dispatch made every
+            # reprint a miss. Safe because a change that *did* matter would have gone
+            # through request_render, which cancels the strip outright.
+            self._strip_memo.store(
+                self.state.current_file_hash or "",
+                self._strip_memo_key(self.state.test_strip_kind),
+                {"mosaics": mosaics, "content_rect": content_rect},
+            )
+        self.state.test_strip_pending = False
+        self.state.test_strip = True
+        self.state.test_strip_mosaics = mosaics
+        self.state.test_strip_mosaic = mosaics[self.state.test_strip_rotation]
+        self.state.test_strip_content_rect = content_rect
+        self.test_strip_changed.emit(True)
+        label = "Ring-around" if self.state.test_strip_kind == "colour" else "Test strip"
+        self.status_message_requested.emit(f"{label} ready — click a patch to keep it", 4000)
+
+    def rotate_test_strip(self, direction: int) -> bool:
+        """Turn the ladder rather than the image while a proof is on the canvas; True = consumed.
+
+        Gated on a mosaic being up, never on `pending`: the rotate controls are global, and a
+        proof that is only expected must not swallow them. Mid-print the turn falls through to
+        the image, dropping the print like any other edit.
+        """
+        if not (self.state.test_strip and self.state.test_strip_mosaics):
+            return False
+        self.state.test_strip_rotation = (self.state.test_strip_rotation + direction) % 4
+        self.state.test_strip_mosaic = self.state.test_strip_mosaics[self.state.test_strip_rotation]
+        self.test_strip_changed.emit(True)
+        return True
+
+    def _on_strip_error(self, _message: str) -> None:
+        """A print that errors never reaches on_strip_finished, and the stuck `pending` flag holds
+        the progress bar open and blocks a reprint."""
+        if self.state.test_strip_pending:
+            self._clear_test_strip()
+
+    def apply_test_strip_pick(self, row: int, col: int) -> None:
+        """Commit the clicked patch's settings, then drop the proof.
+
+        Cast Removal and the Auto toggles are left alone: the patches were rendered under
+        them, so flipping one would render something other than the patch that was clicked.
+        """
+        if not self.state.test_strip:
+            return
+        exposure = self.state.config.exposure
+        colour = self.state.test_strip_kind == "colour"
+        base_grid = RING_GRID if colour else STRIP_GRID
+        rotation = self.state.test_strip_rotation
+        cells = rotate_grid(ring_cells() if colour else strip_cells(), base_grid, rotation)
+        _, _, first, second = cells[row * proof_grid(base_grid, rotation)[1] + col]
+        if colour:
+            new_exposure = replace(exposure, wb_magenta=first, wb_yellow=second)
+        else:
+            new_exposure = replace(exposure, density=first, grade=second)
+        self._clear_test_strip()
+        self.session.update_config(replace(self.state.config, exposure=new_exposure), persist=True)
+        self.request_render()
+
+    def set_local_overlay_visible(self, visible: bool) -> None:
+        """Show/hide the dodge/burn mask overlay (view-only; no re-render)."""
+        self.state.show_local_overlay = visible
+        if self.canvas:
+            self.canvas.overlay.update()
 
     def _enabled_presets(self) -> List[ExportPreset]:
         return [p for p in self.state.export_presets if p.enabled]

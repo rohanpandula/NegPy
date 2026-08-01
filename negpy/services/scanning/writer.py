@@ -451,6 +451,10 @@ def write_tiff_16bit(result: ScanResult, path: str) -> str:
     When this write has no IR, a stale `<basename>_IR.tif` sidecar from the
     prior pair is removed as part of the same exception-safe replacement.
 
+    A non-None ir_valid_mask rides as a third sidecar `<basename>_IR_VALID.tif`
+    ({0,255} u8 — the loader fails closed on anything else) committed through
+    the same synchronous rollback path.
+
     Returns final RGB path.
     """
     if not path.lower().endswith((".tif", ".tiff")):
@@ -459,10 +463,12 @@ def write_tiff_16bit(result: ScanResult, path: str) -> str:
     rgb = _to_uint16(result.rgb)
     base = os.path.splitext(path)[0]
     ir_path = f"{base}_IR.tif"
+    valid_path = f"{base}_IR_VALID.tif"
     has_ir = result.ir is not None
+    has_valid = result.ir_valid_mask is not None
 
-    # Phase 1: write both payloads to temp files. Nothing under `path` or
-    # `ir_path` is touched here, so a failure at this stage (bad array,
+    # Phase 1: write every payload to temp files. Nothing under the final
+    # destinations is touched here, so a failure at this stage (bad array,
     # codec error, disk full) leaves the filesystem exactly as it was.
     tmp_rgb = _write_temp_tiff(rgb, path, photometric="rgb", dpi=result.dpi)
     tmp_ir = None
@@ -473,10 +479,26 @@ def write_tiff_16bit(result: ScanResult, path: str) -> str:
         except Exception:
             os.unlink(tmp_rgb)
             raise
+    tmp_valid = None
+    if has_valid:
+        try:
+            valid_data = np.asarray(result.ir_valid_mask).astype(np.uint8) * 255
+            tmp_valid = _write_temp_tiff(valid_data, valid_path, photometric="minisblack", dpi=result.dpi)
+        except Exception:
+            os.unlink(tmp_rgb)
+            if tmp_ir is not None:
+                os.unlink(tmp_ir)
+            raise
 
-    # Phase 2: swap the prepared payloads in, retaining any prior pair until
-    # every requested destination has been committed.
-    _commit_tiff_pair(tmp_rgb, tmp_ir, path, ir_path)
+    if has_valid:
+        _commit_tiff_triplet(
+            {"rgb": tmp_rgb, "ir": tmp_ir, "ir_valid_mask": tmp_valid},
+            {"rgb": path, "ir": ir_path, "ir_valid_mask": valid_path},
+        )
+    else:
+        # Phase 2: swap the prepared payloads in, retaining any prior pair until
+        # every requested destination has been committed.
+        _commit_tiff_pair(tmp_rgb, tmp_ir, path, ir_path)
 
     return path
 

@@ -85,20 +85,29 @@ class OverflowBar(QWidget):
             return list(range(fits))
 
         widths = [w.sizeHint().width() for w, _ in self._items]
-        if sum(widths) + self._spacing * max(0, count - 1) <= avail:
+        fixed = [
+            w.minimumWidth() if 0 < w.minimumWidth() == w.maximumWidth() else widths[i] for i, w in enumerate(w for w, _ in self._items)
+        ]
+        if sum(fixed) + self._spacing * max(0, count - 1) <= avail:
             return list(range(count))
-        budget = avail - self.OVERFLOW_W
-        visible: list[int] = []
-        used = 0
-        for i, width in enumerate(widths):
-            step = width + (self._spacing if visible else 0)
-            if used + step > budget:
-                break
-            used += step
-            visible.append(i)
-        while visible and self._items[visible[-1]][1] is None:
-            visible.pop()
-        return visible
+
+        def _pack(budget: int) -> list[int]:
+            packed: list[int] = []
+            used = 0
+            for i, width in enumerate(fixed):
+                step = width + (self._spacing if packed else 0)
+                if used + step > budget:
+                    break
+                used += step
+                packed.append(i)
+            while packed and self._items[packed[-1]][1] is None:
+                packed.pop()
+            return packed
+
+        visible = _pack(avail)
+        if not any(self._items[i][1] is not None for i in range(len(visible), count)):
+            return visible  # only separators spilled — no overflow needed
+        return _pack(avail - self.OVERFLOW_W)
 
     def _relayout(self) -> None:
         if not self._items:

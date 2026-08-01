@@ -2,10 +2,11 @@ import os
 import threading
 from typing import Callable
 
-from negpy.infrastructure.scanners.base import ScannerBackend, ScannerDevice
+from negpy.infrastructure.scanners.base import ScannerBackend, ScannerDevice, ScannerSession
 from negpy.infrastructure.scanners.params import ScanParams
+from negpy.infrastructure.scanners.per_frame_roll import PerFrameRollSession
 from negpy.infrastructure.scanners.result import ScanResult
-from negpy.infrastructure.scanners.sane_backend import SaneBackend
+from negpy.infrastructure.scanners.roll import RollSession
 from negpy.kernel.system.logging import get_logger
 from negpy.services.scanning.templating import render_scan_filename
 
@@ -15,12 +16,15 @@ logger = get_logger(__name__)
 class ScannerService:
     """Orchestrates device enumeration, scan execution, and file writing."""
 
-    def __init__(self) -> None:
-        self._backend: ScannerBackend | None = None
+    def __init__(self, backend: ScannerBackend | None = None, backend_id: str | None = None) -> None:
+        self._backend = backend
+        self._backend_id = backend_id
 
     def _get_backend(self) -> ScannerBackend:
         if self._backend is None:
-            self._backend = SaneBackend()
+            from negpy.infrastructure.scanners.registry import DEFAULT_BACKEND_ID, create_backend
+
+            self._backend = create_backend(self._backend_id or DEFAULT_BACKEND_ID)
         return self._backend
 
     def list_devices(self) -> list[ScannerDevice]:
@@ -64,6 +68,22 @@ class ScannerService:
         backend = self._get_backend()
         return backend.scan(device_id, params, progress, cancel)
 
+    def open_session(self, device_id: str) -> ScannerSession:
+        """Open an exclusive session on a session-capable backend.
+
+        Optional-method pattern like refresh_devices: a backend without
+        session support is addressed through one-shot scan()/eject().
+        """
+        backend = self._get_backend()
+        open_session = getattr(backend, "open_session", None)
+        if not callable(open_session):
+            raise RuntimeError(f"Backend {type(backend).__name__} does not support exclusive sessions")
+        return open_session(device_id)
+
+    def open_roll(self, device: ScannerDevice, *, dpi: int) -> RollSession:
+        """Open a whole-strip roll session over the device's backend."""
+        return PerFrameRollSession(self._get_backend(), device, dpi=dpi)
+
     def eject(self, device_id: str) -> bool:
         """Trigger a capability-gated film eject; False when unsupported.
 
@@ -82,10 +102,13 @@ class ScannerService:
         output_folder: str,
         filename_pattern: str,
         output_format: str = "TIFF",
+        seq: int | None = None,
     ) -> str:
         """Write ScanResult to disk. Returns path to the RGB file.
 
-        Filename pattern is a Jinja2 template with variables: date, seq.
+        Filename pattern is a Jinja2 template with variables: date, seq. `seq`
+        seeds the collision search: single scans pass None (start at 1); a range
+        batch passes the frame number so masters are frame-numbered.
         """
         from datetime import date as dt_date
 
@@ -96,7 +119,7 @@ class ScannerService:
         date_str = dt_date.today().strftime("%Y%m%d")
         ext = ".dng" if output_format.upper() == "DNG" else ".tif"
 
-        seq = 1
+        seq = seq or 1
         while True:
             basename = render_scan_filename(filename_pattern, date_str, seq)
             rgb_path = os.path.join(output_folder, basename)

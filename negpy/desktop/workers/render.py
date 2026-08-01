@@ -8,10 +8,11 @@ from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from negpy.domain.interfaces import PipelineContext
 from negpy.domain.models import WorkspaceConfig
-from negpy.features.exposure.analysis import output_histogram
+from negpy.features.exposure.analysis import output_histogram, proof_grid, rotate_grid, strip_mosaic
 from negpy.features.flatfield.logic import apply_flatfield
 from negpy.features.geometry.batch_autocrop import detect_crop_candidate, resolve_roll_crops
 from negpy.features.geometry.processor import GeometryProcessor
+from negpy.infrastructure.display.color_spaces import WORKING_COLOR_SPACE
 from negpy.infrastructure.gpu.resources import GPUTexture
 from negpy.kernel.system.config import APP_CONFIG, DEFAULT_WORKSPACE_CONFIG
 from negpy.kernel.system.logging import get_logger
@@ -42,6 +43,8 @@ class RenderTask:
     crop_preview_full: bool = False
     # Display-only first paint (embedded-JPEG splash): its analysis must not persist.
     ephemeral: bool = False
+    # True for the compare badge render: renders the un-graded auto baseline.
+    compare: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,8 +54,28 @@ class ThumbnailUpdateTask:
     filename: str
     file_hash: str
     buffer: np.ndarray
-    color_space: str = "sRGB"
+    color_space: str = WORKING_COLOR_SPACE
     persist: bool = True  # False = in-memory filmstrip only, skip the disk JPEG encode.
+
+
+@dataclass(frozen=True)
+class TestStripTask:
+    """Request to print a proof mosaic off one frame: the density × grade strip or the colour
+    ring-around. `overrides` is one ExposureConfig field-override dict per patch, row-major
+    over `grid`, unrotated — the worker assembles all four orientations."""
+
+    buffer: np.ndarray
+    config: WorkspaceConfig
+    source_hash: str
+    preview_size: float
+    overrides: tuple
+    grid: tuple
+    icc_input_path: Optional[str] = None
+    icc_output_path: Optional[str] = None
+    color_space: str = WORKING_COLOR_SPACE
+    gpu_enabled: bool = True
+    ir_buffer: Optional[np.ndarray] = None
+    monitor_icc_bytes: Optional[bytes] = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +133,8 @@ class AssetDiscoveryTask:
     supported_extensions: tuple[str, ...]
     rgb_scan: bool = False  # Group discovered files into R/G/B triplets (one asset per frame).
     restore_triplets: dict | None = None  # {red_path: [green, blue]} — rebuild known triplets (session restore).
+    restore_stitches: dict | None = None  # {primary_path: registration} — rebuild saved stitch composites.
+    half_frame: bool = False  # Expand each file into two half-frame assets (left/right).
 
 
 @dataclass(frozen=True)
@@ -137,6 +162,8 @@ class RenderWorker(QObject):
 
     finished = pyqtSignal(object, dict)  # (ndarray|GPUTexture, metrics)
     metrics_updated = pyqtSignal(dict)  # Late-arriving metrics (histogram, etc.)
+    strip_finished = pyqtSignal(object, object)  # (one mosaic ndarray per quarter-turn, content_rect|None)
+    strip_progress = pyqtSignal(int, int)  # (patches printed, total)
     error = pyqtSignal(str)
 
     def __init__(self) -> None:
@@ -201,12 +228,68 @@ class RenderWorker(QObject):
             # Render identity, so the controller can reject stale/ephemeral bounds writeback.
             metrics["source_hash"] = task.source_hash
             metrics["ephemeral"] = task.ephemeral
+            metrics["compare"] = task.compare
 
             self.finished.emit(result, metrics)
             self.metrics_updated.emit(metrics)
 
         except Exception as e:
             logger.exception("Render pipeline failed")
+            self.error.emit(str(e))
+
+    @pyqtSlot(TestStripTask)
+    def build_strip(self, task: TestStripTask) -> None:
+        """Render the frame once per patch and keep only that patch.
+
+        Runs on the render thread with the canvas's own ImageProcessor, so the patches are the
+        pixels the canvas would show. Every field a proof overrides (density/grade, or the
+        colour head's magenta/yellow) is absent from the analysis cache key, so the per-frame
+        metering is reused and only the exposure stage onward re-dispatches. Metrics are
+        dropped: a proof must not disturb the writeback the real render owns.
+        """
+        try:
+            tiles = []
+            content_rect = None
+            for override in task.overrides:
+                config = replace(task.config, exposure=replace(task.config.exposure, **override))
+                result, metrics = self._processor.run_pipeline(
+                    task.buffer,
+                    config,
+                    task.source_hash,
+                    render_size_ref=task.preview_size,
+                    prefer_gpu=task.gpu_enabled,
+                    readback_metrics=False,
+                    ir_buffer=task.ir_buffer,
+                    wants_uv_grid=False,
+                )
+                if isinstance(result, GPUTexture):
+                    result = result.readback()
+
+                soft_proof = task.icc_input_path or task.icc_output_path
+                if soft_proof and isinstance(result, np.ndarray):
+                    pil_img = self._processor.buffer_to_pil(result, config)
+                    pil_proof = self._processor.soft_proof_preview(
+                        pil_img,
+                        task.color_space,
+                        task.icc_input_path,
+                        task.icc_output_path,
+                        task.monitor_icc_bytes,
+                    )
+                    arr = np.array(pil_proof)
+                    result = arr.astype(np.float32) / (65535.0 if arr.dtype == np.uint16 else 255.0)
+
+                tiles.append(result)
+                if content_rect is None:
+                    content_rect = metrics.get("content_rect")
+                self.strip_progress.emit(len(tiles), len(task.overrides))
+
+            # One mosaic per quarter-turn while the tiles are still in hand: a rotated ladder needs
+            # a different slice of each render. Peak memory is unchanged, the tiles dominate.
+            mosaics = tuple(strip_mosaic(rotate_grid(tiles, task.grid, k), proof_grid(task.grid, k)) for k in range(4))
+            self.strip_finished.emit(mosaics, content_rect)
+
+        except Exception as e:
+            logger.exception("Test strip render failed")
             self.error.emit(str(e))
 
 
@@ -317,7 +400,29 @@ class AssetDiscoveryWorker(QObject):
         elif task.rgb_scan and valid_assets:
             valid_assets = self._group_rgb_triplets(valid_assets)
 
+        if task.restore_stitches and valid_assets:
+            valid_assets = self._attach_restored_stitches(valid_assets, task.restore_stitches)
+
+        if task.half_frame and valid_assets:
+            valid_assets = self._expand_half_frames(valid_assets)
+
         self.finished.emit(valid_assets)
+
+    def _expand_half_frames(self, assets: list) -> list:
+        """Expand each file into two half-frame assets sharing the path, with
+        per-half hash/name identities. Triplet assets stay whole (unsupported combo)."""
+        from negpy.services.assets.half_frame import detect_split_x_for_file, half_hash, half_name
+
+        out = []
+        for i, a in enumerate(assets):
+            if a.get("green_path"):
+                out.append(a)
+                continue
+            self.progress.emit(i + 1, len(assets), f"Split {a['name']}")
+            split_x = detect_split_x_for_file(a["path"])
+            for half in (1, 2):
+                out.append({**a, "name": half_name(a["name"], half), "hash": half_hash(a["hash"], half), "half": half, "split_x": split_x})
+        return out
 
     def _attach_restored_triplets(self, assets: list, triplets: dict) -> list:
         """Re-attach saved green/blue exposures to restored red assets (no reclassification)."""
@@ -330,6 +435,32 @@ class AssetDiscoveryWorker(QObject):
                 base = os.path.splitext(a["name"])[0]
                 align = bool(gb[2]) if len(gb) > 2 else True
                 out.append({**a, "name": f"{base} (RGB)", "green_path": gb[0], "blue_path": gb[1], "align": align})
+            else:
+                out.append(a)
+        return out
+
+    def _attach_restored_stitches(self, assets: list, stitches: dict) -> list:
+        """Re-attach saved stitch registrations to restored primary assets (no re-registration).
+        A composite whose parts vanished from disk restores as a plain asset."""
+        import os
+
+        from negpy.features.stitch.models import stitch_name
+
+        out = []
+        for a in assets:
+            entry = stitches.get(a["path"])
+            if entry and entry.get("paths") and all(os.path.exists(p) for p in entry["paths"]):
+                out.append(
+                    {
+                        **a,
+                        "name": stitch_name([a["path"], *entry["paths"]]),
+                        "hash": entry["hash"],
+                        "stitch_paths": tuple(entry["paths"]),
+                        "stitch_transforms": tuple(tuple(float(v) for v in t) for t in entry["transforms"]),
+                        "stitch_canvas": (int(entry["canvas"][0]), int(entry["canvas"][1])),
+                        "stitch_sizes": tuple((int(s[0]), int(s[1])) for s in entry["sizes"]),
+                    }
+                )
             else:
                 out.append(a)
         return out

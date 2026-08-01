@@ -138,6 +138,22 @@ class GeometrySidebar(BaseSidebar):
         self.offset_slider.setToolTip(tooltip_with_shortcut("Insets the crop border from the auto-detected film edge (px)", "offset_inc"))
         self.layout.addWidget(self.offset_slider)
 
+        self.rebate_trim_slider = CompactSlider(
+            "Rebate Trim",
+            0.0,
+            150.0,
+            conf.autocrop_rebate_trim * 100.0,
+            step=5.0,
+            precision=1,
+            unit=" %",
+        )
+        self.rebate_trim_slider.setToolTip(
+            "How far into the detected rebate auto crop cuts: 0% stops at the film edge, "
+            "100% lands on the image edge, above 100% bites in to clear a white border"
+        )
+        self.rebate_trim_slider.setEnabled(conf.autocrop_mode == AutocropMode.IMAGE)
+        self.layout.addWidget(self.rebate_trim_slider)
+
         self.layout.addWidget(section_subheader("ALIGNMENT"))
 
         align_row = QHBoxLayout()
@@ -190,6 +206,13 @@ class GeometrySidebar(BaseSidebar):
         )
         self.offset_slider.valueCommitted.connect(self._on_offset_committed)
 
+        self.rebate_trim_slider.valueChanged.connect(
+            lambda v: self.update_config_section(
+                "geometry", render=True, persist=False, readback_metrics=False, autocrop_rebate_trim=v / 100.0
+            )
+        )
+        self.rebate_trim_slider.valueCommitted.connect(self._on_rebate_trim_committed)
+
         self.straighten_btn.toggled.connect(self._on_straighten_toggled)
 
         # Display convention is CW-positive; negate crossing into the stored convention.
@@ -229,6 +252,15 @@ class GeometrySidebar(BaseSidebar):
         self.controller.session.update_config(new_config, persist=True)
         self.controller.request_render()
 
+    def _on_rebate_trim_committed(self, v: float) -> None:
+        new_config = replace(
+            self.state.config,
+            geometry=replace(self.state.config.geometry, autocrop_rebate_trim=v / 100.0),
+            process=replace(self.state.config.process, **invalidate_local_bounds(self.state.config.process)),
+        )
+        self.controller.session.update_config(new_config, persist=True)
+        self.controller.request_render()
+
     def _on_manual_crop_toggled(self, checked: bool) -> None:
         self.controller.set_active_tool(ToolMode.CROP_MANUAL if checked else ToolMode.NONE)
 
@@ -252,6 +284,8 @@ class GeometrySidebar(BaseSidebar):
             self.mode_combo.setCurrentIndex(self.mode_combo.findData(conf.autocrop_mode))
 
             self.offset_slider.setValue(float(conf.autocrop_offset))
+            self.rebate_trim_slider.setValue(conf.autocrop_rebate_trim * 100.0)
+            self.rebate_trim_slider.setEnabled(conf.autocrop_mode == AutocropMode.IMAGE)
             self.fine_rot_slider.setValue(-conf.fine_rotation)
 
             self.manual_crop_btn.setChecked(self.state.active_tool == ToolMode.CROP_MANUAL)
